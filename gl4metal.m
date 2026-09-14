@@ -21,7 +21,7 @@ static NSMutableDictionary<NSNumber *, gl4metalVertexArray *> *g_vaoObjects = ni
 @implementation gl4metalContext
 @end
 
-#pragma mark - OpenGL implementation
+#pragma mark - OpenGL 3.3 implementation
 
 GLboolean glInit() {
     if (g_context != nil) return GL_TRUE;
@@ -45,6 +45,16 @@ GLboolean glInit() {
     g_context.depthWriteEnabled = GL_TRUE;
     g_context.depthFunc = GL_LESS;
     updateDepthStencilState();
+
+    g_context.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    g_context.clearDepth = 1.0;
+    g_context.pendingClearFlags = 0;
+
+    // Initialize viewport and scissor rect to default values
+    g_context.viewport = (gl4metalRect){0, 0, 800, 600};
+    g_context.scissorRect = (gl4metalRect){0, 0, 800, 600};
+    g_context.scissorTestEnabled = GL_FALSE;
+
     return GL_TRUE;
 }
 
@@ -62,9 +72,23 @@ void APIENTRY glMakeCurrent(void* metalLayerPtr) {
 }
 
 void APIENTRY glSwapBuffers(void) {
-    if (!g_context || !g_context.currentCommandBuffer || !g_context.currentDrawable) {
-    // avoid crash if the game call glSwapBuffers before draw anything
-    return;
+    if (!g_context) return;
+
+    if (g_context.pendingClearFlags != 0 && g_context.metalLayer) {
+        if (!g_context.currentCommandBuffer) g_context.currentCommandBuffer = [g_context.commandQueue commandBuffer];
+        if (!g_context.currentDrawable) g_context.currentDrawable = [g_context.metalLayer nextDrawable];
+        if (g_context.currentDrawable) {
+            MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
+            if (renderPassDesc) {
+                id<MTLRenderCommandEncoder> encoder = [g_context.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
+                [encoder endEncoding];
+            }
+        }
+    }
+
+    if (!g_context.currentCommandBuffer || !g_context.currentDrawable) {
+        NSLog(@"[gl4metal] ERROR: No command buffer or drawable available for swap");
+        return;
     }
 
     if (g_context.swapInterval == 0) {
@@ -124,23 +148,108 @@ const GLubyte *APIENTRY glGetStringi (GLenum name, GLuint index) {
     }
 }
 
+void APIENTRY glClear(GLbitfield mask) {
+    if (!g_context) return;
+
+    g_context.pendingClearFlags |= mask;
+}
+
 void APIENTRY glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
-	if (!g_context.metalLayer) return;
-	
-	if (!g_context.currentCommandBuffer) {
-		g_context.currentCommandBuffer = [g_context.commandQueue commandBuffer];
-	}
-	
-	if (!g_context.currentDrawable) {
-		g_context.currentDrawable = [g_context.metalLayer nextDrawable];
-	}
-	
-    // NSLog(@"[gl4metal] glClearColor: (%.2f, %.2f, %.2f, %.2f)", red, green, blue, alpha);
-    NSLog(@"[gl4metal] glClearColor: New frame, draw ready");
+	if (!g_context) return;
+    g_context.clearColor = MTLClearColorMake(red, green, blue, alpha);
+}
+
+void APIENTRY glClearDepth(GLclampd depth) {
+    if (!g_context) return;
+    g_context.clearDepth = depth;
+}
+
+static MTLRenderPassDescriptor* createRenderPassDescriptor() {
+    if (!g_context || !g_context.currentDrawable) return nil;
+
+    CGSize drawableSize = CGSizeMake(g_context.currentDrawable.texture.width, g_context.currentDrawable.texture.height);
+    ensureDepthTexture(drawableSize);
+
+    MTLRenderPassDescriptor *passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+
+    passDesc.colorAttachments[0].texture = g_context.currentDrawable.texture;
+    passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    if (g_context.pendingClearFlags & GL_COLOR_BUFFER_BIT) {
+        passDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
+        passDesc.colorAttachments[0].clearColor = g_context.clearColor;
+        g_context.pendingClearFlags &= ~GL_COLOR_BUFFER_BIT;
+    } else {
+        passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    }
+
+    passDesc.depthAttachment.texture = g_context.depthTexture;
+    passDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+    if (g_context.pendingClearFlags & GL_DEPTH_BUFFER_BIT) {
+        passDesc.depthAttachment.loadAction = MTLLoadActionClear;
+        passDesc.depthAttachment.clearDepth = g_context.clearDepth;
+        g_context.pendingClearFlags &= ~GL_DEPTH_BUFFER_BIT;
+    } else {
+        passDesc.depthAttachment.loadAction = MTLLoadActionLoad;
+    }
+    
+    return passDesc;
 }
 
 void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    NSLog(@"[gl4metal] glViewport: x=%d, y=%d, width=%d, height=%d", x, y, width, height);
+    if (!g_context) return;
+    g_context.viewport = (gl4metalRect){x, y, width, height};
+}
+
+void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    if (!g_context) return;
+    g_context.scissorRect = (gl4metalRect){x, y, width, height};
+}
+
+static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInteger targetWidth, NSUInteger targetHeight) {
+    if (!encoder || targetWidth == 0 || targetHeight == 0) return;
+
+    gl4metalRect viewport = g_context.viewport;
+    double metalViewportY = (double)targetHeight - ((double)viewport.y + (double)viewport.height);
+
+    MTLViewport mtlViewport = {
+        .originX = (double)viewport.x,
+        .originY = metalViewportY,
+        .width = (double)viewport.width,
+        .height = (double)viewport.height,
+        .znear = 0.0,
+        .zfar = 1.0
+    };
+    [encoder setViewport:mtlViewport];
+
+    MTLScissorRect mtlScissor;
+
+    if (g_context.scissorTestEnabled) {
+        gl4metalRect scissor = g_context.scissorRect;
+        NSInteger flippedY = (NSInteger)targetHeight - ((NSInteger)scissor.y + (NSInteger)scissor.height);
+        
+        NSInteger clampedX = MAX(0, MIN((NSInteger)targetWidth, (NSInteger)scissor.x));
+        NSInteger clampedY = MAX(0, MIN((NSInteger)targetHeight, flippedY));
+        NSUInteger clampedWidth = MAX(0, MIN((NSUInteger)targetWidth - clampedX, (NSUInteger)scissor.width));
+        NSUInteger clampedHeight = MAX(0, MIN((NSUInteger)targetHeight - clampedY, (NSUInteger)scissor.height));
+
+        mtlScissor = (MTLScissorRect){
+            .x = (NSUInteger)clampedX,
+            .y = (NSUInteger)clampedY,
+            .width = (NSUInteger)clampedWidth,
+            .height = (NSUInteger)clampedHeight
+        };
+    } else {
+        mtlScissor = (MTLScissorRect){
+            .x = 0,
+            .y = 0,
+            .width = targetWidth,
+            .height = targetHeight
+        };
+    }
+
+    [encoder setScissorRect:mtlScissor];
 }
 
 void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers) {
@@ -279,21 +388,15 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     if (!g_context.currentCommandBuffer) g_context.currentCommandBuffer = [g_context.commandQueue commandBuffer];
     if (!g_context.currentDrawable) g_context.currentDrawable = [g_context.metalLayer nextDrawable];
 
-    CGSize drawableSize = CGSizeMake(g_context.currentDrawable.texture.width, g_context.currentDrawable.texture.height);
-    ensureDepthTexture(drawableSize);
-
-    MTLRenderPassDescriptor *renderPassDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-    renderPassDesc.colorAttachments[0].texture = g_context.currentDrawable.texture;
-    renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-
-    renderPassDesc.depthAttachment.texture = g_context.depthTexture;
-    renderPassDesc.depthAttachment.loadAction = MTLLoadActionLoad;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
+    MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
 
     id<MTLRenderCommandEncoder> encoder = [g_context.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) NSLog(@"Failed to create MTLRenderCommandEncoder"); return;
+
+    // Set viewport and scissor rect based on current context settings
+    NSUInteger targetWidth = g_context.currentDrawable.texture.width;
+    NSUInteger targetHeight = g_context.currentDrawable.texture.height;
+    applyViewportAndScissor(encoder, targetWidth, targetHeight);
 
     if (g_context.depthStencilState) {
         [encoder setDepthStencilState:g_context.depthStencilState];
@@ -357,10 +460,7 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
         return;
     }
 
-    MTLRenderPassDescriptor *renderPassDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-    renderPassDesc.colorAttachments[0].texture = g_context.currentDrawable.texture;
-    renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad; // Use existing content
-    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
 
     id<MTLRenderCommandEncoder> encoder = [g_context.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) {
@@ -454,10 +554,16 @@ BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction>
 }
 
 void APIENTRY glEnable(GLenum cap) {
+    if (!g_context) return;
+
     if (cap == GL_DEPTH_TEST) {
         if (!g_context.depthTestEnabled) {
             g_context.depthTestEnabled = GL_TRUE;
             updateDepthStencilState();
+        }
+    } else if (cap == GL_SCISSOR_TEST) {
+        if (!g_context.scissorTestEnabled) {
+            g_context.scissorTestEnabled = GL_TRUE;
         }
     }
 }
@@ -467,6 +573,10 @@ void APIENTRY glDisable(GLenum cap) {
         if (g_context.depthTestEnabled) {
             g_context.depthTestEnabled = GL_FALSE;
             updateDepthStencilState();
+        }
+    } else if (cap == GL_SCISSOR_TEST) {
+        if (g_context.scissorTestEnabled) {
+            g_context.scissorTestEnabled = GL_FALSE;
         }
     }
 }
@@ -493,10 +603,240 @@ void APIENTRY glUseProgram(GLuint program) {
 
 GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
     if (!g_context) return GL_FRAMEBUFFER_UNSUPPORTED;
-    // For simplicity, we assume the framebuffer is always complete in this example
+    // Unimplemented: In a full implementation, you would check the framebuffer completeness here.
+    NSLog(@"[gl4metal] glCheckFramebufferStatus called for target 0x%X (not fully implemented)", target);
     return GL_FRAMEBUFFER_COMPLETE;
 }
 
 void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
     if (!g_context || !data) return;
+    NSLog(@"[gl4metal] glGetIntegerv called for pname 0x%X (not implemented)", pname);
+}
+
+void APIENTRY glGetFloatv(GLenum pname, GLfloat *data) {
+    if (!g_context || !data) return;
+    NSLog(@"[gl4metal] glGetFloatv called for pname 0x%X (not implemented)", pname);
+}
+
+void APIENTRY glGetBooleanv(GLenum pname, GLboolean *data) {
+    if (!g_context || !data) return;
+    NSLog(@"[gl4metal] glGetBooleanv called for pname 0x%X (not implemented)", pname);
+}
+
+void APIENTRY glGetVertexAttribiv(GLuint index, GLenum pname, GLint *params) {
+    if (!g_context || !params) return;
+    NSLog(@"[gl4metal] glGetVertexAttribiv called for index %u and pname 0x%X (not implemented)", index, pname);
+}
+
+void APIENTRY glGetVertexAttribfv(GLuint index, GLenum pname, GLfloat *params) {
+    if (!g_context || !params) return;
+    NSLog(@"[gl4metal] glGetVertexAttribfv called for index %u and pname 0x%X (not implemented)", index, pname);
+}
+
+void APIENTRY glGetVertexAttribPointerv(GLuint index, GLenum pname, void **pointer) {
+    if (!g_context || !pointer) return;
+    NSLog(@"[gl4metal] glGetVertexAttribPointerv called for index %u and pname 0x%X (not implemented)", index, pname);
+}
+
+void APIENTRY glDeleteBuffers(GLsizei n, const GLuint *buffers) {
+    if (!buffers) return;
+    for (GLsizei i = 0; i < n; i++) {
+        [g_bufferObjects removeObjectForKey:@(buffers[i])];
+    }
+}
+
+void APIENTRY glDeleteProgram(GLuint program) {
+    NSLog(@"[gl4metal] glDeleteProgram called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glDeleteShader(GLuint shader) {
+    NSLog(@"[gl4metal] glDeleteShader called for shader ID: %u (not implemented)", shader);
+}
+
+void APIENTRY glDetachShader(GLuint program, GLuint shader) {
+    NSLog(@"[gl4metal] glDetachShader called for program ID: %u and shader ID: %u (not implemented)", program, shader);
+}
+
+void APIENTRY glLinkProgram(GLuint program) {
+    NSLog(@"[gl4metal] glLinkProgram called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glCompileShader(GLuint shader) {
+    NSLog(@"[gl4metal] glCompileShader called for shader ID: %u (not implemented)", shader);
+}
+
+void APIENTRY glShaderSource(GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length) {
+    NSLog(@"[gl4metal] glShaderSource called for shader ID: %u (not implemented)", shader);
+}
+
+void APIENTRY glAttachShader(GLuint program, GLuint shader) {
+    NSLog(@"[gl4metal] glAttachShader called for program ID: %u and shader ID: %u (not implemented)", program, shader);
+}
+
+void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetProgramiv called for program ID: %u and pname 0x%X (not implemented)", program, pname);
+}
+
+void APIENTRY glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
+    if (!infoLog) return;
+    NSLog(@"[gl4metal] glGetProgramInfoLog called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetShaderiv called for shader ID: %u and pname 0x%X (not implemented)", shader, pname);
+}
+
+void APIENTRY glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
+    if (!infoLog) return;
+    NSLog(@"[gl4metal] glGetShaderInfoLog called for shader ID: %u (not implemented)", shader);
+}
+
+void APIENTRY glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei *count, GLuint *shaders) {
+    if (!shaders) return;
+    NSLog(@"[gl4metal] glGetAttachedShaders called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    if (!name) return;
+    NSLog(@"[gl4metal] glGetActiveUniform called for program ID: %u and index %u (not implemented)", program, index);
+}
+
+void APIENTRY glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    if (!name) return;
+    NSLog(@"[gl4metal] glGetActiveAttrib called for program ID: %u and index %u (not implemented)", program, index);
+}
+
+GLint APIENTRY glGetUniformLocation(GLuint program, const GLchar *name) {
+    NSLog(@"[gl4metal] glGetUniformLocation called for program ID: %u and name: %s (not implemented)", program, name);
+    return program;
+}
+
+void APIENTRY glUniform1f(GLint location, GLfloat v0) {
+    NSLog(@"[gl4metal] glUniform1f called for location: %d and value: %f (not implemented)", location, v0);
+}
+
+void APIENTRY glUniform1i(GLint location, GLint v0) {
+    NSLog(@"[gl4metal] glUniform1i called for location: %d and value: %d (not implemented)", location, v0);
+}
+
+void APIENTRY glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix4fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
+    NSLog(@"[gl4metal] glUniform4f called for location: %d and values: (%f, %f, %f, %f) (not implemented)", location, v0, v1, v2, v3);
+}
+
+void APIENTRY glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) {
+    NSLog(@"[gl4metal] glUniform4i called for location: %d and values: (%d, %d, %d, %d) (not implemented)", location, v0, v1, v2, v3);
+}
+
+void APIENTRY glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) {
+    NSLog(@"[gl4metal] glUniform3f called for location: %d and values: (%f, %f, %f) (not implemented)", location, v0, v1, v2);
+}
+
+void APIENTRY glUniform3i(GLint location, GLint v0, GLint v1, GLint v2) {
+    NSLog(@"[gl4metal] glUniform3i called for location: %d and values: (%d, %d, %d) (not implemented)", location, v0, v1, v2);
+}
+
+void APIENTRY glUniform2f(GLint location, GLfloat v0, GLfloat v1) {
+    NSLog(@"[gl4metal] glUniform2f called for location: %d and values: (%f, %f) (not implemented)", location, v0, v1);
+}
+
+void APIENTRY glUniform2i(GLint location, GLint v0, GLint v1) {
+    NSLog(@"[gl4metal] glUniform2i called for location: %d and values: (%d, %d) (not implemented)", location, v0, v1);
+}
+
+void APIENTRY glUniform1fv(GLint location, GLsizei count, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniform1fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *value) {
+    NSLog(@"[gl4metal] glUniform1iv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix3fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix2fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix2x3fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix3x2fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix2x4fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix4x2fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix3x4fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    NSLog(@"[gl4metal] glUniformMatrix4x3fv called for location: %d and count: %d (not implemented)", location, count);
+}
+
+void APIENTRY glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetUniformfv called for program ID: %u and location: %d (not implemented)", program, location);
+}
+
+void APIENTRY glGetUniformiv(GLuint program, GLint location, GLint *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetUniformiv called for program ID: %u and location: %d (not implemented)", program, location);
+}
+
+void APIENTRY glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetUniformuiv called for program ID: %u and location: %d (not implemented)", program, location);
+}
+
+GLint APIENTRY glGetAttribLocation(GLuint program, const GLchar *name) {
+    NSLog(@"[gl4metal] glGetAttribLocation called for program ID: %u and name: %s (not implemented)", program, name);
+    return program;
+}
+
+void APIENTRY glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *source) {
+    if (!source) return;
+    NSLog(@"[gl4metal] glGetShaderSource called for shader ID: %u (not implemented)", shader);
+}
+
+void APIENTRY glGetProgramBinary(GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary) {
+    if (!binary) return;
+    NSLog(@"[gl4metal] glGetProgramBinary called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glProgramBinary(GLuint program, GLenum binaryFormat, const void *binary, GLsizei length) {
+    NSLog(@"[gl4metal] glProgramBinary called for program ID: %u (not implemented)", program);
+}
+
+void APIENTRY glProgramParameteri(GLuint program, GLenum pname, GLint value) {
+    NSLog(@"[gl4metal] glProgramParameteri called for program ID: %u and pname: 0x%X (not implemented)", program, pname);
+}
+
+void APIENTRY glGetProgramPipelineiv(GLuint pipeline, GLenum pname, GLint *params) {
+    if (!params) return;
+    NSLog(@"[gl4metal] glGetProgramPipelineiv called for pipeline ID: %u and pname: 0x%X (not implemented)", pipeline, pname);
+}
+
+void APIENTRY glBindProgramPipeline(GLuint pipeline) {
+    NSLog(@"[gl4metal] glBindProgramPipeline called for pipeline ID: %u (not implemented)", pipeline);
+}
+
+void APIENTRY glDeleteProgramPipelines(GLsizei n, const GLuint *pipelines) {
+    if (!pipelines) return;
+    NSLog(@"[gl4metal] glDeleteProgramPipelines called for %d pipelines (not implemented)", n);
 }

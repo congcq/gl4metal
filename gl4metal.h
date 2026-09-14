@@ -8,7 +8,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
-#include <glcorearb.h>
+#include "glcorearb.h"
 
 typedef struct {
     GLboolean enabled;
@@ -19,6 +19,13 @@ typedef struct {
     const void *pointer;
     GLuint boundVBO;
 } gl4metalVertexAttrib;
+
+typedef struct {
+    GLint x;
+    GLint y;
+    GLsizei width;
+    GLsizei height;
+} gl4metalRect;
 
 @interface gl4metalVertexArray : NSObject {
     @public gl4metalVertexAttrib attribs[16];
@@ -49,6 +56,14 @@ typedef struct {
 @property (nonatomic, strong) id<MTLDepthStencilState> depthStencilState;
 @property (nonatomic, strong) id<MTLTexture> depthTexture;
 
+@property (nonatomic, assign) MTLClearColor clearColor;
+@property (nonatomic, assign) double clearDepth;
+@property (nonatomic, assign) GLbitfield pendingClearFlags;
+
+@property (nonatomic, assign) gl4metalRect viewport;
+@property (nonatomic, assign) gl4metalRect scissorRect;
+@property (nonatomic, assign) GLboolean scissorTestEnabled;
+
 @end
 
 #ifdef __cplusplus
@@ -63,6 +78,7 @@ void APIENTRY glSwapInterval(GLint interval);
 
 void APIENTRY glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha);
 void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height);
 
 void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers);
 void APIENTRY glBindBuffer(GLenum target, GLuint buffer);
@@ -87,10 +103,13 @@ void APIENTRY glDisable(GLenum cap);
 void APIENTRY glDepthFunc(GLenum func);
 void APIENTRY glDepthMask(GLboolean flag);
 void APIENTRY glClear(GLbitfield mask);
+void APIENTRY glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha);
 void APIENTRY glClearDepth(GLclampd depth);
 
 static void updateDepthStencilState(void);
 static void ensureDepthTexture(CGSize size);
+static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInteger targetWidth, NSUInteger targetHeight);
+static MTLRenderPassDescriptor* createRenderPassDescriptor();
 BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction> fragmentFunction, MTLVertexDescriptor *vertexDescriptor);
 
 #ifdef __cplusplus
