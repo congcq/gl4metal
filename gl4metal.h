@@ -40,6 +40,8 @@ typedef struct {
 @interface gl4metalContext : NSObject
 
 @property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, assign) NSUInteger gpuFamily;
+@property (nonatomic, copy) NSString *gpuFamilyName;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *boundBuffers;
 @property (nonatomic, assign) GLuint currentVAO;
@@ -51,10 +53,24 @@ typedef struct {
 @property (nonatomic, strong) id<CAMetalDrawable> currentDrawable;
 @property (nonatomic, strong) id<MTLCommandBuffer> currentCommandBuffer;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *programPipelines;
 
 @property (nonatomic, assign) GLboolean depthTestEnabled;
 @property (nonatomic, assign) GLboolean depthWriteEnabled;
 @property (nonatomic, assign) GLenum depthFunc;
+@property (nonatomic, assign) GLboolean cullEnabled;
+@property (nonatomic, assign) GLenum cullFace;
+@property (nonatomic, assign) GLenum frontFace;
+@property (nonatomic, assign) GLenum polygonMode;
+@property (nonatomic, assign) GLfloat lineWidth;
+@property (nonatomic, assign) GLfloat pointSize;
+@property (nonatomic, assign) GLint clearStencil;
+@property (nonatomic, assign) GLuint stencilWriteMask;
+@property (nonatomic, assign) GLboolean colorMaskRed;
+@property (nonatomic, assign) GLboolean colorMaskGreen;
+@property (nonatomic, assign) GLboolean colorMaskBlue;
+@property (nonatomic, assign) GLboolean colorMaskAlpha;
+@property (nonatomic, assign) GLenum drawBuffer;
 
 @property (nonatomic, strong) id<MTLDepthStencilState> depthStencilState;
 @property (nonatomic, strong) id<MTLTexture> depthTexture;
@@ -74,6 +90,8 @@ extern "C" {
 #endif
 
 GLboolean gl4metalInit(void);
+const char *gl4metalGetDeviceName(void);
+NSUInteger gl4metalGetGPUFamily(void);
 const GLubyte* APIENTRY glGetString(GLenum name);
 void APIENTRY glMakeCurrent(void *metalLayerPtr);
 void APIENTRY glSwapBuffers(void);
@@ -83,7 +101,11 @@ static void updateDepthStencilState(void);
 static void ensureDepthTexture(CGSize size);
 static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInteger targetWidth, NSUInteger targetHeight);
 static MTLRenderPassDescriptor* createRenderPassDescriptor();
+gl4metalVertexArray *gl4metalGetCurrentVAO(void);
+MTLVertexDescriptor *gl4metalCreateVertexDescriptorForCurrentVAO(void);
+NSString *gl4metalBuildPipelineCacheKey(GLuint program, gl4metalVertexArray *vao);
 BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction> fragmentFunction, MTLVertexDescriptor *vertexDescriptor);
+void gl4metalSetError(GLenum error);
 
 #ifdef __cplusplus
 }

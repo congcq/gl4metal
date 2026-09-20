@@ -6,40 +6,22 @@
 //
 
 #import "gl4metal.h"
+#import "gl4metal_runtime.h"
+#import "gl4metal_shaders.h"
 
-static gl4metalContext *ctx = nil;
+gl4metalVertexArray *gl4metalGetCurrentVAO(void);
 
-static GLuint nextBufferId = 1;
-static GLuint nextVAOId = 1;
+static GLintptr gl4metalResolvePointerOffset(const void *pointer, id<MTLBuffer> buffer) {
+    if (pointer == NULL || !buffer) return 0;
 
-static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *bufferObjects = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *bufferSizes = nil;
-static NSMutableDictionary<NSNumber *, gl4metalVertexArray *> *vaoObjects = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *framebufferObjects = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *renderbufferObjects = nil;
-
-GLenum lastGL4MetalError = GL_NO_ERROR;
-
-static GLuint nextShaderId = 1;
-static GLuint nextProgramId = 1;
-static GLuint currentProgram = 0;
-
-static NSMutableDictionary<NSNumber *, NSNumber *> *shaderTypes = nil;
-static NSMutableDictionary<NSNumber *, NSString *> *shaderSources = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus = nil;
-static NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus = nil;
-static NSMutableDictionary<NSNumber *, NSString *> *programInfoLog = nil;
-
-static NSMutableDictionary<NSNumber *, NSValue *> *uniform1fValues = nil;
-static NSMutableDictionary<NSNumber *, NSValue *> *uniform2fValues = nil;
-static NSMutableDictionary<NSNumber *, NSValue *> *uniform3fValues = nil;
-static NSMutableDictionary<NSNumber *, NSValue *> *uniform4fValues = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *uniform1iValues = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *uniform2iValues = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *uniform3iValues = nil;
-static NSMutableDictionary<NSNumber *, NSNumber *> *uniform4iValues = nil;
-static NSMutableDictionary<NSNumber *, NSValue *> *uniformMatrix4fvValues = nil;
+    uintptr_t raw = (uintptr_t)pointer;
+    size_t bufferLength = (size_t)[buffer length];
+    if (raw > bufferLength) {
+        NSLog(@"[gl4metal] WARNING: pointer offset 0x%zx exceeds bound buffer length 0x%zx; clamping to 0", (size_t)raw, bufferLength);
+        return 0;
+    }
+    return (GLintptr)raw;
+}
 
 static GLint gl4metalResolveLocationFromName(const char *name) {
     if (name == NULL) return -1;
@@ -62,8 +44,35 @@ static GLint gl4metalResolveLocationFromName(const char *name) {
     return (GLint)(hash & 0x7fffffff);
 }
 
-static void gl4metalSetError(GLenum error) {
+void gl4metalSetError(GLenum error) {
     lastGL4MetalError = error;
+}
+
+static void gl4metalUpdateFallbackMVP(const GLfloat *value, GLsizei count) {
+    if (!ctx || !value || count <= 0) return;
+
+    size_t copyCount = MIN((size_t)count, 16u);
+    memcpy(cachedFallbackMVP, value, copyCount * sizeof(GLfloat));
+    if (copyCount < 16) {
+        memset(cachedFallbackMVP + copyCount, 0, (16 - copyCount) * sizeof(GLfloat));
+    }
+    cachedFallbackMVPIsValid = YES;
+}
+
+static void gl4metalGetFallbackMVP(float matrix[16]) {
+    static const float identity[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    if (cachedFallbackMVPIsValid) {
+        memcpy(matrix, cachedFallbackMVP, sizeof(cachedFallbackMVP));
+        return;
+    }
+
+    memcpy(matrix, identity, sizeof(identity));
 }
 
 @implementation gl4metalVertexArray
@@ -72,10 +81,17 @@ static void gl4metalSetError(GLenum error) {
 @implementation gl4metalContext
 @end
 
-#pragma mark - OpenGL implementation
+const char *gl4metalGetDeviceName(void) {
+    NSString *device = [NSString stringWithFormat:@"gl4metal (%@)", ctx.device ? ctx.device.name : @"Unknown"];
+    return device.UTF8String;
+}
+
+NSUInteger gl4metalGetGPUFamily(void) {
+    return ctx ? ctx.gpuFamily : 0;
+}
 
 GLboolean APIENTRY gl4metalInit(void) {
-    if (ctx != nil) return GL_TRUE;
+    if (ctx) return GL_TRUE;
 
     ctx = [[gl4metalContext alloc] init];
     ctx.device = MTLCreateSystemDefaultDevice();
@@ -83,221 +99,247 @@ GLboolean APIENTRY gl4metalInit(void) {
 
     ctx.commandQueue = [ctx.device newCommandQueue];
     ctx.boundBuffers = [[NSMutableDictionary alloc] init];
-    ctx.currentVAO = 0;
-    ctx.currentFramebuffer = 0;
-    ctx.currentReadFramebuffer = 0;
-    // ctx.swapInterval = 1;
-
-    bufferObjects = [[NSMutableDictionary alloc] init];
-    bufferSizes = [[NSMutableDictionary alloc] init];
-    vaoObjects = [[NSMutableDictionary alloc] init];
-    framebufferObjects = [[NSMutableDictionary alloc] init];
-    renderbufferObjects = [[NSMutableDictionary alloc] init];
-    shaderTypes = [[NSMutableDictionary alloc] init];
-    shaderSources = [[NSMutableDictionary alloc] init];
-    shaderCompileStatus = [[NSMutableDictionary alloc] init];
-    programShaders = [[NSMutableDictionary alloc] init];
-    programLinkStatus = [[NSMutableDictionary alloc] init];
-    programInfoLog = [[NSMutableDictionary alloc] init];
-    uniform1fValues = [[NSMutableDictionary alloc] init];
-    uniform2fValues = [[NSMutableDictionary alloc] init];
-    uniform3fValues = [[NSMutableDictionary alloc] init];
-    uniform4fValues = [[NSMutableDictionary alloc] init];
-    uniform1iValues = [[NSMutableDictionary alloc] init];
-    uniform2iValues = [[NSMutableDictionary alloc] init];
-    uniform3iValues = [[NSMutableDictionary alloc] init];
-    uniform4iValues = [[NSMutableDictionary alloc] init];
-    uniformMatrix4fvValues = [[NSMutableDictionary alloc] init];
-    currentProgram = 0;
-    lastGL4MetalError = GL_NO_ERROR;
-
-    NSLog(@"[gl4metal] Context created on device: %@", ctx.device.name);
-
+    ctx.programPipelines = [[NSMutableDictionary alloc] init];
+    ctx.viewport = (gl4metalRect){0, 0, 800, 600};
+    ctx.scissorRect = (gl4metalRect){0, 0, 800, 600};
     ctx.depthTestEnabled = GL_FALSE;
     ctx.depthWriteEnabled = GL_TRUE;
     ctx.depthFunc = GL_LESS;
-    updateDepthStencilState();
-
+    ctx.cullEnabled = GL_FALSE;
+    ctx.cullFace = GL_BACK;
+    ctx.frontFace = GL_CCW;
+    ctx.polygonMode = GL_FILL;
+    ctx.lineWidth = 1.0f;
+    ctx.pointSize = 1.0f;
+    ctx.clearStencil = 0;
+    ctx.stencilWriteMask = 0xffffffffu;
+    ctx.colorMaskRed = GL_TRUE;
+    ctx.colorMaskGreen = GL_TRUE;
+    ctx.colorMaskBlue = GL_TRUE;
+    ctx.colorMaskAlpha = GL_TRUE;
+    ctx.drawBuffer = GL_BACK;
     ctx.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     ctx.clearDepth = 1.0;
-    ctx.pendingClearFlags = 0;
 
-    // Initialize viewport and scissor rect to default values
-    ctx.viewport = (gl4metalRect){0, 0, 800, 600};
-    ctx.scissorRect = (gl4metalRect){0, 0, 800, 600};
-    ctx.scissorTestEnabled = GL_FALSE;
-
+    bufferObjects = [NSMutableDictionary dictionary];
+    bufferSizes = [NSMutableDictionary dictionary];
+    convertedIndexBuffers = [NSMutableDictionary dictionary];
+    vaoObjects = [NSMutableDictionary dictionary];
+    framebufferObjects = [NSMutableDictionary dictionary];
+    renderbufferObjects = [NSMutableDictionary dictionary];
+    shaderTypes = [NSMutableDictionary dictionary];
+    shaderSources = [NSMutableDictionary dictionary];
+    shaderCompileStatus = [NSMutableDictionary dictionary];
+    programShaders = [NSMutableDictionary dictionary];
+    programLinkStatus = [NSMutableDictionary dictionary];
+    programInfoLog = [NSMutableDictionary dictionary];
+    uniform1fValues = [NSMutableDictionary dictionary];
+    uniform2fValues = [NSMutableDictionary dictionary];
+    uniform3fValues = [NSMutableDictionary dictionary];
+    uniform4fValues = [NSMutableDictionary dictionary];
+    uniform1iValues = [NSMutableDictionary dictionary];
+    uniform2iValues = [NSMutableDictionary dictionary];
+    uniform3iValues = [NSMutableDictionary dictionary];
+    uniform4iValues = [NSMutableDictionary dictionary];
+    uniformMatrix4fvValues = [NSMutableDictionary dictionary];
+    uniformLocationNames = [NSMutableDictionary dictionary];
+    programAttribBindings = [NSMutableDictionary dictionary];
+    pipelineLayoutCache = [NSMutableDictionary dictionary];
+    currentProgram = 0;
+    lastGL4MetalError = GL_NO_ERROR;
+    updateDepthStencilState();
     return GL_TRUE;
 }
 
-void APIENTRY glMakeCurrent(void* metalLayerPtr) {
-    if (ctx == nil) {
-	    return;
-    }
-
+void APIENTRY glMakeCurrent(void *metalLayerPtr) {
+    if (!ctx || !metalLayerPtr) return;
     CAMetalLayer *layer = (__bridge CAMetalLayer *)metalLayerPtr;
     layer.device = ctx.device;
     layer.framebufferOnly = YES;
-
     ctx.metalLayer = layer;
-    NSLog(@"[gl4metal] Context made current with CAMetalLayer");
 }
 
 void APIENTRY glSwapBuffers(void) {
-    if (!ctx) return;
-
-    if (ctx.pendingClearFlags != 0 && ctx.metalLayer) {
-        if (!ctx.currentCommandBuffer) ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-        if (!ctx.currentDrawable) ctx.currentDrawable = [ctx.metalLayer nextDrawable];
-        if (ctx.currentDrawable) {
-            MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
-            if (renderPassDesc) {
-                id<MTLRenderCommandEncoder> encoder = [ctx.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
-                [encoder endEncoding];
-            }
-        }
-    }
-
-    if (!ctx.currentCommandBuffer || !ctx.currentDrawable) {
-        NSLog(@"[gl4metal] ERROR: No command buffer or drawable available for swap");
-        return;
-    }
-
-    if (ctx.swapInterval == 0) {
-        [ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable atTime:0];
-    } else {
-        [ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
-    }
-
+    if (!ctx || !ctx.currentCommandBuffer || !ctx.currentDrawable) return;
+    [ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
     [ctx.currentCommandBuffer commit];
-
     ctx.currentCommandBuffer = nil;
     ctx.currentDrawable = nil;
 }
 
 void APIENTRY glSwapInterval(GLint interval) {
     if (!ctx) return;
-
     ctx.swapInterval = interval;
-    if (ctx.metalLayer) {
-        ctx.metalLayer.maximumDrawableCount = (interval == 0) ? 2 : 3;
-    }
-
-    NSLog(@"[gl4metal] glSwapInterval set to: %d", interval);
+    if (ctx.metalLayer) ctx.metalLayer.maximumDrawableCount = interval == 0 ? 2 : 3;
 }
 
 void APIENTRY glClear(GLbitfield mask) {
-    if (!ctx) return;
-
-    ctx.pendingClearFlags |= mask;
+    if (ctx) ctx.pendingClearFlags |= mask;
 }
 
 void APIENTRY glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
-	if (!ctx) return;
-    ctx.clearColor = MTLClearColorMake(red, green, blue, alpha);
+    if (ctx) ctx.clearColor = MTLClearColorMake(red, green, blue, alpha);
 }
 
 void APIENTRY glClearDepth(GLclampd depth) {
-    if (!ctx) return;
-    ctx.clearDepth = depth;
+    if (ctx) ctx.clearDepth = depth;
 }
 
-static MTLRenderPassDescriptor* createRenderPassDescriptor() {
+static MTLRenderPassDescriptor *createRenderPassDescriptor(void) {
     if (!ctx || !ctx.currentDrawable) return nil;
-
-    CGSize drawableSize = CGSizeMake(ctx.currentDrawable.texture.width, ctx.currentDrawable.texture.height);
-    ensureDepthTexture(drawableSize);
+    CGSize size = CGSizeMake(ctx.currentDrawable.texture.width, ctx.currentDrawable.texture.height);
+    ensureDepthTexture(size);
 
     MTLRenderPassDescriptor *passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-
     passDesc.colorAttachments[0].texture = ctx.currentDrawable.texture;
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-    if (ctx.pendingClearFlags & GL_COLOR_BUFFER_BIT) {
-        passDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-        passDesc.colorAttachments[0].clearColor = ctx.clearColor;
-        ctx.pendingClearFlags &= ~GL_COLOR_BUFFER_BIT;
-    } else {
-        passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    }
-
+    passDesc.colorAttachments[0].loadAction = (ctx.pendingClearFlags & GL_COLOR_BUFFER_BIT)
+        ? MTLLoadActionClear : MTLLoadActionLoad;
+    passDesc.colorAttachments[0].clearColor = ctx.clearColor;
     passDesc.depthAttachment.texture = ctx.depthTexture;
     passDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
-
-    if (ctx.pendingClearFlags & GL_DEPTH_BUFFER_BIT) {
-        passDesc.depthAttachment.loadAction = MTLLoadActionClear;
-        passDesc.depthAttachment.clearDepth = ctx.clearDepth;
-        ctx.pendingClearFlags &= ~GL_DEPTH_BUFFER_BIT;
-    } else {
-        passDesc.depthAttachment.loadAction = MTLLoadActionLoad;
-    }
-    
+    passDesc.depthAttachment.loadAction = (ctx.pendingClearFlags & GL_DEPTH_BUFFER_BIT)
+        ? MTLLoadActionClear : MTLLoadActionLoad;
+    passDesc.depthAttachment.clearDepth = ctx.clearDepth;
+    ctx.pendingClearFlags = 0;
     return passDesc;
 }
 
 void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    if (!ctx) return;
-    ctx.viewport = (gl4metalRect){x, y, width, height};
+    if (ctx) ctx.viewport = (gl4metalRect){x, y, width, height};
 }
 
 void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
-    if (!ctx) return;
-    ctx.scissorRect = (gl4metalRect){x, y, width, height};
+    if (ctx) ctx.scissorRect = (gl4metalRect){x, y, width, height};
 }
 
 static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInteger targetWidth, NSUInteger targetHeight) {
-    if (!encoder || targetWidth == 0 || targetHeight == 0) return;
-
+    if (!ctx || !encoder || targetWidth == 0 || targetHeight == 0) return;
     gl4metalRect viewport = ctx.viewport;
-    double metalViewportY = (double)targetHeight - ((double)viewport.y + (double)viewport.height);
+    [encoder setViewport:(MTLViewport){
+        (double)viewport.x,
+        (double)targetHeight - viewport.y - viewport.height,
+        (double)viewport.width,
+        (double)viewport.height,
+        0.0,
+        1.0
+    }];
+    gl4metalRect scissor = ctx.scissorTestEnabled ? ctx.scissorRect : (gl4metalRect){0, 0, (GLsizei)targetWidth, (GLsizei)targetHeight};
+    [encoder setScissorRect:(MTLScissorRect){
+        MAX(0, scissor.x),
+        MAX(0, (GLint)targetHeight - scissor.y - scissor.height),
+        MIN((NSUInteger)MAX(0, scissor.width), targetWidth),
+        MIN((NSUInteger)MAX(0, scissor.height), targetHeight)
+    }];
+}
 
-    MTLViewport mtlViewport = {
-        .originX = (double)viewport.x,
-        .originY = metalViewportY,
-        .width = (double)viewport.width,
-        .height = (double)viewport.height,
-        .znear = 0.0,
-        .zfar = 1.0
-    };
-    [encoder setViewport:mtlViewport];
-
-    MTLScissorRect mtlScissor;
-
-    if (ctx.scissorTestEnabled) {
-        gl4metalRect scissor = ctx.scissorRect;
-        NSInteger flippedY = (NSInteger)targetHeight - ((NSInteger)scissor.y + (NSInteger)scissor.height);
-        
-        NSInteger clampedX = MAX(0, MIN((NSInteger)targetWidth, (NSInteger)scissor.x));
-        NSInteger clampedY = MAX(0, MIN((NSInteger)targetHeight, flippedY));
-        NSUInteger clampedWidth = MAX(0, MIN((NSUInteger)targetWidth - clampedX, (NSUInteger)scissor.width));
-        NSUInteger clampedHeight = MAX(0, MIN((NSUInteger)targetHeight - clampedY, (NSUInteger)scissor.height));
-
-        mtlScissor = (MTLScissorRect){
-            .x = (NSUInteger)clampedX,
-            .y = (NSUInteger)clampedY,
-            .width = (NSUInteger)clampedWidth,
-            .height = (NSUInteger)clampedHeight
-        };
-    } else {
-        mtlScissor = (MTLScissorRect){
-            .x = 0,
-            .y = 0,
-            .width = targetWidth,
-            .height = targetHeight
-        };
+void APIENTRY glCullFace(GLenum mode) {
+    if (mode != GL_FRONT && mode != GL_BACK && mode != GL_FRONT_AND_BACK) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
     }
+    ctx.cullFace = mode;
+    gl4metalSetError(GL_NO_ERROR);
+}
 
-    [encoder setScissorRect:mtlScissor];
+void APIENTRY glFrontFace(GLenum mode) {
+    if (mode != GL_CW && mode != GL_CCW) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    ctx.frontFace = mode;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPolygonMode(GLenum face, GLenum mode) {
+    if (face != GL_FRONT_AND_BACK || (mode != GL_POINT && mode != GL_LINE && mode != GL_FILL)) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    ctx.polygonMode = mode;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glLineWidth(GLfloat width) {
+    if (width <= 0.0f) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    ctx.lineWidth = width;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPointSize(GLfloat size) {
+    if (size <= 0.0f) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    ctx.pointSize = size;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glClearStencil(GLint s) {
+    ctx.clearStencil = s;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilMask(GLuint mask) {
+    ctx.stencilWriteMask = mask;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+    ctx.colorMaskRed = red;
+    ctx.colorMaskGreen = green;
+    ctx.colorMaskBlue = blue;
+    ctx.colorMaskAlpha = alpha;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDrawBuffer(GLenum buf) {
+    if (buf != GL_BACK && buf != GL_NONE) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    ctx.drawBuffer = buf;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glHint(GLenum target, GLenum mode) {
+    (void)target;
+    (void)mode;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+static void applyRasterState(id<MTLRenderCommandEncoder> encoder) {
+    if (!ctx || !encoder) return;
+
+    MTLCullMode cullMode = MTLCullModeNone;
+    if (ctx.cullEnabled) {
+        cullMode = ctx.cullFace == GL_FRONT ? MTLCullModeFront : MTLCullModeBack;
+    }
+    [encoder setCullMode:cullMode];
+    [encoder setFrontFacingWinding:ctx.frontFace == GL_CW ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    [encoder setTriangleFillMode:ctx.polygonMode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 }
 
 void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers) {
-    if (!buffers) return;
+    if (!buffers || n < 0) return;
+    for (GLsizei i = 0; i < n; i++) buffers[i] = nextBufferId++;
+}
+
+void APIENTRY glGenVertexArrays(GLsizei n, GLuint *arrays) {
+    if (!arrays || n < 0) return;
     for (GLsizei i = 0; i < n; i++) {
-        buffers[i] = nextBufferId++;
+        GLuint id = nextVAOId++;
+        arrays[i] = id;
+        gl4metalVertexArray *vao = [[gl4metalVertexArray alloc] init];
+        vao.id = id;
+        vaoObjects[@(id)] = vao;
     }
 }
 
-static gl4metalVertexArray *gl4metalGetCurrentVAO(void) {
+gl4metalVertexArray *gl4metalGetCurrentVAO(void) {
     if (!ctx || ctx.currentVAO == 0) return nil;
     return vaoObjects[@(ctx.currentVAO)];
 }
@@ -328,12 +370,35 @@ void APIENTRY glBindBuffer(GLenum target, GLuint buffer) {
     }
 }
 
+void APIENTRY glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    (void)index; (void)offset; (void)size;
+    glBindBuffer(target, buffer);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    (void)index;
+    glBindBuffer(target, buffer);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
+    (void)usage;
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
 
     if (currentBound == 0) {
         NSLog(@"[gl4metal] ERROR: glBufferData called with no bound buffer for target 0x%X", target);
         return;
+    }
+
+    if (size <= 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+
+    id<MTLBuffer> oldBuffer = bufferObjects[@(currentBound)];
+    if (oldBuffer) {
+        [convertedIndexBuffers removeAllObjects];
     }
 
     id<MTLBuffer> mtlBuffer = nil;
@@ -346,7 +411,25 @@ void APIENTRY glBufferData(GLenum target, GLsizeiptr size, const void *data, GLe
     if (mtlBuffer) {
         bufferObjects[@(currentBound)] = mtlBuffer;
         bufferSizes[@(currentBound)] = @(size);
+        gl4metalSetError(GL_NO_ERROR);
+    } else {
+        gl4metalSetError(GL_OUT_OF_MEMORY);
     }
+}
+
+void APIENTRY glDeleteBuffers(GLsizei n, const GLuint *buffers) {
+    if (n < 0 || (n > 0 && !buffers)) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    for (GLsizei i = 0; i < n; i++) {
+        GLuint buffer = buffers[i];
+        if (buffer == 0) continue;
+        [bufferObjects removeObjectForKey:@(buffer)];
+        [bufferSizes removeObjectForKey:@(buffer)];
+        [convertedIndexBuffers removeAllObjects];
+    }
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
@@ -358,6 +441,7 @@ void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, c
     if ((size_t)offset + (size_t)size > bufferLength) return;
 
     memcpy((char *)[buffer contents] + offset, data, size);
+    [convertedIndexBuffers removeAllObjects];
     bufferSizes[@(currentBound)] = @(MAX((NSInteger)[bufferSizes[@(currentBound)] integerValue], (NSInteger)(offset + size)));
 }
 
@@ -453,18 +537,6 @@ GLboolean APIENTRY glUnmapBuffer(GLenum target) {
 }
 
 // VAO State
-void APIENTRY glGenVertexArrays(GLsizei n, GLuint *arrays) {
-    if (!arrays) return;
-
-    for (GLsizei i = 0; i < n; i++) {
-        GLuint vaoId = nextVAOId++;
-        arrays[i] = vaoId;
-        gl4metalVertexArray *vao = [[gl4metalVertexArray alloc] init];
-        vao.id = vaoId;
-        vaoObjects[@(vaoId)] = vao;
-    }
-}
-
 void APIENTRY glBindVertexArray(GLuint array) {
     ctx.currentVAO = array;
     if (array == 0) {
@@ -552,7 +624,8 @@ void APIENTRY glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboo
         stride = (GLsizei)(size * (GLint)elemSize);
     }
 
-    GLintptr pointerOffset = (pointer != NULL) ? (GLintptr)(uintptr_t)pointer : 0;
+    id<MTLBuffer> boundBuffer = bufferObjects[@(currentVBO)];
+    GLintptr pointerOffset = gl4metalResolvePointerOffset(pointer, boundBuffer);
 
     vao->attribs[index].enabled = GL_TRUE;
     vao->attribs[index].size = size;
@@ -561,6 +634,16 @@ void APIENTRY glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboo
     vao->attribs[index].stride = stride;
     vao->attribs[index].pointerOffset = pointerOffset;
     vao->attribs[index].boundVBO = currentVBO;
+}
+
+void APIENTRY glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer) {
+    glVertexAttribPointer(index, size, type, GL_FALSE, stride, pointer);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttribDivisor(GLuint index, GLuint divisor) {
+    (void)index; (void)divisor;
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {
@@ -689,58 +772,113 @@ void APIENTRY glLinkProgram(GLuint program) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
-static BOOL gl4metalCreateDefaultProgramPipelineForProgram(GLuint program) {
-    if (!ctx || !ctx.device) return NO;
+static MTLVertexFormat gl4metalVertexFormatForAttrib(const gl4metalVertexAttrib *attrib) {
+    if (!attrib) return MTLVertexFormatInvalid;
 
-    NSString *source = @"#include <metal_stdlib>\n"
-        "using namespace metal;\n"
-        "struct VertexIn {\n"
-        "    float4 position [[attribute(0)]];\n"
-        "    float4 color [[attribute(1)]];\n"
-        "};\n"
-        "struct VertexOut {\n"
-        "    float4 position [[position]];\n"
-        "    float4 color;\n"
-        "};\n"
-        "vertex VertexOut gl4metal_default_vertex(VertexIn in [[stage_in]]) {\n"
-        "    VertexOut out;\n"
-        "    out.position = in.position;\n"
-        "    out.color = in.color;\n"
-        "    return out;\n"
-        "}\n"
-        "fragment half4 gl4metal_default_fragment(VertexOut in [[stage_in]]) {\n"
-        "    return half4(in.color);\n"
-        "}\n";
+    switch (attrib->type) {
+        case GL_FLOAT:
+            switch (attrib->size) {
+                case 1: return MTLVertexFormatFloat;
+                case 2: return MTLVertexFormatFloat2;
+                case 3: return MTLVertexFormatFloat3;
+                case 4: return MTLVertexFormatFloat4;
+            }
+            break;
+        case GL_UNSIGNED_BYTE:
+            switch (attrib->size) {
+                case 1: return attrib->normalized ? MTLVertexFormatUCharNormalized : MTLVertexFormatUChar;
+                case 2: return attrib->normalized ? MTLVertexFormatUChar2Normalized : MTLVertexFormatUChar2;
+                case 4: return attrib->normalized ? MTLVertexFormatUChar4Normalized : MTLVertexFormatUChar4;
+            }
+            break;
+        case GL_UNSIGNED_SHORT:
+            switch (attrib->size) {
+                case 1: return attrib->normalized ? MTLVertexFormatUShortNormalized : MTLVertexFormatUShort;
+                case 2: return attrib->normalized ? MTLVertexFormatUShort2Normalized : MTLVertexFormatUShort2;
+                case 4: return attrib->normalized ? MTLVertexFormatUShort4Normalized : MTLVertexFormatUShort4;
+            }
+            break;
+        default:
+            break;
+    }
+    return MTLVertexFormatFloat4;
+}
 
-    NSError *error = nil;
-    id<MTLLibrary> library = [ctx.device newLibraryWithSource:source options:nil error:&error];
-    if (!library) {
-        NSLog(@"[gl4metal] ERROR: Failed to compile default Metal library for program %u: %@", program, error.localizedDescription);
-        return NO;
+MTLVertexDescriptor *gl4metalCreateVertexDescriptorForCurrentVAO(void) {
+    MTLVertexDescriptor *descriptor = [MTLVertexDescriptor vertexDescriptor];
+    gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
+
+    for (NSUInteger index = 0; index < 16; index++) {
+        gl4metalVertexAttrib *attrib = vao ? &vao->attribs[index] : NULL;
+        if (!attrib || !attrib->enabled) continue;
+
+        descriptor.attributes[index].format = gl4metalVertexFormatForAttrib(attrib);
+        // pointerOffset is applied when the buffer is bound in the draw call.
+        descriptor.attributes[index].offset = 0;
+        descriptor.attributes[index].bufferIndex = index;
+        descriptor.layouts[index].stride = attrib->stride > 0
+            ? (NSUInteger)attrib->stride
+            : (NSUInteger)(MAX(attrib->size, 1) * (GLsizei)sizeof(GLfloat));
+        descriptor.layouts[index].stepRate = 1;
+        descriptor.layouts[index].stepFunction = MTLVertexStepFunctionPerVertex;
     }
 
-    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"gl4metal_default_vertex"];
-    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"gl4metal_default_fragment"];
-    if (!vertexFunction || !fragmentFunction) {
-        NSLog(@"[gl4metal] ERROR: Default Metal functions missing for program %u", program);
-        return NO;
+    if (!vao || !vao->attribs[0].enabled) {
+        descriptor.attributes[0].format = MTLVertexFormatFloat4;
+        descriptor.attributes[0].bufferIndex = 0;
+        descriptor.layouts[0].stride = sizeof(float) * 4;
+        descriptor.layouts[0].stepRate = 1;
+        descriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    if (!vao || !vao->attribs[1].enabled) {
+        descriptor.attributes[1].format = MTLVertexFormatFloat4;
+        descriptor.attributes[1].bufferIndex = 1;
+        descriptor.layouts[1].stride = sizeof(float) * 4;
+        descriptor.layouts[1].stepRate = 1;
+        descriptor.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    return descriptor;
+}
+
+
+static id<MTLRenderPipelineState> gl4metalResolveCurrentPipeline(void) {
+    if (!ctx) return nil;
+
+    if (ctx.pipelineState) {
+        return ctx.pipelineState;
     }
 
-    MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
-    vertexDescriptor.attributes[0].format = MTLVertexFormatFloat4;
-    vertexDescriptor.attributes[0].offset = 0;
-    vertexDescriptor.attributes[0].bufferIndex = 0;
-    vertexDescriptor.attributes[1].format = MTLVertexFormatFloat4;
-    vertexDescriptor.attributes[1].offset = 0;
-    vertexDescriptor.attributes[1].bufferIndex = 1;
-    vertexDescriptor.layouts[0].stride = sizeof(float) * 4;
-    vertexDescriptor.layouts[0].stepRate = 1;
-    vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-    vertexDescriptor.layouts[1].stride = sizeof(float) * 4;
-    vertexDescriptor.layouts[1].stepRate = 1;
-    vertexDescriptor.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+    if (defaultFallbackPipeline) {
+        ctx.pipelineState = defaultFallbackPipeline;
+        return defaultFallbackPipeline;
+    }
 
-    return gl4metalCreatePipelineState(vertexFunction, fragmentFunction, vertexDescriptor);
+    if (currentProgram != 0) {
+        id<MTLRenderPipelineState> cachedProgramPipeline = ctx.programPipelines[@(currentProgram)];
+        if (cachedProgramPipeline) {
+            ctx.pipelineState = cachedProgramPipeline;
+            return cachedProgramPipeline;
+        }
+
+        NSString *cacheKey = gl4metalBuildPipelineCacheKey(currentProgram, gl4metalGetCurrentVAO());
+        id<MTLRenderPipelineState> programPipeline = pipelineLayoutCache[cacheKey];
+        if (!programPipeline) {
+            if (!gl4metalCreateProgramPipelineForProgram(currentProgram)) {
+                return nil;
+            }
+            programPipeline = ctx.pipelineState;
+            if (programPipeline) {
+                ctx.programPipelines[@(currentProgram)] = programPipeline;
+                pipelineLayoutCache[cacheKey] = programPipeline;
+            }
+        }
+        if (programPipeline) {
+            ctx.pipelineState = programPipeline;
+            return programPipeline;
+        }
+    }
+
+    return ctx.pipelineState;
 }
 
 void APIENTRY glUseProgram(GLuint program) {
@@ -749,18 +887,44 @@ void APIENTRY glUseProgram(GLuint program) {
         return;
     }
 
-    if (program == 0 || [programLinkStatus[@(program)] boolValue] == GL_FALSE) {
+    if (program == 0) {
+        currentProgram = 0;
+        ctx.pipelineState = defaultFallbackPipeline;
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
+
+    if ([programLinkStatus[@(program)] boolValue] == GL_FALSE) {
         gl4metalSetError(GL_INVALID_OPERATION);
         NSLog(@"[gl4metal] glUseProgram called with unlinked or invalid program: %u", program);
         return;
     }
 
-    currentProgram = program;
-    if (!ctx.pipelineState) {
-        if (!gl4metalCreateDefaultProgramPipelineForProgram(program)) {
-            NSLog(@"[gl4metal] WARNING: Program %u linked but default Metal pipeline creation failed", program);
-        }
+    if (program == currentProgram && ctx.pipelineState) {
+        gl4metalSetError(GL_NO_ERROR);
+        return;
     }
+
+    currentProgram = program;
+    id<MTLRenderPipelineState> cachedProgramPipeline = ctx.programPipelines[@(program)];
+    if (cachedProgramPipeline) {
+        ctx.pipelineState = cachedProgramPipeline;
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
+
+    if (defaultFallbackPipeline && !ctx.pipelineState) {
+        ctx.pipelineState = defaultFallbackPipeline;
+    }
+
+    id<MTLRenderPipelineState> programPipeline = gl4metalResolveCurrentPipeline();
+    if (!programPipeline) {
+        NSLog(@"[gl4metal] WARNING: Program %u linked but custom Metal pipeline creation failed", program);
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+
+    ctx.pipelineState = programPipeline;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -770,8 +934,10 @@ GLint APIENTRY glGetUniformLocation(GLuint program, const GLchar *name) {
         return -1;
     }
 
+    GLint location = gl4metalResolveLocationFromName(name);
+    uniformLocationNames[@(location)] = [NSString stringWithUTF8String:name];
     gl4metalSetError(GL_NO_ERROR);
-    return gl4metalResolveLocationFromName(name);
+    return location;
 }
 
 void APIENTRY glUniform1f(GLint location, GLfloat v0) {
@@ -879,6 +1045,10 @@ void APIENTRY glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transp
     }
     GLfloat matrix[4] = { value[0], value[1], value[2], value[3] };
     uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[4])];
+    NSString *currentName = uniformLocationNames[@(location)];
+    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
+        gl4metalUpdateFallbackMVP(value, count * 2 * 2);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -891,6 +1061,10 @@ void APIENTRY glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transp
     GLfloat matrix[9] = { 0 };
     for (GLsizei i = 0; i < MIN(count * 3 * 3, 9); ++i) matrix[i] = value[i];
     uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[9])];
+    NSString *currentName = uniformLocationNames[@(location)];
+    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
+        gl4metalUpdateFallbackMVP(value, count * 3 * 3);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -903,6 +1077,10 @@ void APIENTRY glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transp
     GLfloat matrix[16] = { 0 };
     for (GLsizei i = 0; i < 16; ++i) matrix[i] = value[i];
     uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[16])];
+    NSString *currentName = uniformLocationNames[@(location)];
+    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
+        gl4metalUpdateFallbackMVP(value, 16);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -975,93 +1153,6 @@ void APIENTRY glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean tran
     GLfloat matrix[12] = { 0 };
     for (GLsizei i = 0; i < 12; ++i) matrix[i] = value[i];
     uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[12])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
-    if (!framebuffers || n <= 0) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-
-    for (GLsizei i = 0; i < n; i++) {
-        GLuint framebuffer = ++nextBufferId;
-        framebuffers[i] = framebuffer;
-        framebufferObjects[@(framebuffer)] = @(framebuffer);
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glBindFramebuffer(GLenum target, GLuint framebuffer) {
-    (void)target;
-    if (framebuffer == 0) {
-        ctx.currentFramebuffer = 0;
-        ctx.currentReadFramebuffer = 0;
-    } else {
-        ctx.currentFramebuffer = framebuffer;
-        ctx.currentReadFramebuffer = framebuffer;
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
-    (void)target;
-    if (!ctx) {
-        gl4metalSetError(GL_INVALID_OPERATION);
-        return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
-    }
-
-    gl4metalSetError(GL_NO_ERROR);
-    return GL_FRAMEBUFFER_COMPLETE;
-}
-
-void APIENTRY glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    (void)target; (void)attachment; (void)textarget; (void)texture; (void)level;
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
-    if (!framebuffers || n <= 0) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    for (GLsizei i = 0; i < n; i++) {
-        [framebufferObjects removeObjectForKey:@(framebuffers[i])];
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) {
-    if (!renderbuffers || n <= 0) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    for (GLsizei i = 0; i < n; i++) {
-        GLuint renderbuffer = ++nextBufferId;
-        renderbuffers[i] = renderbuffer;
-        renderbufferObjects[@(renderbuffer)] = @(renderbuffer);
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glBindRenderbuffer(GLenum target, GLuint renderbuffer) {
-    (void)target; (void)renderbuffer;
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {
-    (void)target; (void)internalformat; (void)width; (void)height;
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) {
-    if (!renderbuffers || n <= 0) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    for (GLsizei i = 0; i < n; i++) {
-        [renderbufferObjects removeObjectForKey:@(renderbuffers[i])];
-    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1207,7 +1298,7 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
             data[0] = 16;
             break;
         case GL_MAX_TEXTURE_SIZE:
-            data[0] = 4096;
+            data[0] = 16384;
             break;
         case GL_MAX_DRAW_BUFFERS:
             data[0] = 8;
@@ -1275,11 +1366,39 @@ void APIENTRY glGetBooleanv(GLenum pname, GLboolean *data) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) {
+    if (!ctx || program == 0 || name == NULL) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+
+    NSMutableDictionary<NSNumber *, NSString *> *bindings = programAttribBindings[@(program)];
+    if (!bindings) {
+        bindings = [[NSMutableDictionary alloc] init];
+        programAttribBindings[@(program)] = bindings;
+    }
+
+    bindings[@(index)] = [NSString stringWithUTF8String:name];
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 GLint APIENTRY glGetAttribLocation(GLuint program, const GLchar *name) {
-    (void)program;
     if (!ctx || name == NULL) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return -1;
+    }
+
+    if (program != 0) {
+        NSMutableDictionary<NSNumber *, NSString *> *bindings = programAttribBindings[@(program)];
+        if (bindings) {
+            NSString *attributeName = [NSString stringWithUTF8String:name];
+            for (NSNumber *index in bindings) {
+                if ([bindings[index] isEqualToString:attributeName]) {
+                    gl4metalSetError(GL_NO_ERROR);
+                    return (GLint)[index intValue];
+                }
+            }
+        }
     }
 
     NSString *attributeName = [NSString stringWithUTF8String:name];
@@ -1289,6 +1408,59 @@ GLint APIENTRY glGetAttribLocation(GLuint program, const GLchar *name) {
     NSInteger index = [knownNames indexOfObject:attributeName];
     gl4metalSetError(GL_NO_ERROR);
     return (index == NSNotFound) ? -1 : (GLint)index;
+}
+
+void APIENTRY glVertexAttrib1f(GLuint index, GLfloat x) {
+    (void)index;
+    (void)x;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttrib1fv(GLuint index, const GLfloat *v) {
+    if (v == NULL) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    glVertexAttrib1f(index, v[0]);
+}
+
+void APIENTRY glVertexAttrib2f(GLuint index, GLfloat x, GLfloat y) {
+    (void)index; (void)x; (void)y;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttrib2fv(GLuint index, const GLfloat *v) {
+    if (v == NULL) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    glVertexAttrib2f(index, v[0], v[1]);
+}
+
+void APIENTRY glVertexAttrib3f(GLuint index, GLfloat x, GLfloat y, GLfloat z) {
+    (void)index; (void)x; (void)y; (void)z;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttrib3fv(GLuint index, const GLfloat *v) {
+    if (v == NULL) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    glVertexAttrib3f(index, v[0], v[1], v[2]);
+}
+
+void APIENTRY glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
+    (void)index; (void)x; (void)y; (void)z; (void)w;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttrib4fv(GLuint index, const GLfloat *v) {
+    if (v == NULL) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    glVertexAttrib4f(index, v[0], v[1], v[2], v[3]);
 }
 
 void APIENTRY glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
@@ -1411,14 +1583,12 @@ static MTLPrimitiveType getMetalPrimitiveType(GLenum mode) {
 void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     if (!ctx || count <= 0) return;
 
-    if (!ctx.pipelineState && currentProgram != 0) {
-        gl4metalCreateDefaultProgramPipelineForProgram(currentProgram);
-    }
-
-    if (!ctx.pipelineState) {
+    id<MTLRenderPipelineState> activePipeline = ctx.pipelineState ?: gl4metalResolveCurrentPipeline();
+    if (!activePipeline) {
         NSLog(@"[gl4metal] WARNING: No valid Metal pipeline for glDrawArrays");
         return;
     }
+    ctx.pipelineState = activePipeline;
 
     if (!ctx.currentCommandBuffer) ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
     if (!ctx.currentDrawable) ctx.currentDrawable = [ctx.metalLayer nextDrawable];
@@ -1447,7 +1617,12 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         [encoder setDepthStencilState:ctx.depthStencilState];
     }
 
+    applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
+
+    float fallbackMVP[16];
+    gl4metalGetFallbackMVP(fallbackMVP);
+    [encoder setVertexBytes:fallbackMVP length:sizeof(fallbackMVP) atIndex:16];
 
     gl4metalVertexArray *currentVAO = vaoObjects[@(ctx.currentVAO)];
     if (currentVAO) {
@@ -1483,28 +1658,26 @@ static MTLIndexType getMetalIndexType(GLenum type) {
     }
 }
 
+void APIENTRY glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    if (instancecount <= 0) return;
+    glDrawArrays(mode, first, count);
+}
+
 void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     if (!ctx || count <= 0) return;
 
-    if (!ctx.pipelineState && currentProgram != 0) {
-        gl4metalCreateDefaultProgramPipelineForProgram(currentProgram);
-    }
-
-    if (!ctx.pipelineState) {
+    id<MTLRenderPipelineState> activePipeline = ctx.pipelineState ?: gl4metalResolveCurrentPipeline();
+    if (!activePipeline) {
         NSLog(@"[gl4metal] WARNING: No valid Metal pipeline for glDrawElements");
         return;
     }
+    ctx.pipelineState = activePipeline;
 
     gl4metalVertexArray *currentVAO = gl4metalGetCurrentVAO();
     GLuint elementVBO = currentVAO ? currentVAO->elementArrayBufferID : [ctx.boundBuffers[@(GL_ELEMENT_ARRAY_BUFFER)] unsignedIntValue];
 
     if (elementVBO == 0) {
         NSLog(@"[gl4metal] ERROR: glDrawElements called without bound GL_ELEMENT_ARRAY_BUFFER");
-        return;
-    }
-
-    if (type == GL_UNSIGNED_BYTE) {
-        NSLog(@"[gl4metal] WARNING: Metal does not support GL_UNSIGNED_BYTE index buffers directly; skipping draw for safety");
         return;
     }
 
@@ -1530,7 +1703,12 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
         return;
     }
 
+    applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
+
+    float fallbackMVP[16];
+    gl4metalGetFallbackMVP(fallbackMVP);
+    [encoder setVertexBytes:fallbackMVP length:sizeof(fallbackMVP) atIndex:16];
 
     if (currentVAO) {
         for (NSUInteger index = 0; index < 16; index++) {
@@ -1550,7 +1728,7 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
 
     MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
     MTLIndexType indexType = getMetalIndexType(type);
-    GLintptr indexOffsetValue = (indices != NULL) ? (GLintptr)(uintptr_t)indices : 0;
+    GLintptr indexOffsetValue = gl4metalResolvePointerOffset(indices, indexBuffer);
     NSUInteger indexOffset = 0;
     if (!gl4metalValidateBufferOffset(indexBuffer, indexOffsetValue, &indexOffset)) {
         NSLog(@"[gl4metal] WARNING: Index buffer offset invalid for glDrawElements, defaulting to 0");
@@ -1562,27 +1740,43 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
     MTLIndexType drawIndexType = indexType;
 
     if (type == GL_UNSIGNED_BYTE) {
+        NSString *cacheKey = [NSString stringWithFormat:@"%u:%lu:%d", elementVBO, (unsigned long)indexOffset, (int)count];
+        id<MTLBuffer> cachedBuffer = convertedIndexBuffers[cacheKey];
+        if (cachedBuffer) {
+            drawIndexBuffer = cachedBuffer;
+            drawIndexOffset = 0;
+            drawIndexType = MTLIndexTypeUInt16;
+        }
+
         const GLubyte *src = (const GLubyte *)((const char *)[indexBuffer contents] + indexOffset);
         if (indices != NULL && elementVBO == 0) {
             src = (const GLubyte *)indices;
         }
 
-        size_t tmpByteLength = (size_t)count * sizeof(uint16_t);
-        id<MTLBuffer> tmpBuffer = [ctx.device newBufferWithLength:tmpByteLength options:MTLResourceStorageModeShared];
-        if (tmpBuffer) {
-            uint16_t *dst = (uint16_t *)[tmpBuffer contents];
-            for (GLsizei i = 0; i < count; i++) {
-                dst[i] = (uint16_t)src[i];
+        if (!cachedBuffer) {
+            size_t tmpByteLength = (size_t)count * sizeof(uint16_t);
+            id<MTLBuffer> tmpBuffer = [ctx.device newBufferWithLength:tmpByteLength options:MTLResourceStorageModeShared];
+            if (tmpBuffer) {
+                uint16_t *dst = (uint16_t *)[tmpBuffer contents];
+                for (GLsizei i = 0; i < count; i++) {
+                    dst[i] = (uint16_t)src[i];
+                }
+                convertedIndexBuffers[cacheKey] = tmpBuffer;
+                drawIndexBuffer = tmpBuffer;
+                drawIndexOffset = 0;
+                drawIndexType = MTLIndexTypeUInt16;
             }
-            drawIndexBuffer = tmpBuffer;
-            drawIndexOffset = 0;
-            drawIndexType = MTLIndexTypeUInt16;
         }
     }
 
     [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset];
 
     [encoder endEncoding];
+}
+
+void APIENTRY glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
+    if (instancecount <= 0) return;
+    glDrawElements(mode, count, type, indices);
 }
 
 static MTLCompareFunction getMetalCompareFunction(GLenum func) {
@@ -1601,7 +1795,7 @@ static MTLCompareFunction getMetalCompareFunction(GLenum func) {
     }
 }
 
-static void updateDepthStencilState() {
+static void updateDepthStencilState(void) {
     if (!ctx || !ctx.device) return;
 
     MTLDepthStencilDescriptor *desc = [[MTLDepthStencilDescriptor alloc] init];
@@ -1635,6 +1829,11 @@ BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction>
     pipelineDesc.fragmentFunction = fragmentFunction;
     pipelineDesc.vertexDescriptor = vertexDescriptor;
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipelineDesc.colorAttachments[0].writeMask =
+        (ctx.colorMaskRed ? MTLColorWriteMaskRed : 0) |
+        (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
+        (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
+        (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0);
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
     NSError *error = nil;
@@ -1658,6 +1857,8 @@ void APIENTRY glEnable(GLenum cap) {
         if (!ctx.scissorTestEnabled) {
             ctx.scissorTestEnabled = GL_TRUE;
         }
+    } else if (cap == GL_CULL_FACE) {
+        ctx.cullEnabled = GL_TRUE;
     }
 }
 
@@ -1671,6 +1872,8 @@ void APIENTRY glDisable(GLenum cap) {
         if (ctx.scissorTestEnabled) {
             ctx.scissorTestEnabled = GL_FALSE;
         }
+    } else if (cap == GL_CULL_FACE) {
+        ctx.cullEnabled = GL_FALSE;
     }
 }
 
