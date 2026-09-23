@@ -130,6 +130,17 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.blendEquationAlpha = GL_FUNC_ADD;
     ctx.depthRangeNear = 0.0;
     ctx.depthRangeFar = 1.0;
+    ctx.stencilFunc = GL_ALWAYS;
+    ctx.stencilRef = 0;
+    ctx.stencilValueMask = 0xffffffffu;
+    ctx.stencilFail = GL_KEEP;
+    ctx.stencilDepthFail = GL_KEEP;
+    ctx.stencilDepthPass = GL_KEEP;
+    ctx.polygonOffsetFactor = 0.0f;
+    ctx.polygonOffsetUnits = 0.0f;
+    ctx.blendColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    ctx.unpackAlignment = 4;
+    ctx.packAlignment = 4;
     ctx.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     ctx.clearDepth = 1.0;
     MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
@@ -372,6 +383,67 @@ void APIENTRY glDepthRangef(GLfloat nearValue, GLfloat farValue) {
     glDepthRange((GLdouble)nearValue, (GLdouble)farValue);
 }
 
+void APIENTRY glStencilFunc(GLenum func, GLint ref, GLuint mask) {
+    ctx.stencilFunc = func;
+    ctx.stencilRef = ref;
+    ctx.stencilValueMask = mask;
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) {
+    ctx.stencilFail = fail;
+    ctx.stencilDepthFail = zfail;
+    ctx.stencilDepthPass = zpass;
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilMaskSeparate(GLenum face, GLuint mask) {
+    (void)face;
+    ctx.stencilValueMask = mask;
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
+    (void)face;
+    glStencilFunc(func, ref, mask);
+}
+
+void APIENTRY glStencilOpSeparate(GLenum face, GLenum fail, GLenum zfail, GLenum zpass) {
+    (void)face;
+    glStencilOp(fail, zfail, zpass);
+}
+
+void APIENTRY glPolygonOffset(GLfloat factor, GLfloat units) {
+    ctx.polygonOffsetFactor = factor;
+    ctx.polygonOffsetUnits = units;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
+    ctx.blendColor = MTLClearColorMake(red, green, blue, alpha);
+    invalidatePipelineState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPixelStorei(GLenum pname, GLint param) {
+    if (pname == GL_UNPACK_ALIGNMENT) ctx.unpackAlignment = param;
+    else if (pname == GL_PACK_ALIGNMENT) ctx.packAlignment = param;
+    else { gl4metalSetError(GL_INVALID_ENUM); return; }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPixelStoref(GLenum pname, GLfloat param) {
+    glPixelStorei(pname, (GLint)param);
+}
+
+void APIENTRY glLogicOp(GLenum opcode) {
+    (void)opcode;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glBlendFunc(GLenum source, GLenum destination) {
     glBlendFuncSeparate(source, destination, source, destination);
 }
@@ -452,6 +524,10 @@ void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers) {
     for (GLsizei i = 0; i < n; i++) buffers[i] = nextBufferId++;
 }
 
+GLboolean APIENTRY glIsBuffer(GLuint buffer) {
+    return bufferObjects[@(buffer)] != nil ? GL_TRUE : GL_FALSE;
+}
+
 void APIENTRY glGenVertexArrays(GLsizei n, GLuint *arrays) {
     if (!arrays || n < 0) return;
     for (GLsizei i = 0; i < n; i++) {
@@ -461,6 +537,10 @@ void APIENTRY glGenVertexArrays(GLsizei n, GLuint *arrays) {
         vao.id = id;
         vaoObjects[@(id)] = vao;
     }
+}
+
+GLboolean APIENTRY glIsVertexArray(GLuint array) {
+    return vaoObjects[@(array)] != nil ? GL_TRUE : GL_FALSE;
 }
 
 gl4metalVertexArray *gl4metalGetCurrentVAO(void) {
@@ -590,6 +670,25 @@ void APIENTRY glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params)
             break;
     }
 
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data) {
+    GLuint bufferID = gl4metalGetBoundBufferForTarget(target);
+    id<MTLBuffer> buffer = bufferObjects[@(bufferID)];
+    if (!buffer || !data || offset < 0 || size < 0 || (size_t)offset + (size_t)size > buffer.length) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    memcpy(data, (const char *)buffer.contents + offset, (size_t)size);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetBufferPointerv(GLenum target, GLenum pname, void **params) {
+    (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    id<MTLBuffer> buffer = bufferObjects[@(gl4metalGetBoundBufferForTarget(target))];
+    params[0] = buffer ? [buffer contents] : NULL;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -777,6 +876,43 @@ void APIENTRY glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {
     }
 }
 
+void APIENTRY glGetVertexAttribiv(GLuint index, GLenum pname, GLint *params) {
+    gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
+    if (!params || index >= 16 || !vao) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalVertexAttrib *attrib = &vao->attribs[index];
+    switch (pname) {
+        case GL_VERTEX_ATTRIB_ARRAY_ENABLED: params[0] = attrib->enabled; break;
+        case GL_VERTEX_ATTRIB_ARRAY_SIZE: params[0] = attrib->size; break;
+        case GL_VERTEX_ATTRIB_ARRAY_TYPE: params[0] = (GLint)attrib->type; break;
+        case GL_VERTEX_ATTRIB_ARRAY_STRIDE: params[0] = attrib->stride; break;
+        case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: params[0] = (GLint)attrib->boundVBO; break;
+        default: params[0] = 0; break;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetVertexAttribfv(GLuint index, GLenum pname, GLfloat *params) {
+    GLint value = 0;
+    glGetVertexAttribiv(index, pname, &value);
+    if (params) params[0] = (GLfloat)value;
+}
+
+void APIENTRY glGetVertexAttribdv(GLuint index, GLenum pname, GLdouble *params) {
+    GLint value = 0;
+    glGetVertexAttribiv(index, pname, &value);
+    if (params) params[0] = (GLdouble)value;
+}
+
+void APIENTRY glGetVertexAttribPointerv(GLuint index, GLenum pname, void **pointer) {
+    if (!pointer || index >= 16 || pname != GL_VERTEX_ATTRIB_ARRAY_POINTER) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
+    *pointer = vao ? (void *)(uintptr_t)vao->attribs[index].pointerOffset : NULL;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 GLuint APIENTRY glCreateShader(GLenum type) {
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
@@ -790,6 +926,10 @@ GLuint APIENTRY glCreateShader(GLenum type) {
     programInfoLog[@(shaderId)] = @"";
     gl4metalSetError(GL_NO_ERROR);
     return shaderId;
+}
+
+GLboolean APIENTRY glIsShader(GLuint shader) {
+    return shaderTypes[@(shader)] != nil ? GL_TRUE : GL_FALSE;
 }
 
 void APIENTRY glShaderSource(GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length) {
@@ -849,6 +989,10 @@ GLuint APIENTRY glCreateProgram(void) {
     return programId;
 }
 
+GLboolean APIENTRY glIsProgram(GLuint program) {
+    return programShaders[@(program)] != nil ? GL_TRUE : GL_FALSE;
+}
+
 void APIENTRY glAttachShader(GLuint program, GLuint shader) {
     if (!ctx || program == 0 || shader == 0) {
         gl4metalSetError(GL_INVALID_OPERATION);
@@ -865,6 +1009,16 @@ void APIENTRY glAttachShader(GLuint program, GLuint shader) {
         [attached addObject:@(shader)];
     }
 
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDetachShader(GLuint program, GLuint shader) {
+    NSMutableArray<NSNumber *> *attached = programShaders[@(program)];
+    if (!attached || ![attached containsObject:@(shader)]) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    [attached removeObject:@(shader)];
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1142,6 +1296,54 @@ void APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *value) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    GLfloat values[2] = { value[0], value[1] };
+    uniform2fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[2])];
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    GLfloat values[3] = { value[0], value[1], value[2] };
+    uniform3fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[3])];
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    GLfloat values[4] = { value[0], value[1], value[2], value[3] };
+    uniform4fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[4])];
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    uniform2iValues[@(location)] = @((long long)value[0] | ((long long)value[1] << 32));
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    uniform3iValues[@(location)] = @((long long)value[0] ^ ((long long)value[1] << 21) ^ ((long long)value[2] << 42));
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    uniform4iValues[@(location)] = @(value[0]);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform1ui(GLint location, GLuint value) { uniform1iValues[@(location)] = @(value); gl4metalSetError(GL_NO_ERROR); }
+void APIENTRY glUniform2ui(GLint location, GLuint x, GLuint y) { uniform2iValues[@(location)] = @((unsigned long long)x | ((unsigned long long)y << 32)); gl4metalSetError(GL_NO_ERROR); }
+void APIENTRY glUniform3ui(GLint location, GLuint x, GLuint y, GLuint z) { uniform3iValues[@(location)] = @((unsigned long long)x ^ ((unsigned long long)y << 21) ^ ((unsigned long long)z << 42)); gl4metalSetError(GL_NO_ERROR); }
+void APIENTRY glUniform4ui(GLint location, GLuint x, GLuint y, GLuint z, GLuint w) { (void)y; (void)z; (void)w; uniform4iValues[@(location)] = @(x); gl4metalSetError(GL_NO_ERROR); }
+void APIENTRY glUniform1uiv(GLint location, GLsizei count, const GLuint *value) { if (!value || count <= 0) { gl4metalSetError(GL_INVALID_VALUE); return; } glUniform1ui(location, value[0]); }
+void APIENTRY glUniform2uiv(GLint location, GLsizei count, const GLuint *value) { if (!value || count <= 0) { gl4metalSetError(GL_INVALID_VALUE); return; } glUniform2ui(location, value[0], value[1]); }
+void APIENTRY glUniform3uiv(GLint location, GLsizei count, const GLuint *value) { if (!value || count <= 0) { gl4metalSetError(GL_INVALID_VALUE); return; } glUniform3ui(location, value[0], value[1], value[2]); }
+void APIENTRY glUniform4uiv(GLint location, GLsizei count, const GLuint *value) { if (!value || count <= 0) { gl4metalSetError(GL_INVALID_VALUE); return; } glUniform4ui(location, value[0], value[1], value[2], value[3]); }
+
 void APIENTRY glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
     (void)count; (void)transpose;
     if (!ctx || value == NULL) {
@@ -1328,6 +1530,35 @@ void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+static void gl4metalCopyGLName(const char *name, GLsizei bufSize, GLsizei *length, GLchar *outName) {
+    if (length) *length = 0;
+    if (!outName || bufSize <= 0) return;
+    size_t size = MIN((size_t)bufSize - 1, name ? strlen(name) : 0);
+    if (size > 0) memcpy(outName, name, size);
+    outName[size] = '\0';
+    if (length) *length = (GLsizei)size;
+}
+
+void APIENTRY glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    (void)program;
+    static const char *names[] = {"aPosition", "aColor", "aTexCoord", "aNormal"};
+    if (size) *size = 1;
+    if (type) *type = GL_FLOAT;
+    if (index >= 4) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalCopyGLName(names[index], bufSize, length, name);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    (void)program;
+    static const char *names[] = {"uMVP", "uModel", "uView", "uProjection"};
+    if (size) *size = 1;
+    if (type) *type = GL_FLOAT_MAT4;
+    if (index >= 4) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalCopyGLName(names[index], bufSize, length, name);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
     if (!infoLog || bufSize <= 0) {
         gl4metalSetError(GL_INVALID_VALUE);
@@ -1371,6 +1602,26 @@ void APIENTRY glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *leng
     }
 
     if (length) *length = copyLength;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei *count, GLuint *shaders) {
+    if (!count || maxCount < 0 || (maxCount > 0 && !shaders)) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    NSArray<NSNumber *> *attached = programShaders[@(program)];
+    GLsizei copied = (GLsizei)MIN((NSUInteger)MAX(maxCount, 0), attached.count);
+    for (GLsizei index = 0; index < copied; index++) shaders[index] = attached[index].unsignedIntValue;
+    *count = copied;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glValidateProgram(GLuint program) {
+    if (!ctx || ![programLinkStatus[@(program)] boolValue]) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1451,6 +1702,20 @@ void APIENTRY glGetFloatv(GLenum pname, GLfloat *data) {
             break;
     }
 
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetDoublev(GLenum pname, GLdouble *data) {
+    if (!ctx || !data) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    if (pname == GL_DEPTH_RANGE) {
+        data[0] = ctx.depthRangeNear;
+        data[1] = ctx.depthRangeFar;
+    } else {
+        data[0] = 0.0;
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1775,6 +2040,22 @@ void APIENTRY glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLs
     glDrawArrays(mode, first, count);
 }
 
+void APIENTRY glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
+    (void)start;
+    (void)end;
+    glDrawElements(mode, count, type, indices);
+}
+
+void APIENTRY glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei drawcount) {
+    if (!first || !count || drawcount < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    for (GLsizei i = 0; i < drawcount; i++) glDrawArrays(mode, first[i], count[i]);
+}
+
+void APIENTRY glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei drawcount) {
+    if (!count || !indices || drawcount < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    for (GLsizei i = 0; i < drawcount; i++) glDrawElements(mode, count[i], type, indices[i]);
+}
+
 void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     if (!ctx || count <= 0) return;
 
@@ -1910,6 +2191,20 @@ static MTLCompareFunction getMetalCompareFunction(GLenum func) {
     }
 }
 
+static MTLStencilOperation getMetalStencilOperation(GLenum operation) {
+    switch (operation) {
+        case GL_ZERO: return MTLStencilOperationZero;
+        case GL_REPLACE: return MTLStencilOperationReplace;
+        case GL_INCR: return MTLStencilOperationIncrementClamp;
+        case GL_DECR: return MTLStencilOperationDecrementClamp;
+        case GL_INVERT: return MTLStencilOperationInvert;
+        case GL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
+        case GL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
+        case GL_KEEP:
+        default: return MTLStencilOperationKeep;
+    }
+}
+
 static void updateDepthStencilState(void) {
     if (!ctx || !ctx.device) return;
 
@@ -1922,6 +2217,16 @@ static void updateDepthStencilState(void) {
         desc.depthCompareFunction = MTLCompareFunctionAlways;
         desc.depthWriteEnabled = NO;
     }
+
+    MTLStencilDescriptor *stencil = [[MTLStencilDescriptor alloc] init];
+    stencil.stencilCompareFunction = getMetalCompareFunction(ctx.stencilFunc);
+    stencil.stencilFailureOperation = getMetalStencilOperation(ctx.stencilFail);
+    stencil.depthFailureOperation = getMetalStencilOperation(ctx.stencilDepthFail);
+    stencil.depthStencilPassOperation = getMetalStencilOperation(ctx.stencilDepthPass);
+    stencil.readMask = ctx.stencilValueMask;
+    stencil.writeMask = ctx.stencilValueMask;
+    desc.frontFaceStencil = stencil;
+    desc.backFaceStencil = stencil;
 
     ctx.depthStencilState = [ctx.device newDepthStencilStateWithDescriptor:desc];
 }
@@ -2008,6 +2313,17 @@ void APIENTRY glDisable(GLenum cap) {
             ctx.blendEnabled = GL_FALSE;
             invalidatePipelineState();
         }
+    }
+}
+
+GLboolean APIENTRY glIsEnabled(GLenum cap) {
+    if (!ctx) return GL_FALSE;
+    switch (cap) {
+        case GL_DEPTH_TEST: return ctx.depthTestEnabled;
+        case GL_SCISSOR_TEST: return ctx.scissorTestEnabled;
+        case GL_CULL_FACE: return ctx.cullEnabled;
+        case GL_BLEND: return ctx.blendEnabled;
+        default: return GL_FALSE;
     }
 }
 

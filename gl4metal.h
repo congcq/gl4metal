@@ -81,6 +81,17 @@ typedef struct {
 @property (nonatomic, assign) GLenum blendEquationAlpha;
 @property (nonatomic, assign) GLdouble depthRangeNear;
 @property (nonatomic, assign) GLdouble depthRangeFar;
+@property (nonatomic, assign) GLenum stencilFunc;
+@property (nonatomic, assign) GLint stencilRef;
+@property (nonatomic, assign) GLuint stencilValueMask;
+@property (nonatomic, assign) GLenum stencilFail;
+@property (nonatomic, assign) GLenum stencilDepthFail;
+@property (nonatomic, assign) GLenum stencilDepthPass;
+@property (nonatomic, assign) GLfloat polygonOffsetFactor;
+@property (nonatomic, assign) GLfloat polygonOffsetUnits;
+@property (nonatomic, assign) MTLClearColor blendColor;
+@property (nonatomic, assign) GLint unpackAlignment;
+@property (nonatomic, assign) GLint packAlignment;
 
 @property (nonatomic, strong) id<MTLDepthStencilState> depthStencilState;
 @property (nonatomic, strong) id<MTLSamplerState> defaultSamplerState;

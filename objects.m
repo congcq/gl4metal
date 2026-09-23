@@ -23,6 +23,10 @@ void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+GLboolean APIENTRY glIsTexture(GLuint texture) {
+    return textureObjects[@(texture)] != nil ? GL_TRUE : GL_FALSE;
+}
+
 void APIENTRY glBindTexture(GLenum target, GLuint texture) {
     if (target != GL_TEXTURE_2D && target != GL_TEXTURE_CUBE_MAP) {
         gl4metalSetError(GL_INVALID_ENUM);
@@ -66,6 +70,77 @@ void APIENTRY glTexParameterfv(GLenum target, GLenum pname, const GLfloat *param
     (void)target;
     (void)pname;
     (void)params;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
+    (void)target;
+    (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
+    (void)target;
+    (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0.0f;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glTexImage1D(GLenum target, GLint level, GLint internalformat,
+                           GLsizei width, GLint border, GLenum format,
+                           GLenum type, const void *pixels) {
+    (void)target; (void)level; (void)internalformat; (void)width;
+    (void)border; (void)format; (void)type; (void)pixels;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glTexSubImage1D(GLenum target, GLint level, GLint xoffset,
+                              GLsizei width, GLenum format, GLenum type,
+                              const void *pixels) {
+    (void)target; (void)level; (void)xoffset; (void)width;
+    (void)format; (void)type; (void)pixels;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params) {
+    (void)target; (void)level; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params) {
+    (void)target; (void)level; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0.0f;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGenerateMipmap(GLenum target) {
+    (void)target;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glTexParameterIiv(GLenum target, GLenum pname, const GLint *params) {
+    glTexParameteriv(target, pname, params);
+}
+
+void APIENTRY glTexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) {
+    (void)target; (void)pname; (void)params;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetTexParameterIiv(GLenum target, GLenum pname, GLint *params) {
+    glGetTexParameteriv(target, pname, params);
+}
+
+void APIENTRY glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) {
+    (void)target; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -180,6 +255,41 @@ void APIENTRY glFramebufferTexture2D(GLenum target, GLenum attachment,
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+    glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+void APIENTRY glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) {
+    (void)zoffset;
+    glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+void APIENTRY glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
+    (void)layer;
+    glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+}
+
+void APIENTRY glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
+    glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+}
+
+void APIENTRY glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
+    (void)target; (void)attachment; (void)renderbuffertarget; (void)renderbuffer;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
+    (void)target; (void)attachment; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {
+    (void)samples;
+    glRenderbufferStorage(target, internalformat, width, height);
+}
+
 void APIENTRY glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
     if (!framebuffers || n <= 0) {
         gl4metalSetError(GL_INVALID_VALUE);
@@ -189,6 +299,10 @@ void APIENTRY glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
         [framebufferObjects removeObjectForKey:@(framebuffers[i])];
     }
     gl4metalSetError(GL_NO_ERROR);
+}
+
+GLboolean APIENTRY glIsFramebuffer(GLuint framebuffer) {
+    return framebufferObjects[@(framebuffer)] != nil ? GL_TRUE : GL_FALSE;
 }
 
 void APIENTRY glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) {
@@ -228,5 +342,16 @@ void APIENTRY glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) {
     for (GLsizei i = 0; i < n; i++) {
         [renderbufferObjects removeObjectForKey:@(renderbuffers[i])];
     }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+GLboolean APIENTRY glIsRenderbuffer(GLuint renderbuffer) {
+    return renderbufferObjects[@(renderbuffer)] != nil ? GL_TRUE : GL_FALSE;
+}
+
+void APIENTRY glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) {
+    (void)target; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    params[0] = 0;
     gl4metalSetError(GL_NO_ERROR);
 }
