@@ -6,6 +6,7 @@
 extern gl4metalContext *ctx;
 extern GLuint nextBufferId;
 extern GLuint nextVAOId;
+extern GLuint nextTextureId;
 extern NSMutableDictionary<NSNumber *, id<MTLBuffer>> *bufferObjects;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *bufferSizes;
 extern NSMutableDictionary<NSString *, id<MTLBuffer>> *convertedIndexBuffers;
@@ -37,6 +38,11 @@ extern NSMutableDictionary<NSNumber *, NSString *> *uniformLocationNames;
 extern NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, NSString *> *> *programAttribBindings;
 extern NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelineLayoutCache;
 extern id<MTLRenderPipelineState> defaultFallbackPipeline;
+extern NSMutableDictionary<NSNumber *, id<MTLTexture>> *textureObjects;
+extern NSMutableDictionary<NSNumber *, NSNumber *> *boundTextureUnits;
+extern GLenum activeTextureUnit;
+extern NSMutableDictionary<NSNumber *, NSArray<NSDictionary *> *> *uniformLayouts;
+extern NSMutableDictionary<NSNumber *, id<MTLLibrary>> *programMetalLibraries;
 
 void gl4metalSetError(GLenum error);
 

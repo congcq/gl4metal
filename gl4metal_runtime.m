@@ -3,6 +3,7 @@
 gl4metalContext *ctx = nil;
 GLuint nextBufferId = 1;
 GLuint nextVAOId = 1;
+GLuint nextTextureId = 1;
 NSMutableDictionary<NSNumber *, id<MTLBuffer>> *bufferObjects = nil;
 NSMutableDictionary<NSNumber *, NSNumber *> *bufferSizes = nil;
 NSMutableDictionary<NSString *, id<MTLBuffer>> *convertedIndexBuffers = nil;
@@ -39,3 +40,8 @@ NSMutableDictionary<NSNumber *, NSString *> *uniformLocationNames = nil;
 NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, NSString *> *> *programAttribBindings = nil;
 NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelineLayoutCache = nil;
 id<MTLRenderPipelineState> defaultFallbackPipeline = nil;
+NSMutableDictionary<NSNumber *, id<MTLTexture>> *textureObjects = nil;
+NSMutableDictionary<NSNumber *, NSNumber *> *boundTextureUnits = nil;
+GLenum activeTextureUnit = GL_TEXTURE0;
+NSMutableDictionary<NSNumber *, NSArray<NSDictionary *> *> *uniformLayouts = nil;
+NSMutableDictionary<NSNumber *, id<MTLLibrary>> *programMetalLibraries = nil;

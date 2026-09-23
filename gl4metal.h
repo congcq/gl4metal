@@ -71,8 +71,19 @@ typedef struct {
 @property (nonatomic, assign) GLboolean colorMaskBlue;
 @property (nonatomic, assign) GLboolean colorMaskAlpha;
 @property (nonatomic, assign) GLenum drawBuffer;
+@property (nonatomic, assign) GLenum readBuffer;
+@property (nonatomic, assign) GLboolean blendEnabled;
+@property (nonatomic, assign) GLenum blendSourceRGB;
+@property (nonatomic, assign) GLenum blendDestinationRGB;
+@property (nonatomic, assign) GLenum blendSourceAlpha;
+@property (nonatomic, assign) GLenum blendDestinationAlpha;
+@property (nonatomic, assign) GLenum blendEquationRGB;
+@property (nonatomic, assign) GLenum blendEquationAlpha;
+@property (nonatomic, assign) GLdouble depthRangeNear;
+@property (nonatomic, assign) GLdouble depthRangeFar;
 
 @property (nonatomic, strong) id<MTLDepthStencilState> depthStencilState;
+@property (nonatomic, strong) id<MTLSamplerState> defaultSamplerState;
 @property (nonatomic, strong) id<MTLTexture> depthTexture;
 
 @property (nonatomic, assign) MTLClearColor clearColor;

@@ -10,6 +10,7 @@
 #import "gl4metal_shaders.h"
 
 gl4metalVertexArray *gl4metalGetCurrentVAO(void);
+static void invalidatePipelineState(void);
 
 static GLintptr gl4metalResolvePointerOffset(const void *pointer, id<MTLBuffer> buffer) {
     if (pointer == NULL || !buffer) return 0;
@@ -82,7 +83,8 @@ static void gl4metalGetFallbackMVP(float matrix[16]) {
 @end
 
 const char *gl4metalGetDeviceName(void) {
-    NSString *device = [NSString stringWithFormat:@"gl4metal (%@)", ctx.device ? ctx.device.name : @"Unknown"];
+    static NSString *device = nil;
+    device = [NSString stringWithFormat:@"gl4metal (%@)", ctx.device ? ctx.device.name : @"Unknown"];
     return device.UTF8String;
 }
 
@@ -118,8 +120,24 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.colorMaskBlue = GL_TRUE;
     ctx.colorMaskAlpha = GL_TRUE;
     ctx.drawBuffer = GL_BACK;
+    ctx.readBuffer = GL_BACK;
+    ctx.blendEnabled = GL_FALSE;
+    ctx.blendSourceRGB = GL_ONE;
+    ctx.blendDestinationRGB = GL_ZERO;
+    ctx.blendSourceAlpha = GL_ONE;
+    ctx.blendDestinationAlpha = GL_ZERO;
+    ctx.blendEquationRGB = GL_FUNC_ADD;
+    ctx.blendEquationAlpha = GL_FUNC_ADD;
+    ctx.depthRangeNear = 0.0;
+    ctx.depthRangeFar = 1.0;
     ctx.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     ctx.clearDepth = 1.0;
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.sAddressMode = MTLSamplerAddressModeRepeat;
+    samplerDescriptor.tAddressMode = MTLSamplerAddressModeRepeat;
+    ctx.defaultSamplerState = [ctx.device newSamplerStateWithDescriptor:samplerDescriptor];
 
     bufferObjects = [NSMutableDictionary dictionary];
     bufferSizes = [NSMutableDictionary dictionary];
@@ -145,6 +163,10 @@ GLboolean APIENTRY gl4metalInit(void) {
     uniformLocationNames = [NSMutableDictionary dictionary];
     programAttribBindings = [NSMutableDictionary dictionary];
     pipelineLayoutCache = [NSMutableDictionary dictionary];
+    textureObjects = [NSMutableDictionary dictionary];
+    boundTextureUnits = [NSMutableDictionary dictionary];
+    uniformLayouts = [NSMutableDictionary dictionary];
+    programMetalLibraries = [NSMutableDictionary dictionary];
     currentProgram = 0;
     lastGL4MetalError = GL_NO_ERROR;
     updateDepthStencilState();
@@ -163,6 +185,22 @@ void APIENTRY glSwapBuffers(void) {
     if (!ctx || !ctx.currentCommandBuffer || !ctx.currentDrawable) return;
     [ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
     [ctx.currentCommandBuffer commit];
+    ctx.currentCommandBuffer = nil;
+    ctx.currentDrawable = nil;
+}
+
+void APIENTRY glFlush(void) {
+    if (!ctx || !ctx.currentCommandBuffer) return;
+    [ctx.currentCommandBuffer commit];
+    ctx.currentCommandBuffer = nil;
+    ctx.currentDrawable = nil;
+}
+
+void APIENTRY glFinish(void) {
+    if (!ctx || !ctx.currentCommandBuffer) return;
+    id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
     ctx.currentCommandBuffer = nil;
     ctx.currentDrawable = nil;
 }
@@ -221,8 +259,8 @@ static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInte
         (double)targetHeight - viewport.y - viewport.height,
         (double)viewport.width,
         (double)viewport.height,
-        0.0,
-        1.0
+        ctx.depthRangeNear,
+        ctx.depthRangeFar
     }];
     gl4metalRect scissor = ctx.scissorTestEnabled ? ctx.scissorRect : (gl4metalRect){0, 0, (GLsizei)targetWidth, (GLsizei)targetHeight};
     [encoder setScissorRect:(MTLScissorRect){
@@ -305,9 +343,56 @@ void APIENTRY glDrawBuffer(GLenum buf) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glReadBuffer(GLenum src) {
+    if (src != GL_BACK && src != GL_NONE) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    ctx.readBuffer = src;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glHint(GLenum target, GLenum mode) {
     (void)target;
     (void)mode;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDepthRange(GLdouble nearValue, GLdouble farValue) {
+    if (nearValue < 0.0 || nearValue > 1.0 || farValue < 0.0 || farValue > 1.0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    ctx.depthRangeNear = nearValue;
+    ctx.depthRangeFar = farValue;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDepthRangef(GLfloat nearValue, GLfloat farValue) {
+    glDepthRange((GLdouble)nearValue, (GLdouble)farValue);
+}
+
+void APIENTRY glBlendFunc(GLenum source, GLenum destination) {
+    glBlendFuncSeparate(source, destination, source, destination);
+}
+
+void APIENTRY glBlendFuncSeparate(GLenum sourceRGB, GLenum destinationRGB, GLenum sourceAlpha, GLenum destinationAlpha) {
+    ctx.blendSourceRGB = sourceRGB;
+    ctx.blendDestinationRGB = destinationRGB;
+    ctx.blendSourceAlpha = sourceAlpha;
+    ctx.blendDestinationAlpha = destinationAlpha;
+    invalidatePipelineState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glBlendEquation(GLenum mode) {
+    glBlendEquationSeparate(mode, mode);
+}
+
+void APIENTRY glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {
+    ctx.blendEquationRGB = modeRGB;
+    ctx.blendEquationAlpha = modeAlpha;
+    invalidatePipelineState();
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -321,6 +406,45 @@ static void applyRasterState(id<MTLRenderCommandEncoder> encoder) {
     [encoder setCullMode:cullMode];
     [encoder setFrontFacingWinding:ctx.frontFace == GL_CW ? MTLWindingClockwise : MTLWindingCounterClockwise];
     [encoder setTriangleFillMode:ctx.polygonMode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+}
+
+static void invalidatePipelineState(void) {
+    if (!ctx) return;
+    ctx.pipelineState = nil;
+    [ctx.programPipelines removeAllObjects];
+    [pipelineLayoutCache removeAllObjects];
+}
+
+static MTLBlendFactor getMetalBlendFactor(GLenum factor) {
+    switch (factor) {
+        case GL_ZERO: return MTLBlendFactorZero;
+        case GL_ONE: return MTLBlendFactorOne;
+        case GL_SRC_COLOR: return MTLBlendFactorSourceColor;
+        case GL_ONE_MINUS_SRC_COLOR: return MTLBlendFactorOneMinusSourceColor;
+        case GL_DST_COLOR: return MTLBlendFactorDestinationColor;
+        case GL_ONE_MINUS_DST_COLOR: return MTLBlendFactorOneMinusDestinationColor;
+        case GL_SRC_ALPHA: return MTLBlendFactorSourceAlpha;
+        case GL_ONE_MINUS_SRC_ALPHA: return MTLBlendFactorOneMinusSourceAlpha;
+        case GL_DST_ALPHA: return MTLBlendFactorDestinationAlpha;
+        case GL_ONE_MINUS_DST_ALPHA: return MTLBlendFactorOneMinusDestinationAlpha;
+        case GL_CONSTANT_COLOR: return MTLBlendFactorBlendColor;
+        case GL_ONE_MINUS_CONSTANT_COLOR: return MTLBlendFactorOneMinusBlendColor;
+        case GL_CONSTANT_ALPHA: return MTLBlendFactorBlendAlpha;
+        case GL_ONE_MINUS_CONSTANT_ALPHA: return MTLBlendFactorOneMinusBlendAlpha;
+        case GL_SRC_ALPHA_SATURATE: return MTLBlendFactorSourceAlphaSaturated;
+        default: return MTLBlendFactorOne;
+    }
+}
+
+static MTLBlendOperation getMetalBlendOperation(GLenum operation) {
+    switch (operation) {
+        case GL_FUNC_SUBTRACT: return MTLBlendOperationSubtract;
+        case GL_FUNC_REVERSE_SUBTRACT: return MTLBlendOperationReverseSubtract;
+        case GL_MIN: return MTLBlendOperationMin;
+        case GL_MAX: return MTLBlendOperationMax;
+        case GL_FUNC_ADD:
+        default: return MTLBlendOperationAdd;
+    }
 }
 
 void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers) {
@@ -767,6 +891,10 @@ void APIENTRY glLinkProgram(GLuint program) {
         }
     }
 
+    [programMetalLibraries removeObjectForKey:@(program)];
+    [uniformLayouts removeObjectForKey:@(program)];
+    [ctx.programPipelines removeObjectForKey:@(program)];
+    [pipelineLayoutCache removeAllObjects];
     programLinkStatus[@(program)] = @(GL_TRUE);
     programInfoLog[@(program)] = @"";
     gl4metalSetError(GL_NO_ERROR);
@@ -854,12 +982,6 @@ static id<MTLRenderPipelineState> gl4metalResolveCurrentPipeline(void) {
     }
 
     if (currentProgram != 0) {
-        id<MTLRenderPipelineState> cachedProgramPipeline = ctx.programPipelines[@(currentProgram)];
-        if (cachedProgramPipeline) {
-            ctx.pipelineState = cachedProgramPipeline;
-            return cachedProgramPipeline;
-        }
-
         NSString *cacheKey = gl4metalBuildPipelineCacheKey(currentProgram, gl4metalGetCurrentVAO());
         id<MTLRenderPipelineState> programPipeline = pipelineLayoutCache[cacheKey];
         if (!programPipeline) {
@@ -868,7 +990,6 @@ static id<MTLRenderPipelineState> gl4metalResolveCurrentPipeline(void) {
             }
             programPipeline = ctx.pipelineState;
             if (programPipeline) {
-                ctx.programPipelines[@(currentProgram)] = programPipeline;
                 pipelineLayoutCache[cacheKey] = programPipeline;
             }
         }
@@ -906,17 +1027,6 @@ void APIENTRY glUseProgram(GLuint program) {
     }
 
     currentProgram = program;
-    id<MTLRenderPipelineState> cachedProgramPipeline = ctx.programPipelines[@(program)];
-    if (cachedProgramPipeline) {
-        ctx.pipelineState = cachedProgramPipeline;
-        gl4metalSetError(GL_NO_ERROR);
-        return;
-    }
-
-    if (defaultFallbackPipeline && !ctx.pipelineState) {
-        ctx.pipelineState = defaultFallbackPipeline;
-    }
-
     id<MTLRenderPipelineState> programPipeline = gl4metalResolveCurrentPipeline();
     if (!programPipeline) {
         NSLog(@"[gl4metal] WARNING: Program %u linked but custom Metal pipeline creation failed", program);
@@ -945,7 +1055,7 @@ void APIENTRY glUniform1f(GLint location, GLfloat v0) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
-    uniform1fValues[@(location)] = [NSValue valueWithPointer:&v0];
+    uniform1fValues[@(location)] = [NSValue valueWithBytes:&v0 objCType:@encode(GLfloat)];
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1161,6 +1271,10 @@ void APIENTRY glDeleteProgram(GLuint program) {
     [programShaders removeObjectForKey:@(program)];
     [programLinkStatus removeObjectForKey:@(program)];
     [programInfoLog removeObjectForKey:@(program)];
+    [programMetalLibraries removeObjectForKey:@(program)];
+    [uniformLayouts removeObjectForKey:@(program)];
+    [ctx.programPipelines removeObjectForKey:@(program)];
+    [pipelineLayoutCache removeAllObjects];
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1220,7 +1334,7 @@ void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 }
 
 void APIENTRY glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
-    if (!infoLog) {
+    if (!infoLog || bufSize <= 0) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -1243,7 +1357,7 @@ void APIENTRY glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length
 }
 
 void APIENTRY glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
-    if (!infoLog) {
+    if (!infoLog || bufSize <= 0) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -1503,7 +1617,7 @@ void APIENTRY glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
 }
 
 void APIENTRY glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *source) {
-    if (!source) {
+    if (!source || bufSize <= 0) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -1622,7 +1736,10 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 
     float fallbackMVP[16];
     gl4metalGetFallbackMVP(fallbackMVP);
-    [encoder setVertexBytes:fallbackMVP length:sizeof(fallbackMVP) atIndex:16];
+    NSData *uniformData = gl4metalBuildUniformDataForProgram(currentProgram);
+    [encoder setVertexBytes:uniformData.bytes length:uniformData.length atIndex:16];
+    [encoder setFragmentBytes:uniformData.bytes length:uniformData.length atIndex:16];
+    gl4metalBindFragmentResources(encoder, currentProgram);
 
     gl4metalVertexArray *currentVAO = vaoObjects[@(ctx.currentVAO)];
     if (currentVAO) {
@@ -1708,7 +1825,10 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
 
     float fallbackMVP[16];
     gl4metalGetFallbackMVP(fallbackMVP);
-    [encoder setVertexBytes:fallbackMVP length:sizeof(fallbackMVP) atIndex:16];
+    NSData *uniformData = gl4metalBuildUniformDataForProgram(currentProgram);
+    [encoder setVertexBytes:uniformData.bytes length:uniformData.length atIndex:16];
+    [encoder setFragmentBytes:uniformData.bytes length:uniformData.length atIndex:16];
+    gl4metalBindFragmentResources(encoder, currentProgram);
 
     if (currentVAO) {
         for (NSUInteger index = 0; index < 16; index++) {
@@ -1834,6 +1954,15 @@ BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction>
         (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
         (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
         (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0);
+    pipelineDesc.colorAttachments[0].blendingEnabled = ctx.blendEnabled;
+    if (ctx.blendEnabled) {
+        pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = getMetalBlendFactor(ctx.blendSourceRGB);
+        pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = getMetalBlendFactor(ctx.blendDestinationRGB);
+        pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = getMetalBlendFactor(ctx.blendSourceAlpha);
+        pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = getMetalBlendFactor(ctx.blendDestinationAlpha);
+        pipelineDesc.colorAttachments[0].rgbBlendOperation = getMetalBlendOperation(ctx.blendEquationRGB);
+        pipelineDesc.colorAttachments[0].alphaBlendOperation = getMetalBlendOperation(ctx.blendEquationAlpha);
+    }
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
     NSError *error = nil;
@@ -1859,6 +1988,11 @@ void APIENTRY glEnable(GLenum cap) {
         }
     } else if (cap == GL_CULL_FACE) {
         ctx.cullEnabled = GL_TRUE;
+    } else if (cap == GL_BLEND) {
+        if (!ctx.blendEnabled) {
+            ctx.blendEnabled = GL_TRUE;
+            invalidatePipelineState();
+        }
     }
 }
 
@@ -1874,6 +2008,11 @@ void APIENTRY glDisable(GLenum cap) {
         }
     } else if (cap == GL_CULL_FACE) {
         ctx.cullEnabled = GL_FALSE;
+    } else if (cap == GL_BLEND) {
+        if (ctx.blendEnabled) {
+            ctx.blendEnabled = GL_FALSE;
+            invalidatePipelineState();
+        }
     }
 }
 

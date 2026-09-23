@@ -75,6 +75,7 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
     static const char *vendor = "congcq";
     static const char *version = "3.3.0 Core Profile";
     static const char *slVersion = "3.3";
+    static NSString *extensionsString = nil;
 
     switch(name) {
         case GL_VENDOR:
@@ -86,8 +87,8 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
         case GL_SHADING_LANGUAGE_VERSION:
             return (const GLubyte *)slVersion;
         case GL_EXTENSIONS: {
-            NSString *extensions = getExtensions();
-            return (const GLubyte *)extensions.UTF8String;
+            extensionsString = getExtensions();
+            return (const GLubyte *)extensionsString.UTF8String;
         }
         default:
             return NULL;

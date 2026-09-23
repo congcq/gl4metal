@@ -7,7 +7,7 @@ void APIENTRY glGenTextures(GLsizei n, GLuint *textures) {
         return;
     }
     for (GLsizei i = 0; i < n; i++) {
-        textures[i] = nextBufferId++;
+        textures[i] = nextTextureId++;
     }
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -17,17 +17,27 @@ void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    for (GLsizei i = 0; i < n; i++) {
+        [textureObjects removeObjectForKey:@(textures[i])];
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glBindTexture(GLenum target, GLuint texture) {
-    (void)target;
-    (void)texture;
+    if (target != GL_TEXTURE_2D && target != GL_TEXTURE_CUBE_MAP) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    boundTextureUnits[@(activeTextureUnit - GL_TEXTURE0)] = @(texture);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glActiveTexture(GLenum texture) {
-    (void)texture;
+    if (texture < GL_TEXTURE0 || texture >= GL_TEXTURE0 + 32) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    activeTextureUnit = texture;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -62,7 +72,10 @@ void APIENTRY glTexParameterfv(GLenum target, GLenum pname, const GLfloat *param
 void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
                            GLenum format, GLenum type, const void *pixels) {
-    (void)target;
+    if (target != GL_TEXTURE_2D || level < 0 || width <= 0 || height <= 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
     (void)level;
     (void)internalformat;
     (void)width;
@@ -70,7 +83,30 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
     (void)border;
     (void)format;
     (void)type;
-    (void)pixels;
+    GLuint texture = [boundTextureUnits[@(activeTextureUnit - GL_TEXTURE0)] unsignedIntValue];
+    if (texture == 0 || !ctx.device) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+
+    MTLPixelFormat pixelFormat = MTLPixelFormatRGBA8Unorm;
+    if (format == GL_BGRA) pixelFormat = MTLPixelFormatBGRA8Unorm;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                             width:(NSUInteger)width
+                                                                                            height:(NSUInteger)height
+                                                                                         mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> textureObject = [ctx.device newTextureWithDescriptor:descriptor];
+    if (!textureObject) {
+        gl4metalSetError(GL_OUT_OF_MEMORY);
+        return;
+    }
+    if (pixels && type == GL_UNSIGNED_BYTE) {
+        NSUInteger bytesPerRow = (NSUInteger)width * 4;
+        MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height);
+        [textureObject replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:bytesPerRow];
+    }
+    textureObjects[@(texture)] = textureObject;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -85,7 +121,15 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint xoffset,
     (void)height;
     (void)format;
     (void)type;
-    (void)pixels;
+    GLuint texture = [boundTextureUnits[@(activeTextureUnit - GL_TEXTURE0)] unsignedIntValue];
+    id<MTLTexture> textureObject = textureObjects[@(texture)];
+    if (!textureObject || !pixels || type != GL_UNSIGNED_BYTE) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    NSUInteger bytesPerRow = (NSUInteger)width * 4;
+    MTLRegion region = MTLRegionMake2D((NSUInteger)xoffset, (NSUInteger)yoffset, (NSUInteger)width, (NSUInteger)height);
+    [textureObject replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:pixels bytesPerRow:bytesPerRow];
     gl4metalSetError(GL_NO_ERROR);
 }
 
