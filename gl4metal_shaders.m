@@ -241,6 +241,7 @@ NSString *gl4metalBuildTranslatedMetalSource(NSString *vertexSource, NSString *f
         return metalSource;
     }
 
+    #if 0
         vertexSource = gl4metalStripComments(vertexSource);
         fragmentSource = gl4metalStripComments(fragmentSource);
         NSArray *attributes = [gl4metalFindDeclarations(vertexSource, @"attribute") arrayByAddingObjectsFromArray:gl4metalFindDeclarations(vertexSource, @"in")];
@@ -312,8 +313,13 @@ NSString *gl4metalBuildTranslatedMetalSource(NSString *vertexSource, NSString *f
     if (hasColor) *hasColor = color;
     if (hasTexCoord) *hasTexCoord = texcoord;
     return metalSource;
+#endif
+    if (hasColor) *hasColor = NO;
+    if (hasTexCoord) *hasTexCoord = NO;
+    return nil;
 }
 
+#if 0
 BOOL gl4metalCreateDefaultProgramPipelineForProgram(GLuint program) {
     if (!ctx || !ctx.device) return NO;
 
@@ -370,13 +376,14 @@ BOOL gl4metalCreateDefaultProgramPipelineForProgram(GLuint program) {
     }
     return success;
 }
+#endif
 
 BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     if (!ctx || !ctx.device) return NO;
 
     NSMutableArray<NSNumber *> *attached = programShaders[@(program)];
     if (attached == nil || [attached count] == 0) {
-        return gl4metalCreateDefaultProgramPipelineForProgram(program);
+        return NO;
     }
 
     NSString *vertexSource = nil;
@@ -396,7 +403,7 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     gl4metalRegisterUniformLayout(program, vertexSource, fragmentSource);
     NSString *metalSource = gl4metalBuildTranslatedMetalSource(vertexSource, fragmentSource, &hasColor, &hasTexCoord);
     if (metalSource == nil || metalSource.length == 0) {
-        return gl4metalCreateDefaultProgramPipelineForProgram(program);
+        return NO;
     }
 
     id<MTLLibrary> library = programMetalLibraries[@(program)];
@@ -405,7 +412,7 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
         library = [ctx.device newLibraryWithSource:metalSource options:nil error:&error];
         if (!library) {
             NSLog(@"[gl4metal] ERROR: Failed to compile translated Metal library for program %u: %@", program, error.localizedDescription);
-            return gl4metalCreateDefaultProgramPipelineForProgram(program);
+            return NO;
         }
         programMetalLibraries[@(program)] = library;
     }
@@ -413,8 +420,8 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     id<MTLFunction> vertexFunction = [library newFunctionWithName:@"gl4metal_program_vertex"];
     id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"gl4metal_program_fragment"];
     if (!vertexFunction || !fragmentFunction) {
-        NSLog(@"[gl4metal] WARNING: program %u used translated shader source but Metal entry points missing; falling back.", program);
-        return gl4metalCreateDefaultProgramPipelineForProgram(program);
+        NSLog(@"[gl4metal] ERROR: translated shader entry points missing for program %u", program);
+        return NO;
     }
 
     MTLVertexDescriptor *vertexDescriptor = gl4metalCreateVertexDescriptorForCurrentVAO();

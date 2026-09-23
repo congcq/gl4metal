@@ -976,11 +976,6 @@ static id<MTLRenderPipelineState> gl4metalResolveCurrentPipeline(void) {
         return ctx.pipelineState;
     }
 
-    if (defaultFallbackPipeline) {
-        ctx.pipelineState = defaultFallbackPipeline;
-        return defaultFallbackPipeline;
-    }
-
     if (currentProgram != 0) {
         NSString *cacheKey = gl4metalBuildPipelineCacheKey(currentProgram, gl4metalGetCurrentVAO());
         id<MTLRenderPipelineState> programPipeline = pipelineLayoutCache[cacheKey];
@@ -1010,7 +1005,7 @@ void APIENTRY glUseProgram(GLuint program) {
 
     if (program == 0) {
         currentProgram = 0;
-        ctx.pipelineState = defaultFallbackPipeline;
+        ctx.pipelineState = nil;
         gl4metalSetError(GL_NO_ERROR);
         return;
     }
