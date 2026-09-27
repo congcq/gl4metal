@@ -11,6 +11,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
+
+      - run: git submodule update --init --recursive
+      
       - name: Build gl4metal
         run: |
           mkdir -p build
