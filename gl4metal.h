@@ -15,9 +15,16 @@ typedef struct {
     GLint size;
     GLenum type;
     GLboolean normalized;
+    GLboolean integer;
     GLsizei stride;
     GLintptr pointerOffset;
     GLuint boundVBO;
+    GLfloat currentValue[4];
+    GLint currentIntValue[4];
+    GLuint currentUIntValue[4];
+    GLboolean currentValueIsInteger;
+    GLboolean currentValueIsUnsigned;
+    GLuint divisor;
 } gl4metalVertexAttrib;
 
 typedef struct {
@@ -54,6 +61,7 @@ typedef struct {
 @property (nonatomic, strong) id<MTLCommandBuffer> currentCommandBuffer;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *programPipelines;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *programResourceInfo;
 
 @property (nonatomic, assign) GLboolean depthTestEnabled;
 @property (nonatomic, assign) GLboolean depthWriteEnabled;
@@ -105,7 +113,11 @@ gl4metalVertexArray *gl4metalGetCurrentVAO(void);
 MTLVertexDescriptor *gl4metalCreateVertexDescriptorForCurrentVAO(void);
 NSString *gl4metalBuildPipelineCacheKey(GLuint program, gl4metalVertexArray *vao);
 BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction> fragmentFunction, MTLVertexDescriptor *vertexDescriptor);
+BOOL gl4metalCreatePipelineStateForProgram(GLuint program, id<MTLFunction> vertexFunction, id<MTLFunction> fragmentFunction, MTLVertexDescriptor *vertexDescriptor);
+void gl4metalDumpProgramResourceInfo(GLuint program);
 void gl4metalSetError(GLenum error);
+void gl4metalRegisterConstantVertexAttribute(NSUInteger index, MTLVertexFormat format);
+void gl4metalUpdateConstantVertexAttribute(NSUInteger index);
 
 #ifdef __cplusplus
 }

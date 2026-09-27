@@ -3,6 +3,10 @@
 #ifndef GL4METAL_RUNTIME_H
 #define GL4METAL_RUNTIME_H
 
+#include <iostream>
+#include <unordered_map>
+#include <string>
+
 extern gl4metalContext *ctx;
 extern GLuint nextBufferId;
 extern GLuint nextVAOId;
@@ -19,7 +23,16 @@ extern GLuint currentProgram;
 extern float cachedFallbackMVP[16];
 extern BOOL cachedFallbackMVPIsValid;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *shaderTypes;
-extern NSMutableDictionary<NSNumber *, NSString *> *shaderSources;
+struct GLShader {
+    GLenum type = 0;
+    std::string glslSource;
+    std::string mslSource;
+    id<MTLLibrary> mtlLibrary = nil;
+    id<MTLFunction> mtlFunction = nil;
+    bool compiled = false;
+    std::string infoLog;
+};
+extern std::unordered_map<GLuint, GLShader> shaderSources;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus;
 extern NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus;

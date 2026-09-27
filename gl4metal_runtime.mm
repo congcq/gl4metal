@@ -21,7 +21,7 @@ float cachedFallbackMVP[16] = {
 };
 BOOL cachedFallbackMVPIsValid = NO;
 NSMutableDictionary<NSNumber *, NSNumber *> *shaderTypes = nil;
-NSMutableDictionary<NSNumber *, NSString *> *shaderSources = nil;
+std::unordered_map<GLuint, GLShader> shaderSources;
 NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus = nil;
 NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders = nil;
 NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus = nil;
