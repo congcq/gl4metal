@@ -3,10 +3,13 @@
 #ifndef GL4METAL_RUNTIME_H
 #define GL4METAL_RUNTIME_H
 
+#include <iostream>
+#include <unordered_map>
+#include <string>
+
 extern gl4metalContext *ctx;
 extern GLuint nextBufferId;
 extern GLuint nextVAOId;
-extern GLuint nextTextureId;
 extern NSMutableDictionary<NSNumber *, id<MTLBuffer>> *bufferObjects;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *bufferSizes;
 extern NSMutableDictionary<NSString *, id<MTLBuffer>> *convertedIndexBuffers;
@@ -20,7 +23,16 @@ extern GLuint currentProgram;
 extern float cachedFallbackMVP[16];
 extern BOOL cachedFallbackMVPIsValid;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *shaderTypes;
-extern NSMutableDictionary<NSNumber *, NSString *> *shaderSources;
+struct GLShader {
+    GLenum type = 0;
+    std::string glslSource;
+    std::string mslSource;
+    id<MTLLibrary> mtlLibrary = nil;
+    id<MTLFunction> mtlFunction = nil;
+    bool compiled = false;
+    std::string infoLog;
+};
+extern std::unordered_map<GLuint, GLShader> shaderSources;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus;
 extern NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus;
@@ -38,11 +50,6 @@ extern NSMutableDictionary<NSNumber *, NSString *> *uniformLocationNames;
 extern NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, NSString *> *> *programAttribBindings;
 extern NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelineLayoutCache;
 extern id<MTLRenderPipelineState> defaultFallbackPipeline;
-extern NSMutableDictionary<NSNumber *, id<MTLTexture>> *textureObjects;
-extern NSMutableDictionary<NSNumber *, NSNumber *> *boundTextureUnits;
-extern GLenum activeTextureUnit;
-extern NSMutableDictionary<NSNumber *, NSArray<NSDictionary *> *> *uniformLayouts;
-extern NSMutableDictionary<NSNumber *, id<MTLLibrary>> *programMetalLibraries;
 
 void gl4metalSetError(GLenum error);
 
