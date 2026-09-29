@@ -155,12 +155,11 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
     if ((NSUInteger)xoffset + (NSUInteger)width > levelWidth) return NO;
     if ((NSUInteger)yoffset + (NSUInteger)height > levelHeight) return NO;
 
-    // OpenGL texture uploads define the first source row as the row at the
-    // texture's lower-left origin. Metal's replaceRegion memory row 0 is the
-    // top row for the normalized texture coordinate convention used here.
-    // Flip rows during upload so GL texture coordinates retain their semantics.
-    // Set GL4METAL_NO_TEXTURE_FLIP=1 to disable this conversion for A/B testing.
-    BOOL flipY = (getenv("GL4METAL_NO_TEXTURE_FLIP") == NULL);
+    // Keep texture uploads in the same row order supplied by the GL caller.
+    // Minecraft's ordinary 2D textures (Sampler0/Sampler2/etc.) must not be
+    // globally flipped here. Framebuffer-origin conversion is handled at the
+    // compositor shader for DiffuseSampler instead, because framebuffer-backed
+    // textures have a different origin relationship than ordinary GL textures.
     if (!pixels) return YES;
 
     size_t sourceBpp = gl4metalBytesPerPixelForFormatType(format, type);
@@ -176,8 +175,7 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
 
     for (size_t row = 0; row < (size_t)height; ++row) {
         const uint8_t *srcRow = src + row * sourceRowBytes;
-        size_t dstRowIndex = flipY ? ((size_t)height - 1 - row) : row;
-        uint8_t *dstRow = dst + dstRowIndex * (size_t)width * 4;
+        uint8_t *dstRow = dst + row * (size_t)width * 4;
 
         for (size_t x = 0; x < (size_t)width; ++x) {
             const uint8_t *p = srcRow + x * sourceBpp;
@@ -201,11 +199,8 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
         }
     }
 
-    // Convert the OpenGL lower-left y-offset to Metal's row origin after the
-    // vertical flip. The uploaded sub-rectangle occupies the mirrored range.
-    NSUInteger metalY = flipY
-        ? levelHeight - (NSUInteger)yoffset - (NSUInteger)height
-        : (NSUInteger)yoffset;
+    // Ordinary GL texture uploads retain their supplied texture-row origin.
+    NSUInteger metalY = (NSUInteger)yoffset;
 
     [texture replaceRegion:MTLRegionMake2D((NSUInteger)xoffset,
                                            metalY,

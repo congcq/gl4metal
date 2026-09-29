@@ -270,23 +270,41 @@ static NSUInteger gl4metalDrawSerial = 0;
 static BOOL gl4metalGPUIsolationEnabled = NO;
 static BOOL gl4metalGPUIsolationFailed = NO;
 
+// Completed command buffers return their uniform arenas here. Reusing the
+// buffers avoids allocating a fresh 256 KiB MTLBuffer for every frame while
+// preserving GPU lifetime safety: a buffer is returned only after its command
+// buffer has completed.
+static NSMutableArray<id<MTLBuffer>> *gl4metalUniformArenaPool = nil;
+
 static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void) {
     if (!ctx || !ctx.commandQueue) return nil;
     id<MTLCommandBuffer> cb = [ctx.commandQueue commandBuffer];
     if (!cb) return nil;
 
-    // Uniform storage is owned by the command-buffer generation. A small
-    // ring/arena avoids creating one MTLBuffer per uniform per draw while still
-    // keeping every encoded draw immutable until its command buffer completes.
+    // Uniform storage is owned by the command-buffer generation. Reuse a
+    // completed arena when possible; every in-flight command buffer still owns
+    // its arena strongly through the completion-handler capture.
+    if (!gl4metalUniformArenaPool) {
+        gl4metalUniformArenaPool = [NSMutableArray array];
+    }
     NSMutableArray<id<MTLBuffer>> *uniformArenas = [NSMutableArray array];
+    @synchronized(gl4metalUniformArenaPool) {
+        if (gl4metalUniformArenaPool.count > 0) {
+            id<MTLBuffer> recycled = gl4metalUniformArenaPool.lastObject;
+            [gl4metalUniformArenaPool removeLastObject];
+            if (recycled) [uniformArenas addObject:recycled];
+        }
+    }
     ctx.uniformArenaBuffers = uniformArenas;
     ctx.uniformArenaOffset = 0;
 
     cb.label = [NSString stringWithFormat:@"gl4metal frame"];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-        // Capture the arena strongly until GPU completion. The context can move
-        // on to the next frame's arena immediately after commit.
-        (void)uniformArenas;
+        // The command buffer is finished, so its uniform buffers are safe to
+        // recycle for a future frame.
+        @synchronized(gl4metalUniformArenaPool) {
+            [gl4metalUniformArenaPool addObjectsFromArray:uniformArenas];
+        }
         MTLCommandBufferStatus status = completed.status;
         NSError *error = completed.error;
         if (status == MTLCommandBufferStatusError || error) {
@@ -2547,7 +2565,7 @@ static NSUInteger gl4metalAlignUniformOffset(NSUInteger value) {
 static id<MTLBuffer> gl4metalUniformArenaAlloc(NSUInteger length, NSUInteger *outOffset) {
     if (!ctx || !ctx.device || length == 0 || !outOffset) return nil;
 
-    const NSUInteger chunkSize = 256 * 1024;
+    const NSUInteger chunkSize = 64 * 1024;
     NSUInteger alignedLength = gl4metalAlignUniformOffset(length);
 
     if (!ctx.uniformArenaBuffers) {
@@ -2780,6 +2798,11 @@ static void gl4metalBindProgramResources(id<MTLRenderCommandEncoder> encoder, GL
             }
             ++boundTextures;
             GLuint glTexture = gl4metalGetTextureNameForUnit((GLuint)unit);
+            if (getenv("GL4METAL_TEXTURE_BIND_TRACE") &&
+                (program == 1 || program == 17 || program == 53)) {
+                printf("[gl4metal][TEXTURE_BIND_TRACE] program=%u stage=%s name=%s resourceIndex=%lu unit=%d GLtex=%u metal=%p\n",
+                       program, stage, name, index, unit, glTexture, texture);
+            }
             if (getenv("GL4METAL_VERBOSE_RESOURCES")) {
                 printf("[gl4metal][RESOURCES] auto-bound %s texture(%lu) %s %s unit=%d GLtex=%u\n",
                        stage, index, name, glTexture ? "[real]" : "[dummy]", unit, glTexture);

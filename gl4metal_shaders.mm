@@ -5,6 +5,7 @@
 #include <regex>
 #include <algorithm>
 #include <set>
+#include <cctype>
 
 NSString *gl4metalBuildPipelineCacheKey(GLuint program, gl4metalVertexArray *vao) {
     NSMutableString *key = [NSMutableString stringWithFormat:@"p%u:rtC%luD%luS%lu:B%d/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u;",
@@ -426,6 +427,103 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     return YES;
 }
 
+// Rewrite framebuffer/post-process sampling without changing ordinary texture
+// uploads. Minecraft's DiffuseSampler is used for compositor framebuffer
+// textures; their Metal render-target origin is opposite to GL texture-space
+// Y. Applying the flip at this exact sampling site avoids double-flipping
+// normal asset textures such as the loading-screen texture.
+static std::string gl4metalRewriteDiffuseSamplerY(const std::string &source) {
+    if (source.find("DiffuseSampler") == std::string::npos) return source;
+    if (getenv("GL4METAL_NO_FBO_Y_FLIP")) return source;
+
+    std::string out;
+    out.reserve(source.size() + 128);
+    size_t cursor = 0;
+    bool changed = false;
+
+    while (cursor < source.size()) {
+        size_t pos = source.find("texture", cursor);
+        if (pos == std::string::npos) {
+            out.append(source, cursor, std::string::npos);
+            break;
+        }
+
+        // Avoid identifiers such as textureProj or mytexture.
+        bool leftOk = (pos == 0) || !(std::isalnum((unsigned char)source[pos - 1]) || source[pos - 1] == '_');
+        size_t afterName = pos + 7;
+        bool exactTextureName = afterName <= source.size() &&
+            (afterName == source.size() || std::isspace((unsigned char)source[afterName]) || source[afterName] == '(');
+        size_t open = source.find('(', afterName);
+        if (!leftOk || !exactTextureName || open == std::string::npos) {
+            out.append(source, cursor, afterName - cursor);
+            cursor = afterName;
+            continue;
+        }
+
+        // Find the first argument and the top-level comma.
+        size_t i = open + 1;
+        while (i < source.size() && std::isspace((unsigned char)source[i])) ++i;
+        const std::string samplerName = "DiffuseSampler";
+        if (source.compare(i, samplerName.size(), samplerName) != 0) {
+            out.append(source, cursor, open + 1 - cursor);
+            cursor = open + 1;
+            continue;
+        }
+        i += samplerName.size();
+        while (i < source.size() && std::isspace((unsigned char)source[i])) ++i;
+        if (i >= source.size() || source[i] != ',') {
+            out.append(source, cursor, i - cursor);
+            cursor = i;
+            continue;
+        }
+
+        size_t exprStart = i + 1;
+        while (exprStart < source.size() && std::isspace((unsigned char)source[exprStart])) ++exprStart;
+
+        int depth = 1;
+        bool inString = false;
+        char stringQuote = '\0';
+        size_t exprEnd = exprStart;
+        for (; exprEnd < source.size(); ++exprEnd) {
+            char c = source[exprEnd];
+            if (inString) {
+                if (c == stringQuote && (exprEnd == 0 || source[exprEnd - 1] != '\\')) inString = false;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                inString = true;
+                stringQuote = c;
+            } else if (c == '(') {
+                ++depth;
+            } else if (c == ')') {
+                --depth;
+                if (depth == 0) break;
+            }
+        }
+        if (exprEnd >= source.size()) {
+            out.append(source, cursor, std::string::npos);
+            cursor = source.size();
+            break;
+        }
+
+        std::string coordExpr = source.substr(exprStart, exprEnd - exprStart);
+        out.append(source, cursor, pos - cursor);
+        out.append("texture(DiffuseSampler, vec2((");
+        out.append(coordExpr);
+        out.append(").x, 1.0 - (" );
+        out.append(coordExpr);
+        out.append(").y))");
+        cursor = exprEnd + 1;
+        changed = true;
+    }
+
+    if (changed) {
+        printf("[gl4metal][ORIGIN] DiffuseSampler Y-flip enabled for framebuffer/post-process sampling\n");
+        return out;
+    }
+    return source;
+}
+
 static std::string stripGLSLComments(const std::string &source) {
     std::string out;
     out.reserve(source.size());
@@ -490,6 +588,11 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
     // Minecraft frequently appends generated // [TAG] annotations. Strip
     // GLSL comments before parsing so glslang never sees an EOF comment.
     std::string glsl = stripGLSLComments(glslSource);
+
+    // Framebuffer/post-process textures use GL texture coordinates against
+    // Metal render-target origin. Keep ordinary texture uploads untouched and
+    // correct only DiffuseSampler reads here.
+    glsl = gl4metalRewriteDiffuseSamplerY(glsl);
 
     std::regex versionRegex(R"(#version\s+\d+([^\r\n]*))");
 
