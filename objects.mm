@@ -199,16 +199,47 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
         }
     }
 
-    // Ordinary GL texture uploads retain their supplied texture-row origin.
-    NSUInteger metalY = (NSUInteger)yoffset;
+    // Do not CPU-write an MTLTexture that a previous command buffer may still
+    // be sampling or rendering. Stage the pixels into a shared MTLBuffer and
+    // encode the update on the current Metal command buffer. If there is no
+    // current frame command buffer, submit a dedicated upload command buffer;
+    // the same command queue preserves ordering for subsequent rendering.
+    id<MTLCommandBuffer> cb = ctx.currentCommandBuffer;
+    BOOL dedicated = NO;
+    if (!cb) {
+        cb = [ctx.commandQueue commandBuffer];
+        dedicated = YES;
+    }
+    if (!cb) return NO;
 
-    [texture replaceRegion:MTLRegionMake2D((NSUInteger)xoffset,
-                                           metalY,
-                                           (NSUInteger)width,
-                                           (NSUInteger)height)
-                mipmapLevel:(NSUInteger)level
-                  withBytes:rgba.bytes
-                bytesPerRow:(NSUInteger)width * 4];
+    id<MTLBuffer> staging = [ctx.device newBufferWithBytes:rgba.bytes
+                                                       length:rgba.length
+                                                      options:MTLResourceStorageModeShared];
+    if (!staging) return NO;
+
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) return NO;
+
+    [blit copyFromBuffer:staging
+            sourceOffset:0
+        sourceBytesPerRow:(NSUInteger)width * 4
+      sourceBytesPerImage:(NSUInteger)width * (NSUInteger)height * 4
+               sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+                toTexture:texture
+         destinationSlice:0
+         destinationLevel:(NSUInteger)level
+        destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0)];
+    [blit endEncoding];
+
+    if (dedicated) {
+        cb.label = [NSString stringWithFormat:@"gl4metal texture upload"];
+        [cb commit];
+    }
+
+    if (getenv("GL4METAL_RESOURCE_UPDATE_TRACE")) {
+        printf("[gl4metal][RESOURCE_UPDATE] texture upload staged level=%d rect=%d,%d %dx%d dedicated=%d\n",
+               level, xoffset, yoffset, width, height, dedicated);
+    }
     return YES;
 }
 
@@ -515,7 +546,9 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                                                                        height:(NSUInteger)height
                                                                                     mipmapped:(isDepth ? NO : (mipLevels > 1))];
         td.usage = isDepth ? MTLTextureUsageRenderTarget : (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
-        td.storageMode = MTLStorageModeShared;
+        // Texture contents are transferred through GPU blit commands, so keep
+        // real textures private to avoid CPU/GPU aliasing of shared storage.
+        td.storageMode = MTLStorageModePrivate;
         texture = [ctx.device newTextureWithDescriptor:td];
         if (!texture) {
             gl4metalSetError(GL_OUT_OF_MEMORY);

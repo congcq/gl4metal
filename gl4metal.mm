@@ -15,6 +15,62 @@
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 
+// Resource hazards: OpenGL lets the CPU rewrite a buffer while the previous
+// frame is still using that GL object. Metal cannot safely observe arbitrary
+// CPU mutation of an in-flight MTLBuffer. Track GL buffer IDs used by each
+// command buffer so glBufferSubData/glMapBuffer can copy-on-write when needed.
+static NSMutableDictionary<NSNumber *, NSNumber *> *gl4metalBufferInFlightCounts = nil;
+static NSMutableSet<NSNumber *> *gl4metalCurrentCommandBufferBufferUses = nil;
+
+static BOOL gl4metalSafeResourceUpdatesEnabled(void) {
+    const char *v = getenv("GL4METAL_SAFE_RESOURCE_UPDATES");
+    if (!v || !*v) return YES;
+    return !(strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0);
+}
+
+static BOOL gl4metalBufferIsInFlight(GLuint bufferID) {
+    if (!bufferID || !gl4metalBufferInFlightCounts) return NO;
+    @synchronized(gl4metalBufferInFlightCounts) {
+        return [gl4metalBufferInFlightCounts[@(bufferID)] unsignedIntegerValue] > 0;
+    }
+}
+
+static void gl4metalMarkBufferUsed(GLuint bufferID) {
+    if (!bufferID || !gl4metalCurrentCommandBufferBufferUses || !gl4metalBufferInFlightCounts) return;
+    NSNumber *key = @(bufferID);
+    if ([gl4metalCurrentCommandBufferBufferUses containsObject:key]) return;
+    [gl4metalCurrentCommandBufferBufferUses addObject:key];
+    @synchronized(gl4metalBufferInFlightCounts) {
+        NSUInteger count = [gl4metalBufferInFlightCounts[key] unsignedIntegerValue];
+        gl4metalBufferInFlightCounts[key] = @(count + 1);
+    }
+}
+
+static id<MTLBuffer> gl4metalCopyBufferForWrite(GLuint bufferID, id<MTLBuffer> oldBuffer,
+                                                  GLintptr patchOffset, GLsizeiptr patchSize,
+                                                  const void *patchData) {
+    if (!ctx || !ctx.device || !oldBuffer || !patchData) return nil;
+    if (patchOffset < 0 || patchSize < 0 ||
+        (size_t)patchOffset > (size_t)[oldBuffer length] ||
+        (size_t)patchSize > (size_t)[oldBuffer length] - (size_t)patchOffset) {
+        return nil;
+    }
+
+    NSUInteger length = [oldBuffer length];
+    id<MTLBuffer> newBuffer = [ctx.device newBufferWithLength:length
+                                                        options:MTLResourceStorageModeShared];
+    if (!newBuffer) return nil;
+
+    memcpy(newBuffer.contents, oldBuffer.contents, length);
+    memcpy((uint8_t *)newBuffer.contents + patchOffset, patchData, (size_t)patchSize);
+
+    if (getenv("GL4METAL_RESOURCE_UPDATE_TRACE")) {
+        printf("[gl4metal][RESOURCE_UPDATE] COW buffer=%u length=%lu patch=%ld+%ld\n",
+               bufferID, (unsigned long)length, (long)patchOffset, (long)patchSize);
+    }
+    return newBuffer;
+}
+
 gl4metalVertexArray *gl4metalGetCurrentVAO(void);
 
 // V8 uniform/resource binding forward declarations.
@@ -124,24 +180,34 @@ void gl4metalRegisterConstantVertexAttribute(NSUInteger index, MTLVertexFormat f
 
 void gl4metalUpdateConstantVertexAttribute(NSUInteger index) {
     if (!ctx || index >= 16) return;
-    id<MTLBuffer> buffer = constantVertexAttributeBuffers[@(index)];
-    if (!buffer || ![inferredConstantVertexAttributes containsObject:@(index)]) return;
-    // The exact format was fixed when the real shader pipeline was built.
-    // Repack using the existing 16-byte storage; integer-vs-float is tracked by VAO state.
+    id<MTLBuffer> oldBuffer = constantVertexAttributeBuffers[@(index)];
+    if (!oldBuffer || ![inferredConstantVertexAttributes containsObject:@(index)]) return;
     gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     if (!vao) return;
-    // Preserve the raw bytes for the current value. For float values this is float32;
-    // for integer values it is signed/unsigned 32-bit as required by the shader input.
+
+    uint8_t bytes[16] = {0};
     if (vao->attribs[index].currentValueIsInteger) {
         if (vao->attribs[index].currentValueIsUnsigned) {
-            memcpy([buffer contents], vao->attribs[index].currentUIntValue, 16);
+            memcpy(bytes, vao->attribs[index].currentUIntValue, 16);
         } else {
-            memcpy([buffer contents], vao->attribs[index].currentIntValue, 16);
+            memcpy(bytes, vao->attribs[index].currentIntValue, 16);
         }
     } else {
-        memcpy([buffer contents], vao->attribs[index].currentValue, 16);
+        memcpy(bytes, vao->attribs[index].currentValue, 16);
+    }
+
+    // Constant GL attributes are also vertex resources. Replace the Metal
+    // buffer instead of mutating an object that a submitted draw may still use.
+    id<MTLBuffer> replacement = oldBuffer;
+    if (gl4metalSafeResourceUpdatesEnabled()) {
+        replacement = [ctx.device newBufferWithBytes:bytes length:sizeof(bytes) options:MTLResourceStorageModeShared];
+        if (!replacement) return;
+        constantVertexAttributeBuffers[@(index)] = replacement;
+    } else {
+        memcpy(oldBuffer.contents, bytes, sizeof(bytes));
     }
 }
+
 
 static void gl4metalGetFallbackMVP(float matrix[16]) {
     static const float identity[16] = {
@@ -221,6 +287,9 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.pendingClearFlags = 0;
     ctx.pendingClearFramebuffer = 0;
 
+    gl4metalBufferInFlightCounts = [NSMutableDictionary dictionary];
+    gl4metalCurrentCommandBufferBufferUses = nil;
+
     bufferObjects = [NSMutableDictionary dictionary];
     bufferSizes = [NSMutableDictionary dictionary];
     convertedIndexBuffers = [NSMutableDictionary dictionary];
@@ -288,6 +357,8 @@ static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void) {
         gl4metalUniformArenaPool = [NSMutableArray array];
     }
     NSMutableArray<id<MTLBuffer>> *uniformArenas = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *usedGLBuffers = [NSMutableSet set];
+    gl4metalCurrentCommandBufferBufferUses = usedGLBuffers;
     @synchronized(gl4metalUniformArenaPool) {
         if (gl4metalUniformArenaPool.count > 0) {
             id<MTLBuffer> recycled = gl4metalUniformArenaPool.lastObject;
@@ -302,6 +373,13 @@ static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void) {
     [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         // The command buffer is finished, so its uniform buffers are safe to
         // recycle for a future frame.
+        @synchronized(gl4metalBufferInFlightCounts) {
+            for (NSNumber *bufferKey in usedGLBuffers) {
+                NSUInteger count = [gl4metalBufferInFlightCounts[bufferKey] unsignedIntegerValue];
+                if (count > 1) gl4metalBufferInFlightCounts[bufferKey] = @(count - 1);
+                else [gl4metalBufferInFlightCounts removeObjectForKey:bufferKey];
+            }
+        }
         @synchronized(gl4metalUniformArenaPool) {
             [gl4metalUniformArenaPool addObjectsFromArray:uniformArenas];
         }
@@ -745,7 +823,16 @@ void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, c
         return;
     }
 
-    memcpy((char *)[buffer contents] + offset, data, (size_t)size);
+    if (gl4metalSafeResourceUpdatesEnabled() && gl4metalBufferIsInFlight(currentBound)) {
+        id<MTLBuffer> replacement = gl4metalCopyBufferForWrite(currentBound, buffer, offset, size, data);
+        if (!replacement) {
+            gl4metalSetError(GL_OUT_OF_MEMORY);
+            return;
+        }
+        bufferObjects[@(currentBound)] = replacement;
+    } else {
+        memcpy((char *)[buffer contents] + offset, data, (size_t)size);
+    }
     [convertedIndexBuffers removeAllObjects];
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -815,12 +902,23 @@ void APIENTRY glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 }
 
 void* APIENTRY glMapBuffer(GLenum target, GLenum access) {
+    (void)access;
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
 
     id<MTLBuffer> mtlBuffer = bufferObjects[@(currentBound)];
     if (!mtlBuffer) {
         printf("[gl4metal] ERROR: glMapbuffer: No MTLBuffer found for ID %u at target 0x%X\n", currentBound, target);
         return NULL;
+    }
+
+    if (gl4metalSafeResourceUpdatesEnabled() && gl4metalBufferIsInFlight(currentBound)) {
+        id<MTLBuffer> replacement = gl4metalCopyBufferForWrite(currentBound, mtlBuffer, 0, (GLsizeiptr)[mtlBuffer length], mtlBuffer.contents);
+        if (!replacement) {
+            gl4metalSetError(GL_OUT_OF_MEMORY);
+            return NULL;
+        }
+        bufferObjects[@(currentBound)] = replacement;
+        mtlBuffer = replacement;
     }
 
     return [mtlBuffer contents];
@@ -836,6 +934,15 @@ void *APIENTRY glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr lengt
         printf("[gl4metal][BOUNDS] glMapBufferRange OOB: buffer=%u offset=%ld length=%ld bufferLength=%lu\n", currentBound, (long)offset, (long)length, (unsigned long)[mtlBuffer length]);
         gl4metalSetError(GL_INVALID_VALUE);
         return NULL;
+    }
+    if (gl4metalSafeResourceUpdatesEnabled() && gl4metalBufferIsInFlight(currentBound)) {
+        id<MTLBuffer> replacement = gl4metalCopyBufferForWrite(currentBound, mtlBuffer, 0, (GLsizeiptr)[mtlBuffer length], mtlBuffer.contents);
+        if (!replacement) {
+            gl4metalSetError(GL_OUT_OF_MEMORY);
+            return NULL;
+        }
+        bufferObjects[@(currentBound)] = replacement;
+        mtlBuffer = replacement;
     }
     gl4metalSetError(GL_NO_ERROR);
     return (void *)((char *)[mtlBuffer contents] + offset);
@@ -2337,8 +2444,10 @@ static BOOL gl4metalValidateVertexAttribRange(const gl4metalVertexAttrib *a,
     }
     size_t end = base + logicalIndex * stride + elemSize;
     size_t length = (size_t)[buffer length];
-    printf("[gl4metal][BOUNDS] attr[%lu] check: VBO=%u base=%zu stride=%zu elem=%zu lastIndex=%zu end=%zu buffer=%zu divisor=%u\n",
-           (unsigned long)attribIndex, a->boundVBO, base, stride, elemSize, logicalIndex, end, length, a->divisor);
+    if (getenv("GL4METAL_BOUNDS_TRACE")) {
+        printf("[gl4metal][BOUNDS] attr[%lu] check: VBO=%u base=%zu stride=%zu elem=%zu lastIndex=%zu end=%zu buffer=%zu divisor=%u\n",
+               (unsigned long)attribIndex, a->boundVBO, base, stride, elemSize, logicalIndex, end, length, a->divisor);
+    }
     if (end > length) {
         printf("[gl4metal][BOUNDS] attr[%lu] OOB: VBO=%u base=%zu stride=%zu elem=%zu lastIndex=%zu end=%zu buffer=%zu divisor=%u\n",
                (unsigned long)attribIndex, a->boundVBO, base, stride, elemSize,
@@ -2491,6 +2600,7 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
                     if (!gl4metalValidateBufferOffset(buffer, attrib->pointerOffset, &offset)) {
                         continue;
                     }
+                    gl4metalMarkBufferUsed(attrib->boundVBO);
                     [encoder setVertexBuffer:buffer offset:offset atIndex:index];
                     if (getenv("GL4METAL_VERTEX_BIND_TRACE")) {
                         printf("[gl4metal][VERTEX_BIND_TRACE] program=%u vao=%u attr=%lu vbo=%u offset=%lu stride=%d size=%d type=0x%X\n",
@@ -2888,6 +2998,7 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
         printf("[gl4metal] ERROR: Index MTLBuffer not found for VBO ID %u\n", elementVBO);
         return;
     }
+    gl4metalMarkBufferUsed(elementVBO);
     size_t indexWidth = (type == GL_UNSIGNED_BYTE) ? 1 : (type == GL_UNSIGNED_SHORT ? 2 : (type == GL_UNSIGNED_INT ? 4 : 0));
     if (!indexWidth) { printf("[gl4metal][BOUNDS] Unsupported index type 0x%X\n", type); return; }
     GLintptr rawIndexOffset = (indices == NULL) ? 0 : (GLintptr)(uintptr_t)indices;
@@ -2996,6 +3107,7 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
                     if (!gl4metalValidateBufferOffset(buffer, attrib->pointerOffset, &offset)) {
                         continue;
                     }
+                    gl4metalMarkBufferUsed(attrib->boundVBO);
                     [encoder setVertexBuffer:buffer offset:offset atIndex:index];
                     if (getenv("GL4METAL_VERTEX_BIND_TRACE")) {
                         printf("[gl4metal][VERTEX_BIND_TRACE] program=%u vao=%u attr=%lu vbo=%u offset=%lu stride=%d size=%d type=0x%X\n",
@@ -3265,16 +3377,18 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
         printf("[gl4metal][RESOURCES] program=%u reflected Metal resources:\n", program);
         printf("%s", resourceInfo.UTF8String);
     }
-    printf("[gl4metal] Pipeline vertex attributes:\n");
-    for (NSUInteger i = 0; i < 16; i++) {
-        MTLVertexFormat f = vertexDesc.attributes[i].format;
-        if (f != MTLVertexFormatInvalid) {
-            printf("[gl4metal]   attr[%lu] format=%lu buffer=%lu stride=%lu step=%lu rate=%lu\n",
-                   (unsigned long)i, (unsigned long)f,
-                   (unsigned long)vertexDesc.attributes[i].bufferIndex,
-                   (unsigned long)vertexDesc.layouts[i].stride,
-                   (unsigned long)vertexDesc.layouts[i].stepFunction,
-                   (unsigned long)vertexDesc.layouts[i].stepRate);
+    if (getenv("GL4METAL_VERBOSE_RESOURCES") || getenv("GL4METAL_PIPELINE_TRACE")) {
+        printf("[gl4metal] Pipeline vertex attributes:\n");
+        for (NSUInteger i = 0; i < 16; i++) {
+            MTLVertexFormat f = vertexDesc.attributes[i].format;
+            if (f != MTLVertexFormatInvalid) {
+                printf("[gl4metal]   attr[%lu] format=%lu buffer=%lu stride=%lu step=%lu rate=%lu\n",
+                       (unsigned long)i, (unsigned long)f,
+                       (unsigned long)vertexDesc.attributes[i].bufferIndex,
+                       (unsigned long)vertexDesc.layouts[i].stride,
+                       (unsigned long)vertexDesc.layouts[i].stepFunction,
+                       (unsigned long)vertexDesc.layouts[i].stepRate);
+            }
         }
     }
     return YES;
