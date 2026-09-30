@@ -1093,6 +1093,33 @@ static void gl4metalRecoverPackedInterleavedOffsets(gl4metalVertexArray *vao) {
         if (attrCount < 2 || !allZero || !sameStride || packedSize != (size_t)stride)
             continue;
 
+        // Minecraft's POSITION_COLOR_TEX vertex format stores Color before
+        // UV in the interleaved VBO even when the linked shader binds UV and
+        // Color to locations 1 and 2 respectively. Program 17 is the vanilla
+        // text/UI path in 1.20.1 and its reflected formats are Float3, Float2,
+        // UChar4Normalized. Recover the real VBO byte order explicitly instead
+        // of assuming attribute-location order equals struct-member order.
+        if (currentProgram == 17 && stride == 24 && attrCount == 3) {
+            NSUInteger posIndex = NSNotFound;
+            NSUInteger uvIndex = NSNotFound;
+            NSUInteger colorIndex = NSNotFound;
+            for (NSUInteger aj = 0; aj < 16; ++aj) {
+                gl4metalVertexAttrib *a = &vao->attribs[aj];
+                if (!a->enabled || a->boundVBO != vbo) continue;
+                if (a->type == GL_FLOAT && a->size == 3) posIndex = aj;
+                else if (a->type == GL_FLOAT && a->size == 2) uvIndex = aj;
+                else if (a->type == GL_UNSIGNED_BYTE && a->size == 4 && a->normalized) colorIndex = aj;
+            }
+            if (posIndex != NSNotFound && uvIndex != NSNotFound && colorIndex != NSNotFound) {
+                vao->attribs[posIndex].pointerOffset = 0;
+                vao->attribs[colorIndex].pointerOffset = 12;
+                vao->attribs[uvIndex].pointerOffset = 16;
+                printf("[gl4metal][ATTR_RECOVER] program=17 POSITION_COLOR_TEX VBO=%u stride=24 offsets: a%lu=0 a%lu=12 a%lu=16\n",
+                       vbo, (unsigned long)posIndex, (unsigned long)colorIndex, (unsigned long)uvIndex);
+                continue;
+            }
+        }
+
         size_t runningOffset = 0;
         NSUInteger changed = 0;
         BOOL valid = YES;
@@ -1543,7 +1570,23 @@ MTLVertexDescriptor *gl4metalCreateVertexDescriptorForCurrentVAO(void) {
         gl4metalVertexAttrib *attrib = vao ? &vao->attribs[index] : NULL;
         if (!attrib || !attrib->enabled) continue;
 
-        descriptor.attributes[index].format = gl4metalVertexFormatForAttrib(attrib);
+        MTLVertexFormat format = gl4metalVertexFormatForAttrib(attrib);
+        descriptor.attributes[index].format = format;
+
+        // A Metal vertex-buffer layout must only exist when at least one
+        // valid vertex attribute actually references that bufferIndex.
+        // Leaving an orphan layout (for example layout[5] with no attribute
+        // using bufferIndex 5) makes MTLVertexDescriptor reject the whole
+        // descriptor during serialization.
+        if (format == MTLVertexFormatInvalid) {
+            descriptor.attributes[index].offset = 0;
+            descriptor.attributes[index].bufferIndex = 0;
+            descriptor.layouts[index].stride = 0;
+            descriptor.layouts[index].stepRate = 1;
+            descriptor.layouts[index].stepFunction = MTLVertexStepFunctionPerVertex;
+            continue;
+        }
+
         // pointerOffset is applied when the buffer is bound in the draw call.
         descriptor.attributes[index].offset = 0;
         descriptor.attributes[index].bufferIndex = index;
@@ -2530,6 +2573,62 @@ static BOOL gl4metalValidateDrawArraysBuffers(gl4metalVertexArray *vao, NSUInteg
     return ok;
 }
 
+static MTLIndexType gl4metalIndexTypeForElementType(GLenum type) {
+    switch (type) {
+        case GL_UNSIGNED_BYTE:  return MTLIndexTypeUInt16;
+        case GL_UNSIGNED_SHORT: return MTLIndexTypeUInt16;
+        case GL_UNSIGNED_INT:   return MTLIndexTypeUInt32;
+        default:                return MTLIndexTypeUInt16;
+    }
+}
+
+static BOOL gl4metalMakeTriangleFanIndexBuffer(id<MTLBuffer> source,
+                                                NSUInteger sourceOffset,
+                                                GLsizei count,
+                                                GLenum type,
+                                                id<MTLBuffer> *outBuffer,
+                                                MTLIndexType *outType) {
+    if (!ctx || !ctx.device || !source || !outBuffer || !outType || count < 3) return NO;
+    NSUInteger srcSize = (type == GL_UNSIGNED_BYTE) ? 1 :
+                          (type == GL_UNSIGNED_SHORT) ? 2 :
+                          (type == GL_UNSIGNED_INT) ? 4 : 0;
+    if (srcSize == 0 || sourceOffset > [source length] ||
+        (size_t)count > ((size_t)[source length] - sourceOffset) / srcSize) return NO;
+
+    NSUInteger fanTriangles = (NSUInteger)count - 2;
+    NSUInteger outCount = fanTriangles * 3;
+    NSUInteger outIndexSize = (type == GL_UNSIGNED_INT) ? 4 : 2;
+    NSUInteger outBytes = outCount * outIndexSize;
+    id<MTLBuffer> out = [ctx.device newBufferWithLength:outBytes options:MTLResourceStorageModeShared];
+    if (!out) return NO;
+
+    const uint8_t *src = (const uint8_t *)source.contents + sourceOffset;
+    if (outIndexSize == 2) {
+        uint16_t *dst = (uint16_t *)out.contents;
+        for (NSUInteger i = 0; i < fanTriangles; ++i) {
+            NSUInteger i1 = i + 1, i2 = i + 2;
+            uint32_t a = (type == GL_UNSIGNED_BYTE) ? src[0] : ((const uint16_t *)src)[0];
+            uint32_t b = (type == GL_UNSIGNED_BYTE) ? src[i1] : ((const uint16_t *)src)[i1];
+            uint32_t c = (type == GL_UNSIGNED_BYTE) ? src[i2] : ((const uint16_t *)src)[i2];
+            dst[i * 3 + 0] = (uint16_t)a;
+            dst[i * 3 + 1] = (uint16_t)b;
+            dst[i * 3 + 2] = (uint16_t)c;
+        }
+        *outType = MTLIndexTypeUInt16;
+    } else {
+        const uint32_t *src32 = (const uint32_t *)src;
+        uint32_t *dst = (uint32_t *)out.contents;
+        for (NSUInteger i = 0; i < fanTriangles; ++i) {
+            dst[i * 3 + 0] = src32[0];
+            dst[i * 3 + 1] = src32[i + 1];
+            dst[i * 3 + 2] = src32[i + 2];
+        }
+        *outType = MTLIndexTypeUInt32;
+    }
+    *outBuffer = out;
+    return YES;
+}
+
 static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     if (!ctx || count <= 0 || instancecount <= 0) return;
     if (gl4metalGPUIsolationEnabled && gl4metalGPUIsolationFailed) {
@@ -2627,8 +2726,40 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
 
     gl4metalBindProgramResources(encoder, currentProgram);
 
-    MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
-    [encoder drawPrimitives:primitiveType vertexStart:(NSUInteger)first vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instancecount];
+    if (mode == GL_TRIANGLE_FAN && count >= 3) {
+        NSUInteger triCount = (NSUInteger)count - 2;
+        NSUInteger indexCount = triCount * 3;
+        MTLIndexType indexType = ((NSUInteger)first + (NSUInteger)count <= 65535)
+            ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        NSUInteger indexSize = (indexType == MTLIndexTypeUInt16) ? 2 : 4;
+        id<MTLBuffer> fan = [ctx.device newBufferWithLength:indexCount * indexSize options:MTLResourceStorageModeShared];
+        if (fan) {
+            if (indexType == MTLIndexTypeUInt16) {
+                uint16_t *dst = (uint16_t *)fan.contents;
+                for (NSUInteger i = 0; i < triCount; ++i) {
+                    dst[i * 3 + 0] = (uint16_t)first;
+                    dst[i * 3 + 1] = (uint16_t)(first + (GLint)i + 1);
+                    dst[i * 3 + 2] = (uint16_t)(first + (GLint)i + 2);
+                }
+            } else {
+                uint32_t *dst = (uint32_t *)fan.contents;
+                for (NSUInteger i = 0; i < triCount; ++i) {
+                    dst[i * 3 + 0] = (uint32_t)first;
+                    dst[i * 3 + 1] = (uint32_t)(first + (GLint)i + 1);
+                    dst[i * 3 + 2] = (uint32_t)(first + (GLint)i + 2);
+                }
+            }
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                 indexCount:indexCount
+                                  indexType:indexType
+                                indexBuffer:fan
+                          indexBufferOffset:0
+                              instanceCount:(NSUInteger)instancecount];
+        }
+    } else {
+        MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
+        [encoder drawPrimitives:primitiveType vertexStart:(NSUInteger)first vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instancecount];
+    }
 
     [encoder endEncoding];
     if (gl4metalGPUIsolationEnabled) {
@@ -3200,7 +3331,22 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
         }
     }
 
-    [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset instanceCount:(NSUInteger)instancecount];
+    if (mode == GL_TRIANGLE_FAN && count >= 3) {
+        id<MTLBuffer> fanBuffer = nil;
+        MTLIndexType fanType = MTLIndexTypeUInt16;
+        if (gl4metalMakeTriangleFanIndexBuffer(drawIndexBuffer, drawIndexOffset, count,
+                                               (drawIndexType == MTLIndexTypeUInt32) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
+                                               &fanBuffer, &fanType)) {
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                 indexCount:((NSUInteger)count - 2) * 3
+                                  indexType:fanType
+                                indexBuffer:fanBuffer
+                          indexBufferOffset:0
+                              instanceCount:(NSUInteger)instancecount];
+        }
+    } else {
+        [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset instanceCount:(NSUInteger)instancecount];
+    }
 
     [encoder endEncoding];
     if (gl4metalGPUIsolationEnabled) {

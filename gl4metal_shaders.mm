@@ -161,33 +161,40 @@ BOOL gl4metalApplyVertexShaderInputFormats(NSString *vertexSource, GLuint progra
         // vertex descriptor.
         gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
         BOOL enabled = vao && vao->attribs[location].enabled;
-        if (descriptor.attributes[location].format == MTLVertexFormatInvalid) {
-            descriptor.attributes[location].format = format;
-            descriptor.attributes[location].offset = 0;
-            descriptor.attributes[location].bufferIndex = location;
+        // The shader's input location is the authoritative Metal vertex
+        // buffer index for this generated SPIR-V/MSL input. Always normalize
+        // the descriptor mapping here, even when the GL attribute already had
+        // a valid format. This fixes sparse layouts such as 0,1,2,3,4,5 where
+        // an existing GL descriptor can otherwise retain a stale bufferIndex.
+        descriptor.attributes[location].format =
+            descriptor.attributes[location].format == MTLVertexFormatInvalid
+                ? format : descriptor.attributes[location].format;
+        descriptor.attributes[location].offset = 0;
+        descriptor.attributes[location].bufferIndex = location;
 
-            NSUInteger stride = 16;
-            if (enabled && vao->attribs[location].stride > 0) {
-                stride = (NSUInteger)vao->attribs[location].stride;
-            }
-            descriptor.layouts[location].stride = stride;
-            descriptor.layouts[location].stepRate =
-                (enabled && vao->attribs[location].divisor > 0)
-                    ? vao->attribs[location].divisor : 1;
-            descriptor.layouts[location].stepFunction =
-                (enabled && vao->attribs[location].divisor > 0)
-                    ? MTLVertexStepFunctionPerInstance
-                    : MTLVertexStepFunctionPerVertex;
-
-            if (!enabled) {
-                gl4metalRegisterConstantVertexAttribute(location, format);
-            }
-
-            printf("[gl4metal][ATTR] %s GL attr[%lu] recovered from GLSL input %s %s -> Metal format %lu\n",
-                   enabled ? "Enabled" : "Disabled",
-                   (unsigned long)location,
-                   type.UTF8String, name.UTF8String, (unsigned long)format);
+        NSUInteger stride = 16;
+        if (enabled && vao->attribs[location].stride > 0) {
+            stride = (NSUInteger)vao->attribs[location].stride;
         }
+        descriptor.layouts[location].stride = stride;
+        descriptor.layouts[location].stepRate =
+            (enabled && vao->attribs[location].divisor > 0)
+                ? vao->attribs[location].divisor : 1;
+        descriptor.layouts[location].stepFunction =
+            (enabled && vao->attribs[location].divisor > 0)
+                ? MTLVertexStepFunctionPerInstance
+                : MTLVertexStepFunctionPerVertex;
+
+        if (!enabled) {
+            gl4metalRegisterConstantVertexAttribute(location, format);
+        }
+
+        printf("[gl4metal][ATTR] %s GL attr[%lu] normalized from GLSL input %s %s -> Metal format %lu buffer=%lu stride=%lu\n",
+               enabled ? "Enabled" : "Disabled",
+               (unsigned long)location,
+               type.UTF8String, name.UTF8String, (unsigned long)format,
+               (unsigned long)descriptor.attributes[location].bufferIndex,
+               (unsigned long)descriptor.layouts[location].stride);
     }
 
     return foundSupportedInput;
@@ -355,6 +362,38 @@ static void gl4metalDumpGLSLResourceHints(GLuint program, const GLShader *vertex
     }
 }
 
+
+static void gl4metalSanitizeVertexDescriptor(MTLVertexDescriptor *descriptor, GLuint program) {
+    if (!descriptor) return;
+
+    // Metal rejects any vertex-buffer layout which has a non-zero stride but
+    // is not referenced by at least one valid vertex attribute. Re-normalize
+    // all valid attribute buffer indices and clear orphan layouts.
+    BOOL referenced[16] = { NO };
+    for (NSUInteger ai = 0; ai < 16; ++ai) {
+        if (descriptor.attributes[ai].format == MTLVertexFormatInvalid) continue;
+        NSUInteger bufferIndex = descriptor.attributes[ai].bufferIndex;
+        if (bufferIndex >= 16) {
+            descriptor.attributes[ai].bufferIndex = ai;
+            bufferIndex = ai;
+        }
+        referenced[bufferIndex] = YES;
+    }
+
+    for (NSUInteger bi = 0; bi < 16; ++bi) {
+        if (descriptor.layouts[bi].stride != 0 && !referenced[bi]) {
+            if (getenv("GL4METAL_PIPELINE_TRACE")) {
+                printf("[gl4metal][ATTR] program=%u clearing orphan vertex layout[%lu] stride=%lu\n",
+                       program, (unsigned long)bi,
+                       (unsigned long)descriptor.layouts[bi].stride);
+            }
+            descriptor.layouts[bi].stride = 0;
+            descriptor.layouts[bi].stepRate = 1;
+            descriptor.layouts[bi].stepFunction = MTLVertexStepFunctionPerVertex;
+        }
+    }
+}
+
 BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     if (!ctx || !ctx.device) return NO;
 
@@ -410,6 +449,8 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
             vertexDescriptor)) {
         printf("[gl4metal] WARNING: No supported vertex input declarations were found in program %u; pipeline will use only GL attribute state\n", program);
     }
+
+    gl4metalSanitizeVertexDescriptor(vertexDescriptor, program);
 
     BOOL success = gl4metalCreatePipelineStateForProgram(
         program,
