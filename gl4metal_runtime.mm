@@ -23,6 +23,7 @@ BOOL cachedFallbackMVPIsValid = NO;
 NSMutableDictionary<NSNumber *, NSNumber *> *shaderTypes = nil;
 std::unordered_map<GLuint, GLShader> shaderSources;
 NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus = nil;
+NSMutableDictionary<NSNumber *, NSString *> *shaderInfoLog = nil;
 NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders = nil;
 NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus = nil;
 NSMutableDictionary<NSNumber *, NSString *> *programInfoLog = nil;

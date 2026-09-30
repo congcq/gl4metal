@@ -66,6 +66,13 @@ typedef struct {
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *programResourceInfo;
 
 @property (nonatomic, assign) GLboolean depthTestEnabled;
+@property (nonatomic, assign) GLboolean stencilTestEnabled;
+@property (nonatomic, assign) GLenum stencilFunc;
+@property (nonatomic, assign) GLint stencilRef;
+@property (nonatomic, assign) GLuint stencilReadMask;
+@property (nonatomic, assign) GLenum stencilFail;
+@property (nonatomic, assign) GLenum stencilDepthFail;
+@property (nonatomic, assign) GLenum stencilDepthPass;
 @property (nonatomic, assign) GLboolean blendEnabled;
 @property (nonatomic, assign) GLenum blendSrcRGB;
 @property (nonatomic, assign) GLenum blendDstRGB;
@@ -114,6 +121,8 @@ extern "C" {
 GLboolean gl4metalInit(void);
 const char *gl4metalGetDeviceName(void);
 NSUInteger gl4metalGetGPUFamily(void);
+GLint gl4metalGetExtensionCount(void);
+GLint gl4metalGetPixelStoreValue(GLenum pname);
 const GLubyte* APIENTRY glGetString(GLenum name);
 void APIENTRY glMakeCurrent(void *metalLayerPtr);
 void APIENTRY glSwapBuffers(void);

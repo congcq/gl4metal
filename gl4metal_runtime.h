@@ -34,6 +34,7 @@ struct GLShader {
 };
 extern std::unordered_map<GLuint, GLShader> shaderSources;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *shaderCompileStatus;
+extern NSMutableDictionary<NSNumber *, NSString *> *shaderInfoLog;
 extern NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *programShaders;
 extern NSMutableDictionary<NSNumber *, NSNumber *> *programLinkStatus;
 extern NSMutableDictionary<NSNumber *, NSString *> *programInfoLog;

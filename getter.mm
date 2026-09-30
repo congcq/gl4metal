@@ -11,17 +11,17 @@ GLenum APIENTRY glGetError() {
 
 void APIENTRY glGetPointerv(GLenum pname, void**params) {
     if (!params) {
-        lastGL4MetalError = GL_INVALID_VALUE;
+        gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
 
     switch (pname) {
         case GL_BUFFER_MAP_POINTER:
             params[0] = NULL;
-            lastGL4MetalError = GL_NO_ERROR;
+            gl4metalSetError(GL_NO_ERROR);
             return;
         default:
-            lastGL4MetalError = GL_INVALID_ENUM;
+            gl4metalSetError(GL_INVALID_ENUM);
             return;
     }
 }
@@ -35,9 +35,7 @@ static NSArray<NSString *> *gl4metalGetExtensionList(void) {
             @"GL_ARB_vertex_buffer_object",
             @"GL_ARB_framebuffer_object",
             @"GL_EXT_framebuffer_object",
-            @"GL_OES_vertex_array_object",
-            @"GL_EXT_texture_storage",
-            @"GL_EXT_texture_filter_anisotropic"
+            @"GL_OES_vertex_array_object"
         ]];
 
         NSUInteger family = gl4metalGetGPUFamily();
@@ -71,10 +69,14 @@ NSString* getExtensions() {
     return [extensions componentsJoinedByString:@" "];
 }
 
+GLint gl4metalGetExtensionCount(void) {
+    return (GLint)gl4metalGetExtensionList().count;
+}
+
 const GLubyte* APIENTRY glGetString(GLenum name) {
     static const char *vendor = "congcq";
     static const char *version = "3.3.0 Core Profile";
-    static const char *slVersion = "3.3";
+    static const char *slVersion = "3.30";
 
     switch(name) {
         case GL_VENDOR:
@@ -95,25 +97,15 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
 }
 
 const GLubyte *APIENTRY glGetStringi(GLenum name, GLuint index) {
-    if (name == GL_VENDOR) {
-        return index == 0 ? (const GLubyte *)"congcq" : NULL;
+    if (name != GL_EXTENSIONS) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return NULL;
     }
-    if (name == GL_RENDERER) {
-        return index == 0 ? (const GLubyte *)(gl4metalGetDeviceName() ?: "gl4metal") : NULL;
+    NSArray<NSString *> *extensions = gl4metalGetExtensionList();
+    if (index >= (GLuint)extensions.count) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return NULL;
     }
-    if (name == GL_VERSION) {
-        return index == 0 ? (const GLubyte *)"3.3.0 Core Profile" : NULL;
-    }
-    if (name == GL_SHADING_LANGUAGE_VERSION) {
-        return index == 0 ? (const GLubyte *)"3.3.0" : NULL;
-    }
-    if (name == GL_EXTENSIONS) {
-        NSArray<NSString *> *extensions = gl4metalGetExtensionList();
-        if (index >= (GLuint)extensions.count) {
-            return NULL;
-        }
-        NSString *extension = extensions[index];
-        return (const GLubyte *)extension.UTF8String;
-    }
-    return NULL;
+    NSString *extension = extensions[index];
+    return (const GLubyte *)extension.UTF8String;
 }

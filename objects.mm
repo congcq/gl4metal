@@ -70,11 +70,28 @@ static NSMutableDictionary<NSNumber *, id<MTLTexture>> *gl4metalTextureObjects =
 static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, NSNumber *> *> *gl4metalTextureParams = nil;
 static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *gl4metalTextureSamplers = nil;
 static NSMutableDictionary<NSNumber *, NSNumber *> *gl4metalTextureUnitBindings = nil;
+static NSMutableSet<NSNumber *> *gl4metalTextureObjectNames = nil;
 static GLuint gl4metalNextTextureId = 1;
 static GLuint gl4metalActiveTextureUnit = 0;
+static GLint gl4metalUnpackAlignment = 4;
+static GLint gl4metalUnpackRowLength = 0;
+static GLint gl4metalUnpackSkipRows = 0;
+static GLint gl4metalUnpackSkipPixels = 0;
+static GLint gl4metalPackAlignment = 4;
+static GLint gl4metalPackRowLength = 0;
+static GLint gl4metalPackSkipRows = 0;
+static GLint gl4metalPackSkipPixels = 0;
+static GLint gl4metalUnpackSwapBytes = GL_FALSE;
+static GLint gl4metalUnpackLSBFirst = GL_FALSE;
+static GLint gl4metalPackSwapBytes = GL_FALSE;
+static GLint gl4metalPackLSBFirst = GL_FALSE;
 
 // Forward declaration: texture deletion can detach FBO attachments below.
 static void gl4metalDetachTextureFromAllFramebuffers(GLuint texture);
+
+static BOOL gl4metalIsDrawFramebufferTarget(GLenum target) {
+    return target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER;
+}
 
 // Real framebuffer/renderbuffer state. GL texture names and renderbuffer names
 // remain separate namespaces just like OpenGL; the Metal resources are stored
@@ -112,6 +129,7 @@ static void gl4metalEnsureTextureState(void) {
     if (!gl4metalTextureParams) gl4metalTextureParams = [NSMutableDictionary dictionary];
     if (!gl4metalTextureSamplers) gl4metalTextureSamplers = [NSMutableDictionary dictionary];
     if (!gl4metalTextureUnitBindings) gl4metalTextureUnitBindings = [NSMutableDictionary dictionary];
+    if (!gl4metalTextureObjectNames) gl4metalTextureObjectNames = [NSMutableSet set];
 }
 
 static GLuint gl4metalTextureBoundToUnit(GLuint unit) {
@@ -166,7 +184,13 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
     if (sourceBpp == 0) return NO;
 
     size_t pixelCount = (size_t)width * (size_t)height;
-    size_t sourceRowBytes = (size_t)width * sourceBpp;
+    size_t sourceRowPixels = gl4metalUnpackRowLength > 0
+        ? (size_t)gl4metalUnpackRowLength : (size_t)width;
+    size_t unalignedRowBytes = sourceRowPixels * sourceBpp;
+    size_t alignment = (size_t)gl4metalUnpackAlignment;
+    size_t sourceRowBytes = (unalignedRowBytes + alignment - 1) & ~(alignment - 1);
+    size_t sourceStart = (size_t)gl4metalUnpackSkipRows * sourceRowBytes +
+                         (size_t)gl4metalUnpackSkipPixels * sourceBpp;
     NSMutableData *rgba = [NSMutableData dataWithLength:pixelCount * 4];
     if (!rgba) return NO;
 
@@ -174,7 +198,7 @@ static BOOL gl4metalUploadPixelsToTexture(id<MTLTexture> texture,
     uint8_t *dst = (uint8_t *)rgba.mutableBytes;
 
     for (size_t row = 0; row < (size_t)height; ++row) {
-        const uint8_t *srcRow = src + row * sourceRowBytes;
+        const uint8_t *srcRow = src + sourceStart + row * sourceRowBytes;
         uint8_t *dstRow = dst + row * (size_t)width * 4;
 
         for (size_t x = 0; x < (size_t)width; ++x) {
@@ -361,10 +385,98 @@ GLuint gl4metalGetTextureNameForUnit(GLuint unit) {
 void gl4metalInitTextureState(void) {
     gl4metalEnsureTextureState();
     gl4metalActiveTextureUnit = 0;
+    gl4metalUnpackAlignment = 4;
+    gl4metalUnpackRowLength = 0;
+    gl4metalUnpackSkipRows = 0;
+    gl4metalUnpackSkipPixels = 0;
+    gl4metalPackAlignment = 4;
+    gl4metalPackRowLength = 0;
+    gl4metalPackSkipRows = 0;
+    gl4metalPackSkipPixels = 0;
+    gl4metalUnpackSwapBytes = GL_FALSE;
+    gl4metalUnpackLSBFirst = GL_FALSE;
+    gl4metalPackSwapBytes = GL_FALSE;
+    gl4metalPackLSBFirst = GL_FALSE;
+}
+
+GLint gl4metalGetPixelStoreValue(GLenum pname) {
+    switch (pname) {
+        case GL_UNPACK_ALIGNMENT: return gl4metalUnpackAlignment;
+        case GL_UNPACK_ROW_LENGTH: return gl4metalUnpackRowLength;
+        case GL_UNPACK_SKIP_ROWS: return gl4metalUnpackSkipRows;
+        case GL_UNPACK_SKIP_PIXELS: return gl4metalUnpackSkipPixels;
+        case GL_PACK_ALIGNMENT: return gl4metalPackAlignment;
+        case GL_PACK_ROW_LENGTH: return gl4metalPackRowLength;
+        case GL_PACK_SKIP_ROWS: return gl4metalPackSkipRows;
+        case GL_PACK_SKIP_PIXELS: return gl4metalPackSkipPixels;
+        case GL_UNPACK_SWAP_BYTES: return gl4metalUnpackSwapBytes;
+        case GL_UNPACK_LSB_FIRST: return gl4metalUnpackLSBFirst;
+        case GL_PACK_SWAP_BYTES: return gl4metalPackSwapBytes;
+        case GL_PACK_LSB_FIRST: return gl4metalPackLSBFirst;
+        default: return -1;
+    }
+}
+
+void APIENTRY glPixelStorei(GLenum pname, GLint param) {
+    switch (pname) {
+        case GL_UNPACK_ALIGNMENT:
+            if (param != 1 && param != 2 && param != 4 && param != 8) {
+                gl4metalSetError(GL_INVALID_VALUE);
+                return;
+            }
+            gl4metalUnpackAlignment = param;
+            break;
+        case GL_PACK_ALIGNMENT:
+            if (param != 1 && param != 2 && param != 4 && param != 8) {
+                gl4metalSetError(GL_INVALID_VALUE);
+                return;
+            }
+            gl4metalPackAlignment = param;
+            break;
+        case GL_UNPACK_ROW_LENGTH:
+        case GL_UNPACK_SKIP_ROWS:
+        case GL_UNPACK_SKIP_PIXELS:
+            if (param < 0) {
+                gl4metalSetError(GL_INVALID_VALUE);
+                return;
+            }
+            if (pname == GL_UNPACK_ROW_LENGTH) gl4metalUnpackRowLength = param;
+            else if (pname == GL_UNPACK_SKIP_ROWS) gl4metalUnpackSkipRows = param;
+            else gl4metalUnpackSkipPixels = param;
+            break;
+        case GL_PACK_ROW_LENGTH:
+        case GL_PACK_SKIP_ROWS:
+        case GL_PACK_SKIP_PIXELS:
+            if (param < 0) {
+                gl4metalSetError(GL_INVALID_VALUE);
+                return;
+            }
+            if (pname == GL_PACK_ROW_LENGTH) gl4metalPackRowLength = param;
+            else if (pname == GL_PACK_SKIP_ROWS) gl4metalPackSkipRows = param;
+            else gl4metalPackSkipPixels = param;
+            break;
+        case GL_UNPACK_SWAP_BYTES:
+        case GL_UNPACK_LSB_FIRST:
+        case GL_PACK_SWAP_BYTES:
+        case GL_PACK_LSB_FIRST:
+            if (pname == GL_UNPACK_SWAP_BYTES) gl4metalUnpackSwapBytes = param != 0;
+            else if (pname == GL_UNPACK_LSB_FIRST) gl4metalUnpackLSBFirst = param != 0;
+            else if (pname == GL_PACK_SWAP_BYTES) gl4metalPackSwapBytes = param != 0;
+            else gl4metalPackLSBFirst = param != 0;
+            break;
+        default:
+            gl4metalSetError(GL_INVALID_ENUM);
+            return;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPixelStoref(GLenum pname, GLfloat param) {
+    glPixelStorei(pname, (GLint)param);
 }
 
 void APIENTRY glGenTextures(GLsizei n, GLuint *textures) {
-    if (!textures || n < 0) {
+    if (n < 0 || (n > 0 && !textures)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -386,7 +498,7 @@ void APIENTRY glGenTextures(GLsizei n, GLuint *textures) {
 static void gl4metalDetachTextureFromAllFramebuffers(GLuint texture);
 
 void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures) {
-    if (!textures || n < 0) {
+    if (n < 0 || (n > 0 && !textures)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -404,6 +516,7 @@ void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures) {
         [gl4metalTextureObjects removeObjectForKey:@(texture)];
         [gl4metalTextureParams removeObjectForKey:@(texture)];
         [gl4metalTextureSamplers removeObjectForKey:@(texture)];
+        [gl4metalTextureObjectNames removeObject:@(texture)];
 
         NSArray<NSNumber *> *units = [gl4metalTextureUnitBindings allKeysForObject:@(texture)];
         for (NSNumber *unit in units) {
@@ -424,8 +537,16 @@ void APIENTRY glBindTexture(GLenum target, GLuint texture) {
         gl4metalEnsureTextureParams(texture);
     }
 
+    if (texture != 0) [gl4metalTextureObjectNames addObject:@(texture)];
+
     gl4metalTextureUnitBindings[@(gl4metalActiveTextureUnit)] = @(texture);
     gl4metalSetError(GL_NO_ERROR);
+}
+
+GLboolean APIENTRY glIsTexture(GLuint texture) {
+    if (texture == 0) return GL_FALSE;
+    gl4metalEnsureTextureState();
+    return [gl4metalTextureObjectNames containsObject:@(texture)] ? GL_TRUE : GL_FALSE;
 }
 
 void APIENTRY glActiveTexture(GLenum texture) {
@@ -451,15 +572,39 @@ void APIENTRY glTexParameteri(GLenum target, GLenum pname, GLint param) {
 
     switch (pname) {
         case GL_TEXTURE_MIN_FILTER:
+            if (param != GL_NEAREST && param != GL_LINEAR &&
+                param != GL_NEAREST_MIPMAP_NEAREST && param != GL_LINEAR_MIPMAP_NEAREST &&
+                param != GL_NEAREST_MIPMAP_LINEAR && param != GL_LINEAR_MIPMAP_LINEAR) {
+                gl4metalSetError(GL_INVALID_ENUM);
+                return;
+            }
+            break;
+        case GL_TEXTURE_MAG_FILTER:
+            if (pname == GL_TEXTURE_MAG_FILTER && param != GL_NEAREST && param != GL_LINEAR) {
+                gl4metalSetError(GL_INVALID_ENUM);
+                return;
+            }
+            break;
+        case GL_TEXTURE_WRAP_S:
+        case GL_TEXTURE_WRAP_T:
+            if (param != GL_REPEAT && param != GL_CLAMP_TO_EDGE &&
+                param != GL_CLAMP_TO_BORDER && param != GL_MIRRORED_REPEAT) {
+                gl4metalSetError(GL_INVALID_ENUM);
+                return;
+            }
+            break;
+        default:
+            gl4metalSetError(GL_INVALID_ENUM);
+            return;
+    }
+
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:
         case GL_TEXTURE_MAG_FILTER:
         case GL_TEXTURE_WRAP_S:
         case GL_TEXTURE_WRAP_T:
             gl4metalEnsureTextureParams(texture)[@(pname)] = @(param);
             [gl4metalTextureSamplers removeObjectForKey:@(texture)];
-            gl4metalSetError(GL_NO_ERROR);
-            return;
-        default:
-            // Preserve the old compatibility behavior for unsupported pname.
             gl4metalSetError(GL_NO_ERROR);
             return;
     }
@@ -483,6 +628,51 @@ void APIENTRY glTexParameterfv(GLenum target, GLenum pname, const GLfloat *param
         return;
     }
     glTexParameteri(target, pname, (GLint)params[0]);
+}
+
+static NSNumber *gl4metalGetBoundTextureParameter(GLenum target, GLenum pname) {
+    if (target != GL_TEXTURE_2D) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return nil;
+    }
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:
+        case GL_TEXTURE_MAG_FILTER:
+        case GL_TEXTURE_WRAP_S:
+        case GL_TEXTURE_WRAP_T:
+            break;
+        default:
+            gl4metalSetError(GL_INVALID_ENUM);
+            return nil;
+    }
+
+    gl4metalEnsureTextureState();
+    GLuint texture = gl4metalTextureBoundToUnit(gl4metalActiveTextureUnit);
+    if (texture == 0 || ![gl4metalTextureObjectNames containsObject:@(texture)]) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return nil;
+    }
+    NSNumber *value = gl4metalEnsureTextureParams(texture)[@(pname)];
+    gl4metalSetError(GL_NO_ERROR);
+    return value;
+}
+
+void APIENTRY glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
+    if (!params) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    NSNumber *value = gl4metalGetBoundTextureParameter(target, pname);
+    if (value) params[0] = value.intValue;
+}
+
+void APIENTRY glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
+    if (!params) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    NSNumber *value = gl4metalGetBoundTextureParameter(target, pname);
+    if (value) params[0] = value.floatValue;
 }
 
 void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
@@ -751,13 +941,12 @@ void APIENTRY glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
     for (GLsizei i = 0; i < n; i++) {
         GLuint framebuffer = ++nextBufferId;
         framebuffers[i] = framebuffer;
-        framebufferObjects[@(framebuffer)] = @(framebuffer);
     }
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glBindFramebuffer(GLenum target, GLuint framebuffer) {
-    if (target != GL_FRAMEBUFFER) {
+    if (!gl4metalIsDrawFramebufferTarget(target) && target != GL_READ_FRAMEBUFFER) {
         gl4metalSetError(GL_INVALID_ENUM);
         return;
     }
@@ -765,15 +954,19 @@ void APIENTRY glBindFramebuffer(GLenum target, GLuint framebuffer) {
     if (framebuffer != 0 && !framebufferObjects[@(framebuffer)]) {
         framebufferObjects[@(framebuffer)] = @(framebuffer);
     }
-    ctx.currentFramebuffer = framebuffer;
-    ctx.currentReadFramebuffer = framebuffer;
-    // Render target format and attachment set are part of the pipeline state.
-    ctx.pipelineState = nil;
+    if (gl4metalIsDrawFramebufferTarget(target)) {
+        ctx.currentFramebuffer = framebuffer;
+        // Render target format and attachment set are part of the pipeline state.
+        ctx.pipelineState = nil;
+    }
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+        ctx.currentReadFramebuffer = framebuffer;
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
 GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
-    if (target != GL_FRAMEBUFFER) {
+    if (!gl4metalIsDrawFramebufferTarget(target) && target != GL_READ_FRAMEBUFFER) {
         gl4metalSetError(GL_INVALID_ENUM);
         return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
     }
@@ -781,13 +974,15 @@ GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
     }
-    if (ctx.currentFramebuffer == 0) {
+    GLuint framebuffer = target == GL_READ_FRAMEBUFFER
+        ? ctx.currentReadFramebuffer : ctx.currentFramebuffer;
+    if (framebuffer == 0) {
         gl4metalSetError(GL_NO_ERROR);
         return GL_FRAMEBUFFER_COMPLETE;
     }
 
     gl4metalInitFramebufferState();
-    GLuint fbo = ctx.currentFramebuffer;
+    GLuint fbo = framebuffer;
     id<MTLTexture> color = gl4metalFramebufferAttachmentTexture(fbo, GL_COLOR_ATTACHMENT0);
     id<MTLTexture> depth = gl4metalFramebufferAttachmentTexture(fbo, GL_DEPTH_ATTACHMENT);
     id<MTLTexture> ds = gl4metalFramebufferAttachmentTexture(fbo, GL_DEPTH_STENCIL_ATTACHMENT);
@@ -816,8 +1011,12 @@ GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
 
 void APIENTRY glFramebufferTexture2D(GLenum target, GLenum attachment,
                                      GLenum textarget, GLuint texture, GLint level) {
-    if (target != GL_FRAMEBUFFER || textarget != GL_TEXTURE_2D || level < 0) {
+    if (!gl4metalIsDrawFramebufferTarget(target) || textarget != GL_TEXTURE_2D) {
         gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if (level < 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
     if (!ctx || ctx.currentFramebuffer == 0) {
@@ -858,7 +1057,7 @@ void APIENTRY glFramebufferTexture2D(GLenum target, GLenum attachment,
 
 void APIENTRY glFramebufferRenderbuffer(GLenum target, GLenum attachment,
                                          GLenum renderbuffertarget, GLuint renderbuffer) {
-    if (target != GL_FRAMEBUFFER || renderbuffertarget != GL_RENDERBUFFER) {
+    if (!gl4metalIsDrawFramebufferTarget(target) || renderbuffertarget != GL_RENDERBUFFER) {
         gl4metalSetError(GL_INVALID_ENUM);
         return;
     }
@@ -912,9 +1111,9 @@ void APIENTRY glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
         [gl4metalFramebufferStencilRB removeObjectForKey:@(framebuffer)];
         if (ctx.currentFramebuffer == framebuffer) {
             ctx.currentFramebuffer = 0;
-            ctx.currentReadFramebuffer = 0;
             ctx.pipelineState = nil;
         }
+        if (ctx.currentReadFramebuffer == framebuffer) ctx.currentReadFramebuffer = 0;
     }
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -928,7 +1127,6 @@ void APIENTRY glGenRenderbuffers(GLsizei n, GLuint *renderbuffers) {
     for (GLsizei i = 0; i < n; i++) {
         GLuint renderbuffer = ++nextBufferId;
         renderbuffers[i] = renderbuffer;
-        renderbufferObjects[@(renderbuffer)] = @(renderbuffer);
     }
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -1012,4 +1210,12 @@ void APIENTRY glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) {
     }
     ctx.pipelineState = nil;
     gl4metalSetError(GL_NO_ERROR);
+}
+
+GLboolean APIENTRY glIsFramebuffer(GLuint framebuffer) {
+    return framebuffer != 0 && framebufferObjects[@(framebuffer)] ? GL_TRUE : GL_FALSE;
+}
+
+GLboolean APIENTRY glIsRenderbuffer(GLuint renderbuffer) {
+    return renderbuffer != 0 && renderbufferObjects[@(renderbuffer)] ? GL_TRUE : GL_FALSE;
 }
