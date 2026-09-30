@@ -119,6 +119,32 @@ void gl4metalSetError(GLenum error) {
     lastGL4MetalError = error;
 }
 
+static void gl4metalTraceUniformUpdate(GLint location, const char *kind, const float *values, NSUInteger count) {
+    if (!getenv("GL4METAL_UNIFORM_UPDATE_TRACE") || !uniformLocationNames || !uniformLocationPrograms) return;
+    NSString *name = uniformLocationNames[@(location)];
+    NSNumber *owner = uniformLocationPrograms[@(location)];
+    if (!name || !owner) return;
+    GLuint program = owner.unsignedIntValue;
+    if (!(program == 7 || program == 16 || program == 17 || program == 53)) return;
+    printf("[gl4metal][UNIFORM_UPDATE] program=%u name=%s kind=%s", program, name.UTF8String, kind);
+    NSUInteger n = MIN(count, (NSUInteger)4);
+    for (NSUInteger i = 0; i < n; ++i) printf(" %.6g", values[i]);
+    printf("\n");
+}
+
+static void gl4metalTraceUniformUpdateInt(GLint location, const char *kind, const GLint *values, NSUInteger count) {
+    if (!getenv("GL4METAL_UNIFORM_UPDATE_TRACE") || !uniformLocationNames || !uniformLocationPrograms) return;
+    NSString *name = uniformLocationNames[@(location)];
+    NSNumber *owner = uniformLocationPrograms[@(location)];
+    if (!name || !owner) return;
+    GLuint program = owner.unsignedIntValue;
+    if (!(program == 7 || program == 16 || program == 17 || program == 53)) return;
+    printf("[gl4metal][UNIFORM_UPDATE] program=%u name=%s kind=%s", program, name.UTF8String, kind);
+    NSUInteger n = MIN(count, (NSUInteger)4);
+    for (NSUInteger i = 0; i < n; ++i) printf(" %d", values[i]);
+    printf("\n");
+}
+
 static void gl4metalUpdateFallbackMVP(const GLfloat *value, GLsizei count) {
     if (!ctx || !value || count <= 0) return;
 
@@ -1709,6 +1735,7 @@ void APIENTRY glUniform1f(GLint location, GLfloat v0) {
         return;
     }
     uniform1fValues[@(location)] = [NSValue valueWithBytes:&v0 objCType:@encode(GLfloat)];
+    gl4metalTraceUniformUpdate(location, "1f", &v0, 1);
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1767,6 +1794,43 @@ void APIENTRY glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
     }
     GLfloat values[4] = { v0, v1, v2, v3 };
     uniform4fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[4])];
+    gl4metalTraceUniformUpdate(location, "4f", values, 4);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+// The LWJGL/Minecraft path may use the vector upload entry points instead of
+// the scalar convenience calls. Keep the first vector in the same uniform
+// store consumed by the Metal resource bridge.
+void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    GLfloat values[2] = { value[0], value[1] };
+    uniform2fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[2])];
+    gl4metalTraceUniformUpdate(location, "2fv", values, 2);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    GLfloat values[3] = { value[0], value[1], value[2] };
+    uniform3fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[3])];
+    gl4metalTraceUniformUpdate(location, "3fv", values, 3);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    GLfloat values[4] = { value[0], value[1], value[2], value[3] };
+    uniform4fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[4])];
+    gl4metalTraceUniformUpdate(location, "4fv", values, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1776,6 +1840,38 @@ void APIENTRY glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3
         return;
     }
     uniform4iValues[@(location)] = @(v0);
+    GLint values[4] = { v0, v1, v2, v3 };
+    gl4metalTraceUniformUpdateInt(location, "4i", values, 4);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    uniform2iValues[@(location)] = @(value[0]);
+    gl4metalTraceUniformUpdateInt(location, "2iv", value, 2);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    uniform3iValues[@(location)] = @(value[0]);
+    gl4metalTraceUniformUpdateInt(location, "3iv", value, 3);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *value) {
+    if (!ctx || count <= 0 || !value) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    uniform4iValues[@(location)] = @(value[0]);
+    gl4metalTraceUniformUpdateInt(location, "4iv", value, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
 

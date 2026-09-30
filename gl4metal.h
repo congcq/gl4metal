@@ -118,6 +118,12 @@ const GLubyte* APIENTRY glGetString(GLenum name);
 void APIENTRY glMakeCurrent(void *metalLayerPtr);
 void APIENTRY glSwapBuffers(void);
 void APIENTRY glSwapInterval(GLint interval);
+void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *value);
+void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *value);
+void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *value);
+void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *value);
+void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *value);
+void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *value);
 
 static void updateDepthStencilState(void);
 static void ensureDepthTexture(CGSize size);

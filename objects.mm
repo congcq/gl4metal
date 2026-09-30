@@ -546,12 +546,9 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                                                                        height:(NSUInteger)height
                                                                                     mipmapped:(isDepth ? NO : (mipLevels > 1))];
         td.usage = isDepth ? MTLTextureUsageRenderTarget : (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
-        // Keep GL texture storage shared for compatibility with the existing
-        // GLES-style texture lifetime/update path. Uploads are still staged
-        // through a shared MTLBuffer and copied with a Metal blit command, so
-        // reverting this storage mode does not reintroduce direct CPU texture
-        // writes.
-        td.storageMode = MTLStorageModeShared;
+        // Ordinary GL textures stay GPU-private. CPU uploads are staged through
+        // a shared MTLBuffer and copied with a Metal blit command.
+        td.storageMode = MTLStorageModePrivate;
         texture = [ctx.device newTextureWithDescriptor:td];
         if (!texture) {
             gl4metalSetError(GL_OUT_OF_MEMORY);
