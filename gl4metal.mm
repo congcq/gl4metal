@@ -680,16 +680,20 @@ static void applyRasterState(id<MTLRenderCommandEncoder> encoder) {
         cullMode = ctx.cullFace == GL_FRONT ? MTLCullModeFront : MTLCullModeBack;
     }
     [encoder setCullMode:cullMode];
-    // OpenGL and Metal use the same clip-space handedness, but our GL
-    // lower-left viewport is emulated with a Metal upper-left viewport by
-    // reflecting Y in the viewport transform. That reflection reverses the
-    // observed triangle winding. Invert the Metal winding here so GL_CCW/GL_CW
-    // preserve their OpenGL front-face semantics. Without this, ordinary
-    // Minecraft terrain with back-face culling can be completely invisible.
-    MTLWinding metalWinding = (ctx.frontFace == GL_CW)
-        ? MTLWindingCounterClockwise
-        : MTLWindingClockwise;
-    [encoder setFrontFacingWinding:metalWinding];
+    // Keep the original OpenGL -> Metal front-face mapping. The GL viewport
+    // Y conversion is a viewport-coordinate conversion, not a reason to
+    // globally invert the rasterizer winding. A global inversion makes
+    // Minecraft programs that enable back-face culling disappear.
+    [encoder setFrontFacingWinding:ctx.frontFace == GL_CW ? MTLWindingClockwise : MTLWindingCounterClockwise];
+
+    // Optional diagnostics for the text renderer (program 53). These are
+    // intentionally opt-in because Program 53 can be reused by different
+    // render paths depending on the Minecraft build.
+    if (currentProgram == 53) {
+        if (getenv("GL4METAL_PROGRAM53_NO_CULL")) {
+            [encoder setCullMode:MTLCullModeNone];
+        }
+    }
     [encoder setTriangleFillMode:ctx.polygonMode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
     if (ctx.blendEnabled) {
         [encoder setBlendColorRed:ctx.blendConstantRed green:ctx.blendConstantGreen blue:ctx.blendConstantBlue alpha:ctx.blendConstantAlpha];
@@ -2700,6 +2704,14 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
     if (ctx.depthStencilState) {
         [encoder setDepthStencilState:ctx.depthStencilState];
     }
+    if (currentProgram == 53 && getenv("GL4METAL_PROGRAM53_NO_DEPTH")) {
+        id<MTLDepthStencilState> noDepthState = nil;
+        MTLDepthStencilDescriptor *dds = [[MTLDepthStencilDescriptor alloc] init];
+        dds.depthCompareFunction = MTLCompareFunctionAlways;
+        dds.depthWriteEnabled = NO;
+        noDepthState = [ctx.device newDepthStencilStateWithDescriptor:dds];
+        if (noDepthState) [encoder setDepthStencilState:noDepthState];
+    }
 
     applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
@@ -3244,6 +3256,14 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
     if (ctx.depthStencilState) {
         [encoder setDepthStencilState:ctx.depthStencilState];
     }
+    if (currentProgram == 53 && getenv("GL4METAL_PROGRAM53_NO_DEPTH")) {
+        id<MTLDepthStencilState> noDepthState = nil;
+        MTLDepthStencilDescriptor *dds = [[MTLDepthStencilDescriptor alloc] init];
+        dds.depthCompareFunction = MTLCompareFunctionAlways;
+        dds.depthWriteEnabled = NO;
+        noDepthState = [ctx.device newDepthStencilStateWithDescriptor:dds];
+        if (noDepthState) [encoder setDepthStencilState:noDepthState];
+    }
     applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
 
@@ -3500,19 +3520,29 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
         (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
         (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
         (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0);
-    // Vanilla 1.20.1 text/UI program 17 samples an alpha glyph atlas and
-    // carries vertex color in a POSITION_COLOR_TEX layout. Keep its canonical
-    // alpha blending even if the surrounding GL state was not mirrored yet.
-    // This is deliberately scoped to program 17; all other programs use the
-    // actual GL blend state.
-    BOOL textProgram17 = (program == 17);
-    GLenum effectiveSrcRGB = textProgram17 ? GL_SRC_ALPHA : ctx.blendSrcRGB;
-    GLenum effectiveDstRGB = textProgram17 ? GL_ONE_MINUS_SRC_ALPHA : ctx.blendDstRGB;
-    GLenum effectiveSrcAlpha = textProgram17 ? GL_ONE : ctx.blendSrcAlpha;
-    GLenum effectiveDstAlpha = textProgram17 ? GL_ONE_MINUS_SRC_ALPHA : ctx.blendDstAlpha;
+    // Blend state is taken directly from the emulated OpenGL state. Do not
+    // force a blend mode by program number: Program 53 is the important
+    // alpha-text candidate in vanilla 1.20.1, while Program 17 is used by
+    // other position/texture/color passes as well.
+    GLenum effectiveSrcRGB = ctx.blendSrcRGB;
+    GLenum effectiveDstRGB = ctx.blendDstRGB;
+    GLenum effectiveSrcAlpha = ctx.blendSrcAlpha;
+    GLenum effectiveDstAlpha = ctx.blendDstAlpha;
     GLenum effectiveEqRGB = ctx.blendEquationRGB;
     GLenum effectiveEqAlpha = ctx.blendEquationAlpha;
-    BOOL effectiveBlendEnabled = textProgram17 ? GL_TRUE : ctx.blendEnabled;
+    BOOL effectiveBlendEnabled = ctx.blendEnabled;
+
+    // Optional canonical alpha-blend A/B test for the vanilla 1.20.1 text
+    // program. No default behavior changes unless the env var is present.
+    if (program == 53 && getenv("GL4METAL_PROGRAM53_FORCE_ALPHA_BLEND")) {
+        effectiveBlendEnabled = GL_TRUE;
+        effectiveSrcRGB = GL_SRC_ALPHA;
+        effectiveDstRGB = GL_ONE_MINUS_SRC_ALPHA;
+        effectiveSrcAlpha = GL_ONE;
+        effectiveDstAlpha = GL_ONE_MINUS_SRC_ALPHA;
+        effectiveEqRGB = GL_FUNC_ADD;
+        effectiveEqAlpha = GL_FUNC_ADD;
+    }
 
     pipelineDesc.colorAttachments[0].blendingEnabled = effectiveBlendEnabled;
     pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = gl4metalBlendFactor(effectiveSrcRGB);
@@ -3642,6 +3672,10 @@ void APIENTRY glBlendFunc(GLenum sfactor, GLenum dfactor) {
     ctx.blendSrcAlpha = sfactor;
     ctx.blendDstAlpha = dfactor;
     ctx.pipelineState = nil;
+    if (getenv("GL4METAL_BLEND_TRACE")) {
+        printf("[gl4metal][BLEND_TRACE] glBlendFunc rgb=%s/0x%X alpha=0x%X/0x%X\n",
+               "set", (unsigned)sfactor, (unsigned)sfactor, (unsigned)dfactor);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -3652,6 +3686,10 @@ void APIENTRY glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha,
     ctx.blendSrcAlpha = srcAlpha;
     ctx.blendDstAlpha = dstAlpha;
     ctx.pipelineState = nil;
+    if (getenv("GL4METAL_BLEND_TRACE")) {
+        printf("[gl4metal][BLEND_TRACE] glBlendFuncSeparate rgb=0x%X/0x%X alpha=0x%X/0x%X\n",
+               (unsigned)srcRGB, (unsigned)dstRGB, (unsigned)srcAlpha, (unsigned)dstAlpha);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
