@@ -954,6 +954,10 @@ GLboolean APIENTRY glUnmapBuffer(GLenum target) {
 
 // VAO State
 void APIENTRY glBindVertexArray(GLuint array) {
+    // VAO changes alter the vertex descriptor selected by the current GL
+    // program. The pipeline cache key includes VAO state, but a previously
+    // resolved ctx.pipelineState must never survive a VAO switch.
+    if (ctx) ctx.pipelineState = nil;
     ctx.currentVAO = array;
     if (array == 0) {
         ctx.boundBuffers[@(GL_ARRAY_BUFFER)] = @(0);
@@ -2544,7 +2548,10 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
     }
     gl4metalDumpProgramResourceInfo(currentProgram);
 
-    id<MTLRenderPipelineState> activePipeline = ctx.pipelineState ?: gl4metalResolveCurrentPipeline();
+    // Always resolve against the current GL state. The resolver is backed by
+    // pipelineLayoutCache, so this is a cheap cache lookup on the hot path,
+    // while preventing stale pipelines after program/VAO/FBO changes.
+    id<MTLRenderPipelineState> activePipeline = gl4metalResolveCurrentPipeline();
     if (!activePipeline) {
         printf("[gl4metal] WARNING: No valid Metal pipeline for glDrawArrays\n");
         return;
@@ -2977,7 +2984,10 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
         return;
     }
 
-    id<MTLRenderPipelineState> activePipeline = ctx.pipelineState ?: gl4metalResolveCurrentPipeline();
+    // Always resolve against the current GL state. The resolver is backed by
+    // pipelineLayoutCache, so this is a cheap cache lookup on the hot path,
+    // while preventing stale pipelines after program/VAO/FBO changes.
+    id<MTLRenderPipelineState> activePipeline = gl4metalResolveCurrentPipeline();
     if (!activePipeline) {
         printf("[gl4metal] WARNING: No valid Metal pipeline for glDrawElements\n");
         return;
