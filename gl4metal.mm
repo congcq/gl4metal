@@ -680,7 +680,16 @@ static void applyRasterState(id<MTLRenderCommandEncoder> encoder) {
         cullMode = ctx.cullFace == GL_FRONT ? MTLCullModeFront : MTLCullModeBack;
     }
     [encoder setCullMode:cullMode];
-    [encoder setFrontFacingWinding:ctx.frontFace == GL_CW ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    // OpenGL and Metal use the same clip-space handedness, but our GL
+    // lower-left viewport is emulated with a Metal upper-left viewport by
+    // reflecting Y in the viewport transform. That reflection reverses the
+    // observed triangle winding. Invert the Metal winding here so GL_CCW/GL_CW
+    // preserve their OpenGL front-face semantics. Without this, ordinary
+    // Minecraft terrain with back-face culling can be completely invisible.
+    MTLWinding metalWinding = (ctx.frontFace == GL_CW)
+        ? MTLWindingCounterClockwise
+        : MTLWindingClockwise;
+    [encoder setFrontFacingWinding:metalWinding];
     [encoder setTriangleFillMode:ctx.polygonMode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
     if (ctx.blendEnabled) {
         [encoder setBlendColorRed:ctx.blendConstantRed green:ctx.blendConstantGreen blue:ctx.blendConstantBlue alpha:ctx.blendConstantAlpha];
@@ -3268,7 +3277,6 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
 
     gl4metalBindProgramResources(encoder, currentProgram);
 
-    MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
     MTLIndexType indexType = getMetalIndexType(type);
     GLintptr indexOffsetValue = gl4metalResolvePointerOffset(indices, indexBuffer);
     NSUInteger indexOffset = 0;
@@ -3345,6 +3353,7 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
                               instanceCount:(NSUInteger)instancecount];
         }
     } else {
+        MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
         [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset instanceCount:(NSUInteger)instancecount];
     }
 
@@ -3491,15 +3500,27 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
         (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
         (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
         (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0);
-    pipelineDesc.colorAttachments[0].blendingEnabled = ctx.blendEnabled;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = gl4metalBlendFactor(ctx.blendSrcRGB);
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = gl4metalBlendFactor(ctx.blendDstRGB);
-    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = gl4metalBlendFactor(ctx.blendSrcAlpha);
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = gl4metalBlendFactor(ctx.blendDstAlpha);
-    pipelineDesc.colorAttachments[0].rgbBlendOperation = gl4metalBlendOperation(ctx.blendEquationRGB);
-    pipelineDesc.colorAttachments[0].alphaBlendOperation = gl4metalBlendOperation(ctx.blendEquationAlpha);
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = gl4metalBlendFactor(ctx.blendSrcRGB);
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = gl4metalBlendFactor(ctx.blendDstRGB);
+    // Vanilla 1.20.1 text/UI program 17 samples an alpha glyph atlas and
+    // carries vertex color in a POSITION_COLOR_TEX layout. Keep its canonical
+    // alpha blending even if the surrounding GL state was not mirrored yet.
+    // This is deliberately scoped to program 17; all other programs use the
+    // actual GL blend state.
+    BOOL textProgram17 = (program == 17);
+    GLenum effectiveSrcRGB = textProgram17 ? GL_SRC_ALPHA : ctx.blendSrcRGB;
+    GLenum effectiveDstRGB = textProgram17 ? GL_ONE_MINUS_SRC_ALPHA : ctx.blendDstRGB;
+    GLenum effectiveSrcAlpha = textProgram17 ? GL_ONE : ctx.blendSrcAlpha;
+    GLenum effectiveDstAlpha = textProgram17 ? GL_ONE_MINUS_SRC_ALPHA : ctx.blendDstAlpha;
+    GLenum effectiveEqRGB = ctx.blendEquationRGB;
+    GLenum effectiveEqAlpha = ctx.blendEquationAlpha;
+    BOOL effectiveBlendEnabled = textProgram17 ? GL_TRUE : ctx.blendEnabled;
+
+    pipelineDesc.colorAttachments[0].blendingEnabled = effectiveBlendEnabled;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = gl4metalBlendFactor(effectiveSrcRGB);
+    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = gl4metalBlendFactor(effectiveDstRGB);
+    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = gl4metalBlendFactor(effectiveSrcAlpha);
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = gl4metalBlendFactor(effectiveDstAlpha);
+    pipelineDesc.colorAttachments[0].rgbBlendOperation = gl4metalBlendOperation(effectiveEqRGB);
+    pipelineDesc.colorAttachments[0].alphaBlendOperation = gl4metalBlendOperation(effectiveEqAlpha);
     pipelineDesc.depthAttachmentPixelFormat = targetDepthFormat;
     pipelineDesc.stencilAttachmentPixelFormat = targetStencilFormat;
 
@@ -3529,6 +3550,14 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
 
     ctx.pipelineState = pipeline;
     printf("[gl4metal] Real Metal pipeline created without attribute-format probing.\n");
+    if (program == 17 || program == 20 || program == 21 || program == 27 || program == 53) {
+        printf("[gl4metal][STATE] program=%u blend=%d rgb=0x%X/0x%X alpha=0x%X/0x%X eq=0x%X/0x%X cull=%d frontFace=0x%X depth=%d depthWrite=%d\n",
+               program, (int)effectiveBlendEnabled, (unsigned)effectiveSrcRGB, (unsigned)effectiveDstRGB,
+               (unsigned)effectiveSrcAlpha, (unsigned)effectiveDstAlpha,
+               (unsigned)effectiveEqRGB, (unsigned)effectiveEqAlpha,
+               (int)ctx.cullEnabled, (unsigned)ctx.frontFace,
+               (int)ctx.depthTestEnabled, (int)ctx.depthWriteEnabled);
+    }
     if (program != 0) {
         printf("[gl4metal][RESOURCES] program=%u reflected Metal resources:\n", program);
         printf("%s", resourceInfo.UTF8String);
