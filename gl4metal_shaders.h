@@ -20,5 +20,6 @@ NSString *gl4metalBuildPipelineCacheKey(GLuint program, gl4metalVertexArray *vao
 NSString *gl4metalBuildTranslatedMetalSource(NSString *vertexSource, NSString *fragmentSource, BOOL *hasColor, BOOL *hasTexCoord);
 BOOL gl4metalShaderUsesAttribute(NSString *source, NSString *name);
 BOOL gl4metalApplyVertexShaderInputFormats(NSString *vertexSource, GLuint program, MTLVertexDescriptor *descriptor);
-std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource);
+std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
+                               std::string *diagnostics);
 #endif

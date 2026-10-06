@@ -11,16 +11,55 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <string.h>
+#include <math.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 
-// Resource hazards: OpenGL lets the CPU rewrite a buffer while the previous
-// frame is still using that GL object. Metal cannot safely observe arbitrary
-// CPU mutation of an in-flight MTLBuffer. Track GL buffer IDs used by each
-// command buffer so glBufferSubData/glMapBuffer can copy-on-write when needed.
-static NSMutableDictionary<NSNumber *, NSNumber *> *gl4metalBufferInFlightCounts = nil;
-static NSMutableSet<NSNumber *> *gl4metalCurrentCommandBufferBufferUses = nil;
+#ifndef GL_CLAMP_VERTEX_COLOR
+#define GL_CLAMP_VERTEX_COLOR 0x891A
+#endif
+#ifndef GL_CLAMP_FRAGMENT_COLOR
+#define GL_CLAMP_FRAGMENT_COLOR 0x891B
+#endif
+#ifndef GL_POINT_SIZE_MIN
+#define GL_POINT_SIZE_MIN 0x8126
+#endif
+#ifndef GL_POINT_SIZE_MAX
+#define GL_POINT_SIZE_MAX 0x8127
+#endif
+#ifndef GL_POINT_FADE_THRESHOLD_SIZE
+#define GL_POINT_FADE_THRESHOLD_SIZE 0x8128
+#endif
+#ifndef GL_POINT_DISTANCE_ATTENUATION
+#define GL_POINT_DISTANCE_ATTENUATION 0x8129
+#endif
+
+// Track the actual MTLBuffer versions captured by each command buffer. A GL
+// buffer can be copy-on-write replaced while an older version remains in use;
+// tracking only its GL name would make every subsequent update clone again.
+static NSMutableDictionary<NSValue *, NSNumber *> *gl4metalResourceInFlightCounts = nil;
+static NSMutableDictionary<NSValue *, id<MTLBuffer>> *gl4metalCurrentCommandBufferResources = nil;
+static NSMutableDictionary<NSString *, NSData *> *gl4metalIndexStatsCache = nil;
+static NSUInteger gl4metalConvertedIndexBufferCacheBytes = 0;
+static NSMutableDictionary<NSString *, id<MTLBuffer>> *gl4metalTriangleFanBufferCache = nil;
+static NSUInteger gl4metalTriangleFanBufferCacheBytes = 0;
+
+static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void);
+
+static void gl4metalInvalidateIndexStatsCache(void) {
+    [gl4metalIndexStatsCache removeAllObjects];
+}
+
+static void gl4metalClearIndexCaches(void) {
+    [convertedIndexBuffers removeAllObjects];
+    gl4metalConvertedIndexBufferCacheBytes = 0;
+    [gl4metalTriangleFanBufferCache removeAllObjects];
+    gl4metalTriangleFanBufferCacheBytes = 0;
+    gl4metalInvalidateIndexStatsCache();
+}
 
 static BOOL gl4metalSafeResourceUpdatesEnabled(void) {
     const char *v = getenv("GL4METAL_SAFE_RESOURCE_UPDATES");
@@ -29,20 +68,24 @@ static BOOL gl4metalSafeResourceUpdatesEnabled(void) {
 }
 
 static BOOL gl4metalBufferIsInFlight(GLuint bufferID) {
-    if (!bufferID || !gl4metalBufferInFlightCounts) return NO;
-    @synchronized(gl4metalBufferInFlightCounts) {
-        return [gl4metalBufferInFlightCounts[@(bufferID)] unsignedIntegerValue] > 0;
+    id<MTLBuffer> buffer = bufferObjects[@(bufferID)];
+    if (!buffer || !gl4metalResourceInFlightCounts) return NO;
+    NSValue *resourceKey = [NSValue valueWithPointer:(__bridge const void *)buffer];
+    @synchronized(gl4metalResourceInFlightCounts) {
+        return [gl4metalResourceInFlightCounts[resourceKey] unsignedIntegerValue] > 0;
     }
 }
 
 static void gl4metalMarkBufferUsed(GLuint bufferID) {
-    if (!bufferID || !gl4metalCurrentCommandBufferBufferUses || !gl4metalBufferInFlightCounts) return;
-    NSNumber *key = @(bufferID);
-    if ([gl4metalCurrentCommandBufferBufferUses containsObject:key]) return;
-    [gl4metalCurrentCommandBufferBufferUses addObject:key];
-    @synchronized(gl4metalBufferInFlightCounts) {
-        NSUInteger count = [gl4metalBufferInFlightCounts[key] unsignedIntegerValue];
-        gl4metalBufferInFlightCounts[key] = @(count + 1);
+    id<MTLBuffer> buffer = bufferObjects[@(bufferID)];
+    if (!bufferID || !buffer || !gl4metalCurrentCommandBufferResources ||
+        !gl4metalResourceInFlightCounts) return;
+    NSValue *resourceKey = [NSValue valueWithPointer:(__bridge const void *)buffer];
+    if (gl4metalCurrentCommandBufferResources[resourceKey]) return;
+    gl4metalCurrentCommandBufferResources[resourceKey] = buffer;
+    @synchronized(gl4metalResourceInFlightCounts) {
+        NSUInteger count = [gl4metalResourceInFlightCounts[resourceKey] unsignedIntegerValue];
+        gl4metalResourceInFlightCounts[resourceKey] = @(count + 1);
     }
 }
 
@@ -62,7 +105,10 @@ static id<MTLBuffer> gl4metalCopyBufferForWrite(GLuint bufferID, id<MTLBuffer> o
     if (!newBuffer) return nil;
 
     memcpy(newBuffer.contents, oldBuffer.contents, length);
-    memcpy((uint8_t *)newBuffer.contents + patchOffset, patchData, (size_t)patchSize);
+    BOOL patchAlreadyMatchesCopy = patchOffset == 0 && (NSUInteger)patchSize == length &&
+        patchData == oldBuffer.contents;
+    if (!patchAlreadyMatchesCopy)
+        memcpy((uint8_t *)newBuffer.contents + patchOffset, patchData, (size_t)patchSize);
 
     if (getenv("GL4METAL_RESOURCE_UPDATE_TRACE")) {
         printf("[gl4metal][RESOURCE_UPDATE] COW buffer=%u length=%lu patch=%ld+%ld\n",
@@ -76,15 +122,98 @@ gl4metalVertexArray *gl4metalGetCurrentVAO(void);
 // V8 uniform/resource binding forward declarations.
 // uniformLocationNames is defined in gl4metal_runtime.mm and declared extern by gl4metal_runtime.h.
 static NSMutableDictionary<NSNumber *, NSNumber *> *uniformLocationPrograms = nil;
+static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSNumber *> *> *programFragDataBindings = nil;
+static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSNumber *> *> *programFragDataIndices = nil;
+static NSMutableSet<NSNumber *> *gl4metalPendingProgramDeletes = nil;
+static NSMutableSet<NSNumber *> *gl4metalPendingShaderDeletes = nil;
 static NSMutableSet<NSNumber *> *bufferObjectNames = nil;
+static NSMutableSet<NSNumber *> *bufferGeneratedNames = nil;
+static NSMutableSet<NSNumber *> *vertexArrayGeneratedNames = nil;
 static NSMutableDictionary<NSNumber *, NSValue *> *mappedBufferPointers = nil;
+static NSMutableDictionary<NSNumber *, NSNumber *> *mappedBufferOffsets = nil;
+static NSMutableDictionary<NSNumber *, NSNumber *> *mappedBufferLengths = nil;
+static NSMutableDictionary<NSNumber *, NSNumber *> *mappedBufferAccesses = nil;
+static NSMutableDictionary<NSValue *, id<MTLCommandBuffer>> *gl4metalSyncCommands = nil;
 static NSMutableDictionary<NSNumber *, NSNumber *> *bufferUsages = nil;
+
+static void gl4metalDeleteShaderStorage(GLuint shader) {
+    [shaderTypes removeObjectForKey:@(shader)];
+    shaderSources.erase(shader);
+    [shaderCompileStatus removeObjectForKey:@(shader)];
+    [shaderInfoLog removeObjectForKey:@(shader)];
+    [gl4metalPendingShaderDeletes removeObject:@(shader)];
+}
+
+static void gl4metalDeleteShaderIfUnattached(GLuint shader) {
+    for (NSNumber *programId in programShaders) {
+        if ([programShaders[programId] containsObject:@(shader)]) return;
+    }
+    gl4metalDeleteShaderStorage(shader);
+}
+
+static void gl4metalDestroyProgramStorage(GLuint program) {
+    NSNumber *programKey = @(program);
+    NSArray<NSNumber *> *attachedShaders = [programShaders[programKey] copy];
+
+    NSString *cachePrefix = [NSString stringWithFormat:@"p%u:", program];
+    for (NSString *cacheKey in [pipelineLayoutCache.allKeys copy]) {
+        if ([cacheKey hasPrefix:cachePrefix]) [pipelineLayoutCache removeObjectForKey:cacheKey];
+    }
+    [ctx.programPipelines removeObjectForKey:programKey];
+    [ctx.programResourceInfo removeObjectForKey:programKey];
+    [programAttribBindings removeObjectForKey:programKey];
+    [programFragDataBindings removeObjectForKey:programKey];
+    [programFragDataIndices removeObjectForKey:programKey];
+
+    for (NSNumber *location in [uniformLocationPrograms.allKeys copy]) {
+        if ([uniformLocationPrograms[location] unsignedIntValue] != program) continue;
+        [uniformLocationPrograms removeObjectForKey:location];
+        [uniformLocationNames removeObjectForKey:location];
+        [uniform1fValues removeObjectForKey:location];
+        [uniform2fValues removeObjectForKey:location];
+        [uniform3fValues removeObjectForKey:location];
+        [uniform4fValues removeObjectForKey:location];
+        [uniform1iValues removeObjectForKey:location];
+        [uniform2iValues removeObjectForKey:location];
+        [uniform3iValues removeObjectForKey:location];
+        [uniform4iValues removeObjectForKey:location];
+        [uniformMatrix4fvValues removeObjectForKey:location];
+        [uniformRawValues removeObjectForKey:location];
+    }
+
+    [programShaders removeObjectForKey:programKey];
+    [programLinkStatus removeObjectForKey:programKey];
+    [programInfoLog removeObjectForKey:programKey];
+    [gl4metalPendingProgramDeletes removeObject:programKey];
+    for (NSNumber *shader in attachedShaders) {
+        if ([gl4metalPendingShaderDeletes containsObject:shader])
+            gl4metalDeleteShaderIfUnattached(shader.unsignedIntValue);
+    }
+}
+
+static void gl4metalFinalizePendingProgramDelete(GLuint program) {
+    if (program != 0 && [gl4metalPendingProgramDeletes containsObject:@(program)])
+        gl4metalDestroyProgramStorage(program);
+}
+
+static GLenum gl4metalLogicOperation = GL_COPY;
+static GLboolean gl4metalColorLogicOperationEnabled = GL_FALSE;
+static GLenum gl4metalClampVertexColor = GL_FIXED_ONLY;
+static GLenum gl4metalClampFragmentColor = GL_FIXED_ONLY;
+static GLenum gl4metalClampReadColor = GL_TRUE;
+static GLfloat gl4metalPointSizeMin = 0.0f;
+static GLfloat gl4metalPointSizeMax = 1.0f;
+static GLfloat gl4metalPointFadeThreshold = 1.0f;
+static GLfloat gl4metalPointDistanceAttenuation[3] = {1.0f, 0.0f, 0.0f};
+static GLenum gl4metalPointSpriteCoordOrigin = GL_UPPER_LEFT;
 static void gl4metalBindProgramResources(id<MTLRenderCommandEncoder> encoder, GLuint program);
 static MTLBlendFactor gl4metalBlendFactor(GLenum factor);
 static MTLBlendOperation gl4metalBlendOperation(GLenum equation);
 static NSData *gl4metalUniformDataForName(NSString *name, GLuint program, NSUInteger length);
 static GLint gl4metalFindUniformLocationByName(NSString *name, GLuint program);
 static void gl4metalEncodePendingClear(void);
+static NSArray<NSDictionary<NSString *, id> *> *gl4metalProgramVariables(GLuint program, BOOL uniforms);
+static NSArray<NSDictionary<NSString *, id> *> *gl4metalProgramFragmentOutputs(GLuint program);
 
 static GLintptr gl4metalResolvePointerOffset(const void *pointer, id<MTLBuffer> buffer) {
     if (pointer == NULL || !buffer) return 0;
@@ -122,10 +251,13 @@ static GLint gl4metalResolveLocationFromName(GLuint program, const char *name) {
 }
 
 void gl4metalSetError(GLenum error) {
-    // OpenGL errors remain pending until glGetError consumes them. A later
-    // successful call must not erase an error the application has not read.
-    if (error == GL_NO_ERROR || lastGL4MetalError != GL_NO_ERROR) return;
-    lastGL4MetalError = error;
+    // OpenGL keeps one pending flag per error code. Repeated instances of an
+    // already-pending error collapse, while a distinct error remains queued.
+    if (error == GL_NO_ERROR) return;
+    if (!gl4metalPendingErrors) gl4metalPendingErrors = [NSMutableArray array];
+    NSNumber *key = @(error);
+    if (![gl4metalPendingErrors containsObject:key]) [gl4metalPendingErrors addObject:key];
+    lastGL4MetalError = gl4metalPendingErrors.firstObject.unsignedIntValue;
 }
 
 static void gl4metalTraceUniformUpdate(GLint location, const char *kind, const float *values, NSUInteger count) {
@@ -428,6 +560,9 @@ GLboolean APIENTRY gl4metalInit(void) {
 
     ctx.commandQueue = [ctx.device newCommandQueue];
     ctx.boundBuffers = [[NSMutableDictionary alloc] init];
+    ctx.indexedBufferBindings = [[NSMutableDictionary alloc] init];
+    ctx.framebufferDrawBuffers = [@{@0: @(GL_BACK)} mutableCopy];
+    ctx.framebufferReadBuffers = [@{@0: @(GL_BACK)} mutableCopy];
     ctx.programPipelines = [[NSMutableDictionary alloc] init];
     ctx.programResourceInfo = [[NSMutableDictionary alloc] init];
     inferredConstantVertexAttributes = [NSMutableSet set];
@@ -442,6 +577,13 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.stencilFail = GL_KEEP;
     ctx.stencilDepthFail = GL_KEEP;
     ctx.stencilDepthPass = GL_KEEP;
+    ctx.stencilBackFunc = GL_ALWAYS;
+    ctx.stencilBackRef = 0;
+    ctx.stencilBackReadMask = 0xffffffffu;
+    ctx.stencilBackWriteMask = 0xffffffffu;
+    ctx.stencilBackFail = GL_KEEP;
+    ctx.stencilBackDepthFail = GL_KEEP;
+    ctx.stencilBackDepthPass = GL_KEEP;
     ctx.depthWriteEnabled = GL_TRUE;
     ctx.blendEnabled = GL_FALSE;
     ctx.blendSrcRGB = GL_ONE;
@@ -461,6 +603,18 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.polygonMode = GL_FILL;
     ctx.lineWidth = 1.0f;
     ctx.pointSize = 1.0f;
+    ctx.polygonOffsetFactor = 0.0f;
+    ctx.polygonOffsetUnits = 0.0f;
+    ctx.polygonOffsetFillEnabled = GL_FALSE;
+    ctx.polygonOffsetLineEnabled = GL_FALSE;
+    ctx.polygonOffsetPointEnabled = GL_FALSE;
+    ctx.sampleCoverageEnabled = GL_FALSE;
+    ctx.sampleCoverageValue = 1.0f;
+    ctx.sampleCoverageInvert = GL_FALSE;
+    ctx.primitiveRestartEnabled = GL_FALSE;
+    ctx.primitiveRestartIndex = 0xffffffffu;
+    ctx.depthRangeNear = 0.0;
+    ctx.depthRangeFar = 1.0;
     ctx.clearStencil = 0;
     ctx.stencilWriteMask = 0xffffffffu;
     ctx.colorMaskRed = GL_TRUE;
@@ -468,18 +622,29 @@ GLboolean APIENTRY gl4metalInit(void) {
     ctx.colorMaskBlue = GL_TRUE;
     ctx.colorMaskAlpha = GL_TRUE;
     ctx.drawBuffer = GL_BACK;
+    ctx.readBuffer = GL_BACK;
     ctx.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     ctx.clearDepth = 1.0;
     ctx.pendingClearFlags = 0;
     ctx.pendingClearFramebuffer = 0;
+    ctx.pendingClearColor = ctx.clearColor;
+    ctx.pendingClearDepth = ctx.clearDepth;
+    ctx.pendingClearStencil = (GLuint)ctx.clearStencil;
 
-    gl4metalBufferInFlightCounts = [NSMutableDictionary dictionary];
-    gl4metalCurrentCommandBufferBufferUses = nil;
+    gl4metalResourceInFlightCounts = [NSMutableDictionary dictionary];
+    gl4metalCurrentCommandBufferResources = nil;
+    gl4metalIndexStatsCache = [NSMutableDictionary dictionary];
 
     bufferObjects = [NSMutableDictionary dictionary];
     bufferSizes = [NSMutableDictionary dictionary];
     bufferObjectNames = [NSMutableSet set];
+    bufferGeneratedNames = [NSMutableSet set];
+    vertexArrayGeneratedNames = [NSMutableSet set];
     mappedBufferPointers = [NSMutableDictionary dictionary];
+    mappedBufferOffsets = [NSMutableDictionary dictionary];
+    mappedBufferLengths = [NSMutableDictionary dictionary];
+    mappedBufferAccesses = [NSMutableDictionary dictionary];
+    gl4metalSyncCommands = [NSMutableDictionary dictionary];
     bufferUsages = [NSMutableDictionary dictionary];
     convertedIndexBuffers = [NSMutableDictionary dictionary];
     vaoObjects = [NSMutableDictionary dictionary];
@@ -501,14 +666,30 @@ GLboolean APIENTRY gl4metalInit(void) {
     uniform3iValues = [NSMutableDictionary dictionary];
     uniform4iValues = [NSMutableDictionary dictionary];
     uniformMatrix4fvValues = [NSMutableDictionary dictionary];
+    uniformRawValues = [NSMutableDictionary dictionary];
     uniformLocationNames = [NSMutableDictionary dictionary];
     uniformLocationPrograms = [NSMutableDictionary dictionary];
     programAttribBindings = [NSMutableDictionary dictionary];
+    programFragDataBindings = [NSMutableDictionary dictionary];
+    programFragDataIndices = [NSMutableDictionary dictionary];
     pipelineLayoutCache = [NSMutableDictionary dictionary];
+    gl4metalLogicOperation = GL_COPY;
+    gl4metalColorLogicOperationEnabled = GL_FALSE;
+    gl4metalClampVertexColor = GL_FIXED_ONLY;
+    gl4metalClampFragmentColor = GL_FIXED_ONLY;
+    gl4metalClampReadColor = GL_TRUE;
+    gl4metalPointSizeMin = 0.0f;
+    gl4metalPointSizeMax = 1.0f;
+    gl4metalPointFadeThreshold = 1.0f;
+    gl4metalPointDistanceAttenuation[0] = 1.0f;
+    gl4metalPointDistanceAttenuation[1] = 0.0f;
+    gl4metalPointDistanceAttenuation[2] = 0.0f;
+    gl4metalPointSpriteCoordOrigin = GL_UPPER_LEFT;
     currentProgram = 0;
+    gl4metalPendingErrors = [NSMutableArray array];
     lastGL4MetalError = GL_NO_ERROR;
     gl4metalInitTextureState();
-    gl4metalInitFramebufferState();
+    gl4metalResetFramebufferState();
 
     glslang::InitializeProcess();
     updateDepthStencilState();
@@ -530,32 +711,25 @@ static BOOL gl4metalGPUIsolationEnabled = NO;
 static BOOL gl4metalGPUIsolationFailed = NO;
 
 // Completed command buffers return their uniform arenas here. Reusing the
-// buffers avoids allocating a fresh 256 KiB MTLBuffer for every frame while
-// preserving GPU lifetime safety: a buffer is returned only after its command
-// buffer has completed.
+// buffers avoids allocating a fresh arena for every frame. Pool size is capped
+// to prevent high-water workloads from retaining unbounded GPU memory.
 static NSMutableArray<id<MTLBuffer>> *gl4metalUniformArenaPool = nil;
+static NSUInteger gl4metalUniformArenaPoolBytes = 0;
+static const NSUInteger gl4metalUniformArenaPoolByteLimit = 8u * 1024u * 1024u;
 
 static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void) {
     if (!ctx || !ctx.commandQueue) return nil;
     id<MTLCommandBuffer> cb = [ctx.commandQueue commandBuffer];
     if (!cb) return nil;
 
-    // Uniform storage is owned by the command-buffer generation. Reuse a
-    // completed arena when possible; every in-flight command buffer still owns
-    // its arena strongly through the completion-handler capture.
+    // Uniform storage is owned by the command-buffer generation. Arenas are
+    // acquired lazily as draws need them and held until this command buffer completes.
     if (!gl4metalUniformArenaPool) {
         gl4metalUniformArenaPool = [NSMutableArray array];
     }
     NSMutableArray<id<MTLBuffer>> *uniformArenas = [NSMutableArray array];
-    NSMutableSet<NSNumber *> *usedGLBuffers = [NSMutableSet set];
-    gl4metalCurrentCommandBufferBufferUses = usedGLBuffers;
-    @synchronized(gl4metalUniformArenaPool) {
-        if (gl4metalUniformArenaPool.count > 0) {
-            id<MTLBuffer> recycled = gl4metalUniformArenaPool.lastObject;
-            [gl4metalUniformArenaPool removeLastObject];
-            if (recycled) [uniformArenas addObject:recycled];
-        }
-    }
+    NSMutableDictionary<NSValue *, id<MTLBuffer>> *usedBufferResources = [NSMutableDictionary dictionary];
+    gl4metalCurrentCommandBufferResources = usedBufferResources;
     ctx.uniformArenaBuffers = uniformArenas;
     ctx.uniformArenaOffset = 0;
 
@@ -563,15 +737,22 @@ static id<MTLCommandBuffer> gl4metalCreateCommandBuffer(void) {
     [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         // The command buffer is finished, so its uniform buffers are safe to
         // recycle for a future frame.
-        @synchronized(gl4metalBufferInFlightCounts) {
-            for (NSNumber *bufferKey in usedGLBuffers) {
-                NSUInteger count = [gl4metalBufferInFlightCounts[bufferKey] unsignedIntegerValue];
-                if (count > 1) gl4metalBufferInFlightCounts[bufferKey] = @(count - 1);
-                else [gl4metalBufferInFlightCounts removeObjectForKey:bufferKey];
+        @synchronized(gl4metalResourceInFlightCounts) {
+            for (NSValue *resourceKey in usedBufferResources) {
+                NSUInteger count = [gl4metalResourceInFlightCounts[resourceKey] unsignedIntegerValue];
+                if (count > 1) gl4metalResourceInFlightCounts[resourceKey] = @(count - 1);
+                else [gl4metalResourceInFlightCounts removeObjectForKey:resourceKey];
             }
         }
         @synchronized(gl4metalUniformArenaPool) {
-            [gl4metalUniformArenaPool addObjectsFromArray:uniformArenas];
+            for (id<MTLBuffer> arena in uniformArenas) {
+                NSUInteger arenaLength = arena.length;
+                if (arenaLength <= gl4metalUniformArenaPoolByteLimit &&
+                    gl4metalUniformArenaPoolBytes <= gl4metalUniformArenaPoolByteLimit - arenaLength) {
+                    [gl4metalUniformArenaPool addObject:arena];
+                    gl4metalUniformArenaPoolBytes += arenaLength;
+                }
+            }
         }
         MTLCommandBufferStatus status = completed.status;
         NSError *error = completed.error;
@@ -664,7 +845,6 @@ void APIENTRY glSwapBuffers(void) {
     if (!presentCommandBuffer) presentCommandBuffer = gl4metalCreateCommandBuffer();
     if (!presentCommandBuffer) return;
     [presentCommandBuffer presentDrawable:ctx.currentDrawable];
-    printf("[gl4metal] Committing Metal command buffer\n");
     [presentCommandBuffer commit];
     if (getenv("GL4METAL_PRESENT_TRACE")) {
         printf("[gl4metal][PRESENT_TRACE] present submitted\\n");
@@ -676,21 +856,141 @@ void APIENTRY glSwapBuffers(void) {
 void APIENTRY glSwapInterval(GLint interval) {
     if (!ctx) return;
     ctx.swapInterval = interval;
-    if (ctx.metalLayer) ctx.metalLayer.maximumDrawableCount = interval == 0 ? 2 : 3;
+    // Metal presentation is already asynchronous. Reducing drawable queue
+    // depth for interval 0 adds back-pressure without disabling display sync.
+    if (ctx.metalLayer) ctx.metalLayer.maximumDrawableCount = 3;
 }
 
 void APIENTRY glClear(GLbitfield mask) {
-    if (!ctx) return;
-    ctx.pendingClearFlags |= mask;
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    const GLbitfield validMask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+    if (mask & ~validMask) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (ctx.currentFramebuffer != 0 &&
+        glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+    if (ctx.drawBuffer == GL_NONE ||
+        (!ctx.colorMaskRed && !ctx.colorMaskGreen && !ctx.colorMaskBlue && !ctx.colorMaskAlpha))
+        mask &= ~GL_COLOR_BUFFER_BIT;
+    if (!ctx.depthWriteEnabled) mask &= ~GL_DEPTH_BUFFER_BIT;
+    if (ctx.stencilWriteMask == 0 && ctx.stencilBackWriteMask == 0)
+        mask &= ~GL_STENCIL_BUFFER_BIT;
+    if (mask == 0) { gl4metalSetError(GL_NO_ERROR); return; }
+    // Preserve the state snapshot and ordering of consecutive clears.
+    gl4metalEncodePendingClear();
+    ctx.pendingClearFlags = mask;
     ctx.pendingClearFramebuffer = ctx.currentFramebuffer;
+    ctx.pendingClearColor = ctx.clearColor;
+    ctx.pendingClearDepth = ctx.clearDepth;
+    ctx.pendingClearStencil = (GLuint)ctx.clearStencil;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+static BOOL gl4metalValidateClearBuffer(GLenum buffer, GLint drawbuffer,
+                                        BOOL allowDepthStencil) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return NO; }
+    if (buffer != GL_COLOR && buffer != GL_DEPTH && buffer != GL_STENCIL &&
+        !(allowDepthStencil && buffer == GL_DEPTH_STENCIL)) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return NO;
+    }
+    if (drawbuffer < 0) { gl4metalSetError(GL_INVALID_VALUE); return NO; }
+    if (ctx.currentFramebuffer != 0 &&
+        glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return NO;
+    }
+    if (buffer == GL_COLOR) {
+        if (drawbuffer >= 1) { gl4metalSetError(GL_INVALID_VALUE); return NO; }
+        return YES;
+    }
+    if (drawbuffer != 0) { gl4metalSetError(GL_INVALID_VALUE); return NO; }
+    return YES;
+}
+
+static void gl4metalQueueClearBuffer(GLbitfield flags) {
+    gl4metalEncodePendingClear();
+    ctx.pendingClearFlags = flags;
+    ctx.pendingClearFramebuffer = ctx.currentFramebuffer;
+    ctx.pendingClearColor = ctx.clearColor;
+    ctx.pendingClearDepth = ctx.clearDepth;
+    ctx.pendingClearStencil = (GLuint)ctx.clearStencil;
+}
+
+void APIENTRY glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
+    if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateClearBuffer(buffer, drawbuffer, NO)) return;
+    if (buffer == GL_COLOR) {
+        if (ctx.drawBuffer == GL_NONE) { gl4metalSetError(GL_NO_ERROR); return; }
+        gl4metalQueueClearBuffer(GL_COLOR_BUFFER_BIT);
+        ctx.pendingClearColor = MTLClearColorMake(value[0], value[1], value[2], value[3]);
+    } else if (buffer == GL_DEPTH) {
+        if (!ctx.depthWriteEnabled) { gl4metalSetError(GL_NO_ERROR); return; }
+        gl4metalQueueClearBuffer(GL_DEPTH_BUFFER_BIT);
+        ctx.pendingClearDepth = fmin(1.0, fmax(0.0, value[0]));
+    } else {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
+    if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateClearBuffer(buffer, drawbuffer, NO)) return;
+    if (buffer == GL_COLOR) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    } else if (buffer == GL_STENCIL) {
+        if (ctx.stencilWriteMask == 0 && ctx.stencilBackWriteMask == 0) {
+            gl4metalSetError(GL_NO_ERROR);
+            return;
+        }
+        gl4metalQueueClearBuffer(GL_STENCIL_BUFFER_BIT);
+        ctx.pendingClearStencil = (GLuint)value[0];
+    } else {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
+    if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateClearBuffer(buffer, drawbuffer, NO)) return;
+    if (buffer != GL_COLOR) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    gl4metalSetError(GL_INVALID_OPERATION);
+}
+
+void APIENTRY glClearBufferfi(GLenum buffer, GLint drawbuffer,
+                              GLfloat depth, GLint stencil) {
+    if (!gl4metalValidateClearBuffer(buffer, drawbuffer, YES)) return;
+    if (buffer != GL_DEPTH_STENCIL) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    GLbitfield flags = 0;
+    if (ctx.depthWriteEnabled) flags |= GL_DEPTH_BUFFER_BIT;
+    if (ctx.stencilWriteMask != 0 || ctx.stencilBackWriteMask != 0)
+        flags |= GL_STENCIL_BUFFER_BIT;
+    if (flags == 0) { gl4metalSetError(GL_NO_ERROR); return; }
+    gl4metalQueueClearBuffer(flags);
+    ctx.pendingClearDepth = fmin(1.0, fmax(0.0, depth));
+    ctx.pendingClearStencil = (GLuint)stencil;
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
-    if (ctx) ctx.clearColor = MTLClearColorMake(red, green, blue, alpha);
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    ctx.clearColor = MTLClearColorMake(fminf(1.0f, fmaxf(0.0f, red)),
+                                       fminf(1.0f, fmaxf(0.0f, green)),
+                                       fminf(1.0f, fmaxf(0.0f, blue)),
+                                       fminf(1.0f, fmaxf(0.0f, alpha)));
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glClearDepth(GLclampd depth) {
-    if (ctx) ctx.clearDepth = depth;
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    ctx.clearDepth = fmin(1.0, fmax(0.0, depth));
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 static MTLRenderPassDescriptor *createRenderPassDescriptor(void) {
@@ -706,12 +1006,15 @@ static MTLRenderPassDescriptor *createRenderPassDescriptor(void) {
         colorTexture = gl4metalGetCurrentFramebufferColorTexture();
         depthTexture = gl4metalGetCurrentFramebufferDepthTexture();
         stencilTexture = gl4metalGetCurrentFramebufferStencilTexture();
-        if (!colorTexture) {
-            printf("[gl4metal] ERROR: FBO %u has no color attachment for draw path\n", ctx.currentFramebuffer);
+        id<MTLTexture> targetTexture = colorTexture ?: (depthTexture ?: stencilTexture);
+        if (!targetTexture) {
+            printf("[gl4metal] ERROR: FBO %u has no renderable attachment\n", ctx.currentFramebuffer);
             return nil;
         }
-        targetWidth = colorTexture.width;
-        targetHeight = colorTexture.height;
+        NSUInteger level = colorTexture ? gl4metalGetCurrentFramebufferColorLevel() :
+            (depthTexture ? gl4metalGetCurrentFramebufferDepthLevel() : gl4metalGetCurrentFramebufferStencilLevel());
+        targetWidth = MAX((NSUInteger)1, targetTexture.width >> MIN(level, (NSUInteger)31));
+        targetHeight = MAX((NSUInteger)1, targetTexture.height >> MIN(level, (NSUInteger)31));
     } else {
         if (!ctx.currentDrawable && ctx.metalLayer) ctx.currentDrawable = [ctx.metalLayer nextDrawable];
         if (!ctx.currentDrawable) return nil;
@@ -725,37 +1028,45 @@ static MTLRenderPassDescriptor *createRenderPassDescriptor(void) {
     if (!colorTexture || targetWidth == 0 || targetHeight == 0) return nil;
 
     MTLRenderPassDescriptor *passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-    passDesc.colorAttachments[0].texture = colorTexture;
-    passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     GLbitfield effectiveClearFlags =
         (ctx.pendingClearFramebuffer == ctx.currentFramebuffer)
             ? ctx.pendingClearFlags : 0;
-    passDesc.colorAttachments[0].loadAction = (effectiveClearFlags & GL_COLOR_BUFFER_BIT)
-        ? MTLLoadActionClear : MTLLoadActionLoad;
-    passDesc.colorAttachments[0].clearColor = ctx.clearColor;
+    if (!colorTexture || ctx.drawBuffer == GL_NONE) effectiveClearFlags &= ~GL_COLOR_BUFFER_BIT;
+    if (!depthTexture) effectiveClearFlags &= ~GL_DEPTH_BUFFER_BIT;
+    if (!stencilTexture) effectiveClearFlags &= ~GL_STENCIL_BUFFER_BIT;
+    if (colorTexture) {
+        passDesc.colorAttachments[0].texture = colorTexture;
+        if (ctx.currentFramebuffer != 0)
+            passDesc.colorAttachments[0].level = gl4metalGetCurrentFramebufferColorLevel();
+        passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        passDesc.colorAttachments[0].loadAction = (effectiveClearFlags & GL_COLOR_BUFFER_BIT)
+            ? MTLLoadActionClear : MTLLoadActionLoad;
+        passDesc.colorAttachments[0].clearColor = ctx.pendingClearColor;
+    }
 
     if (depthTexture) {
         passDesc.depthAttachment.texture = depthTexture;
+        if (ctx.currentFramebuffer != 0)
+            passDesc.depthAttachment.level = gl4metalGetCurrentFramebufferDepthLevel();
         passDesc.depthAttachment.storeAction = MTLStoreActionStore;
         passDesc.depthAttachment.loadAction = (effectiveClearFlags & GL_DEPTH_BUFFER_BIT)
             ? MTLLoadActionClear : MTLLoadActionLoad;
-        passDesc.depthAttachment.clearDepth = ctx.clearDepth;
+        passDesc.depthAttachment.clearDepth = ctx.pendingClearDepth;
     }
 
     if (stencilTexture &&
         (stencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ||
          stencilTexture.pixelFormat == MTLPixelFormatStencil8)) {
         passDesc.stencilAttachment.texture = stencilTexture;
+        if (ctx.currentFramebuffer != 0)
+            passDesc.stencilAttachment.level = gl4metalGetCurrentFramebufferStencilLevel();
         passDesc.stencilAttachment.storeAction = MTLStoreActionStore;
         passDesc.stencilAttachment.loadAction = (effectiveClearFlags & GL_STENCIL_BUFFER_BIT)
             ? MTLLoadActionClear : MTLLoadActionLoad;
-        passDesc.stencilAttachment.clearStencil = (NSUInteger)ctx.clearStencil;
+        passDesc.stencilAttachment.clearStencil = ctx.pendingClearStencil;
     }
 
-    if (effectiveClearFlags != 0) {
-        ctx.pendingClearFlags &= ~effectiveClearFlags;
-        if (ctx.pendingClearFlags == 0) ctx.pendingClearFramebuffer = ctx.currentFramebuffer;
-    }
+    if (ctx.pendingClearFramebuffer == ctx.currentFramebuffer) ctx.pendingClearFlags = 0;
     return passDesc;
 }
 
@@ -772,6 +1083,10 @@ static void gl4metalEncodePendingClear(void) {
     id<MTLRenderCommandEncoder> encoder =
         [ctx.currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
     [encoder endEncoding];
+}
+
+void gl4metalFlushPendingClear(void) {
+    gl4metalEncodePendingClear();
 }
 
 void APIENTRY glFlush(void) {
@@ -792,7 +1107,22 @@ void APIENTRY glFinish(void) {
 }
 
 void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    if (ctx) ctx.viewport = (gl4metalRect){x, y, width, height};
+    if (width < 0 || height < 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    ctx.viewport = (gl4metalRect){x, y, width, height};
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDepthRange(GLdouble nearValue, GLdouble farValue) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    // OpenGL clamps depth range endpoints to [0, 1]. Metal uses the same
+    // normalized depth interval, so the values can be forwarded at draw time.
+    ctx.depthRangeNear = fmin(1.0, fmax(0.0, nearValue));
+    ctx.depthRangeFar = fmin(1.0, fmax(0.0, farValue));
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
@@ -807,8 +1137,8 @@ static void applyViewportAndScissor(id<MTLRenderCommandEncoder> encoder, NSUInte
         (double)targetHeight - viewport.y - viewport.height,
         (double)viewport.width,
         (double)viewport.height,
-        0.0,
-        1.0
+        ctx.depthRangeNear,
+        ctx.depthRangeFar
     }];
     gl4metalRect scissor = ctx.scissorTestEnabled ? ctx.scissorRect : (gl4metalRect){0, 0, (GLsizei)targetWidth, (GLsizei)targetHeight};
     [encoder setScissorRect:(MTLScissorRect){
@@ -846,12 +1176,26 @@ void APIENTRY glPolygonMode(GLenum face, GLenum mode) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glPolygonOffset(GLfloat factor, GLfloat units) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    ctx.polygonOffsetFactor = factor;
+    ctx.polygonOffsetUnits = units;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glLineWidth(GLfloat width) {
-    if (width <= 0.0f) {
+    if (!ctx) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    if (!isfinite(width) || width <= 0.0f) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
-    ctx.lineWidth = width;
+    // Metal line primitives and wireframe rasterization are fixed to one
+    // pixel. OpenGL requires out-of-range widths to be clamped to the
+    // implementation's supported range; this backend reports [1, 1].
+    ctx.lineWidth = 1.0f;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -864,13 +1208,115 @@ void APIENTRY glPointSize(GLfloat size) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+static BOOL gl4metalValidLogicOperation(GLenum operation) {
+    switch (operation) {
+        case GL_CLEAR: case GL_AND: case GL_AND_REVERSE: case GL_COPY:
+        case GL_AND_INVERTED: case GL_NOOP: case GL_XOR: case GL_OR:
+        case GL_NOR: case GL_EQUIV: case GL_INVERT: case GL_OR_REVERSE:
+        case GL_COPY_INVERTED: case GL_OR_INVERTED: case GL_NAND: case GL_SET:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static void gl4metalPointParameterScalar(GLenum pname, GLfloat value) {
+    switch (pname) {
+        case GL_POINT_SIZE_MIN:
+            if (value < 0.0f) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            gl4metalPointSizeMin = value;
+            break;
+        case GL_POINT_SIZE_MAX:
+            if (value < 0.0f) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            gl4metalPointSizeMax = value;
+            break;
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            if (value < 0.0f) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            gl4metalPointFadeThreshold = value;
+            break;
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            if (value != (GLfloat)GL_UPPER_LEFT && value != (GLfloat)GL_LOWER_LEFT) {
+                gl4metalSetError(GL_INVALID_ENUM); return;
+            }
+            gl4metalPointSpriteCoordOrigin = (GLenum)value;
+            break;
+        default:
+            gl4metalSetError(GL_INVALID_ENUM);
+            return;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+static void gl4metalPointParameterAttenuation(const GLfloat value[3]) {
+    if (value[0] < 0.0f || value[1] < 0.0f || value[2] < 0.0f ||
+        (value[0] == 0.0f && value[1] == 0.0f && value[2] == 0.0f)) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    memcpy(gl4metalPointDistanceAttenuation, value, sizeof(gl4metalPointDistanceAttenuation));
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPointParameterf(GLenum pname, GLfloat param) {
+    gl4metalPointParameterScalar(pname, param);
+}
+
+void APIENTRY glPointParameteri(GLenum pname, GLint param) {
+    gl4metalPointParameterScalar(pname, (GLfloat)param);
+}
+
+void APIENTRY glPointParameterfv(GLenum pname, const GLfloat *params) {
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (pname == GL_POINT_DISTANCE_ATTENUATION) gl4metalPointParameterAttenuation(params);
+    else gl4metalPointParameterScalar(pname, params[0]);
+}
+
+void APIENTRY glPointParameteriv(GLenum pname, const GLint *params) {
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (pname == GL_POINT_DISTANCE_ATTENUATION) {
+        GLfloat value[3] = {(GLfloat)params[0], (GLfloat)params[1], (GLfloat)params[2]};
+        gl4metalPointParameterAttenuation(value);
+    } else {
+        gl4metalPointParameterScalar(pname, (GLfloat)params[0]);
+    }
+}
+
+void APIENTRY glLogicOp(GLenum operation) {
+    if (!gl4metalValidLogicOperation(operation)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    gl4metalLogicOperation = operation;
+    if (ctx) {
+        ctx.pipelineState = nil;
+        [pipelineLayoutCache removeAllObjects];
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glClampColor(GLenum target, GLenum clamp) {
+    if (target != GL_CLAMP_VERTEX_COLOR && target != GL_CLAMP_FRAGMENT_COLOR &&
+        target != GL_CLAMP_READ_COLOR) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if ((target == GL_CLAMP_READ_COLOR && clamp != GL_TRUE && clamp != GL_FALSE) ||
+        (target != GL_CLAMP_READ_COLOR && clamp != GL_TRUE && clamp != GL_FALSE && clamp != GL_FIXED_ONLY)) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if (target == GL_CLAMP_VERTEX_COLOR) gl4metalClampVertexColor = clamp;
+    else if (target == GL_CLAMP_FRAGMENT_COLOR) gl4metalClampFragmentColor = clamp;
+    else gl4metalClampReadColor = clamp;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glClearStencil(GLint s) {
     ctx.clearStencil = s;
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glStencilMask(GLuint mask) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     ctx.stencilWriteMask = mask;
+    ctx.stencilBackWriteMask = mask;
     updateDepthStencilState();
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -888,6 +1334,9 @@ void APIENTRY glStencilFunc(GLenum func, GLint ref, GLuint mask) {
     ctx.stencilFunc = func;
     ctx.stencilRef = ref;
     ctx.stencilReadMask = mask;
+    ctx.stencilBackFunc = func;
+    ctx.stencilBackRef = ref;
+    ctx.stencilBackReadMask = mask;
     updateDepthStencilState();
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -911,11 +1360,60 @@ void APIENTRY glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) {
     ctx.stencilFail = fail;
     ctx.stencilDepthFail = zfail;
     ctx.stencilDepthPass = zpass;
+    ctx.stencilBackFail = fail;
+    ctx.stencilBackDepthFail = zfail;
+    ctx.stencilBackDepthPass = zpass;
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+static BOOL gl4metalValidStencilFace(GLenum face) {
+    return face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK;
+}
+
+void APIENTRY glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
+    if (!gl4metalValidStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (func != GL_NEVER && func != GL_LESS && func != GL_EQUAL && func != GL_LEQUAL &&
+        func != GL_GREATER && func != GL_NOTEQUAL && func != GL_GEQUAL && func != GL_ALWAYS) {
+        gl4metalSetError(GL_INVALID_ENUM); return;
+    }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (face != GL_BACK) {
+        ctx.stencilFunc = func; ctx.stencilRef = ref; ctx.stencilReadMask = mask;
+    }
+    if (face != GL_FRONT) {
+        ctx.stencilBackFunc = func; ctx.stencilBackRef = ref; ctx.stencilBackReadMask = mask;
+    }
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilMaskSeparate(GLenum face, GLuint mask) {
+    if (!gl4metalValidStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (face != GL_BACK) ctx.stencilWriteMask = mask;
+    if (face != GL_FRONT) ctx.stencilBackWriteMask = mask;
+    updateDepthStencilState();
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glStencilOpSeparate(GLenum face, GLenum fail, GLenum zfail, GLenum zpass) {
+    if (!gl4metalValidStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (!gl4metalValidStencilOperation(fail) || !gl4metalValidStencilOperation(zfail) ||
+        !gl4metalValidStencilOperation(zpass)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (face != GL_BACK) {
+        ctx.stencilFail = fail; ctx.stencilDepthFail = zfail; ctx.stencilDepthPass = zpass;
+    }
+    if (face != GL_FRONT) {
+        ctx.stencilBackFail = fail; ctx.stencilBackDepthFail = zfail; ctx.stencilBackDepthPass = zpass;
+    }
     updateDepthStencilState();
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     ctx.colorMaskRed = red;
     ctx.colorMaskGreen = green;
     ctx.colorMaskBlue = blue;
@@ -924,17 +1422,68 @@ void APIENTRY glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLbool
 }
 
 void APIENTRY glDrawBuffer(GLenum buf) {
-    if (buf != GL_BACK && buf != GL_NONE) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    BOOL valid = ctx.currentFramebuffer == 0
+        ? (buf == GL_BACK || buf == GL_NONE)
+        : (buf == GL_COLOR_ATTACHMENT0 || buf == GL_NONE);
+    if (!valid) {
         gl4metalSetError(GL_INVALID_ENUM);
         return;
     }
     ctx.drawBuffer = buf;
+    ctx.framebufferDrawBuffers[@(ctx.currentFramebuffer)] = @(buf);
+    ctx.pipelineState = nil;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDrawBuffers(GLsizei n, const GLenum *bufs) {
+    if (n < 0 || (n > 0 && !bufs)) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (n > 1) {
+        // This backend exposes a single color attachment/draw target.
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (n == 0) {
+        ctx.drawBuffer = GL_NONE;
+        ctx.framebufferDrawBuffers[@(ctx.currentFramebuffer)] = @(GL_NONE);
+        ctx.pipelineState = nil;
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
+    glDrawBuffer(bufs[0]);
+}
+
+void APIENTRY glReadBuffer(GLenum src) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    BOOL valid = NO;
+    if (ctx.currentReadFramebuffer == 0) {
+        valid = src == GL_BACK || src == GL_NONE;
+    } else {
+        valid = src == GL_COLOR_ATTACHMENT0 || src == GL_NONE;
+    }
+    if (!valid) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    ctx.readBuffer = src;
+    ctx.framebufferReadBuffers[@(ctx.currentReadFramebuffer)] = @(src);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glHint(GLenum target, GLenum mode) {
-    (void)target;
-    (void)mode;
+    if (target != GL_LINE_SMOOTH_HINT && target != GL_POLYGON_SMOOTH_HINT &&
+        target != GL_TEXTURE_COMPRESSION_HINT && target != GL_FRAGMENT_SHADER_DERIVATIVE_HINT) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if (mode != GL_DONT_CARE && mode != GL_FASTEST && mode != GL_NICEST) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -946,6 +1495,12 @@ static void applyRasterState(id<MTLRenderCommandEncoder> encoder) {
         cullMode = ctx.cullFace == GL_FRONT ? MTLCullModeFront : MTLCullModeBack;
     }
     [encoder setCullMode:cullMode];
+    BOOL polygonOffsetEnabled = ctx.polygonMode == GL_FILL ? ctx.polygonOffsetFillEnabled :
+                                ctx.polygonMode == GL_LINE ? ctx.polygonOffsetLineEnabled :
+                                ctx.polygonOffsetPointEnabled;
+    [encoder setDepthBias:polygonOffsetEnabled ? ctx.polygonOffsetUnits : 0.0f
+              slopeScale:polygonOffsetEnabled ? ctx.polygonOffsetFactor : 0.0f
+                   clamp:0.0f];
     // Keep the original OpenGL -> Metal front-face mapping. The GL viewport
     // Y conversion is a viewport-coordinate conversion, not a reason to
     // globally invert the rasterizer winding. A global inversion makes
@@ -971,7 +1526,17 @@ void APIENTRY glGenBuffers(GLsizei n, GLuint *buffers) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
-    for (GLsizei i = 0; i < n; i++) buffers[i] = nextBufferId++;
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    for (GLsizei i = 0; i < n; i++) {
+        GLuint name = 0;
+        do {
+            name = nextBufferId++;
+            if (name == 0) name = nextBufferId++;
+        } while ([bufferObjectNames containsObject:@(name)] ||
+                 [bufferGeneratedNames containsObject:@(name)]);
+        buffers[i] = name;
+        [bufferGeneratedNames addObject:@(name)];
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -980,9 +1545,15 @@ void APIENTRY glGenVertexArrays(GLsizei n, GLuint *arrays) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     for (GLsizei i = 0; i < n; i++) {
-        GLuint id = nextVAOId++;
+        GLuint id = 0;
+        do {
+            id = nextVAOId++;
+            if (id == 0) id = nextVAOId++;
+        } while ([vertexArrayGeneratedNames containsObject:@(id)] || vaoObjects[@(id)] != nil);
         arrays[i] = id;
+        [vertexArrayGeneratedNames addObject:@(id)];
     }
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -1000,12 +1571,35 @@ static GLuint gl4metalGetBoundBufferForTarget(GLenum target) {
     return bound ? [bound unsignedIntValue] : 0;
 }
 
+static BOOL gl4metalValidBufferTarget(GLenum target) {
+    switch (target) {
+        case GL_ARRAY_BUFFER:
+        case GL_ELEMENT_ARRAY_BUFFER:
+        case GL_PIXEL_PACK_BUFFER:
+        case GL_PIXEL_UNPACK_BUFFER:
+        case GL_COPY_READ_BUFFER:
+        case GL_COPY_WRITE_BUFFER:
+        case GL_TRANSFORM_FEEDBACK_BUFFER:
+        case GL_UNIFORM_BUFFER:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
 void APIENTRY glBindBuffer(GLenum target, GLuint buffer) {
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
-    if (buffer != 0) [bufferObjectNames addObject:@(buffer)];
+    if (!gl4metalValidBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (buffer != 0) {
+        // Buffer names need not come from glGenBuffers; first binding creates
+        // the object in desktop OpenGL. Keep the generated-name set only for
+        // distinguishing names reserved by glGenBuffers before that bind.
+        [bufferGeneratedNames removeObject:@(buffer)];
+        [bufferObjectNames addObject:@(buffer)];
+    }
     ctx.boundBuffers[@(target)] = @(buffer);
 
     if (ctx.currentVAO != 0) {
@@ -1020,26 +1614,66 @@ void APIENTRY glBindBuffer(GLenum target, GLuint buffer) {
 }
 
 void APIENTRY glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
-    (void)index; (void)offset; (void)size;
+    NSUInteger maxBindings = target == GL_UNIFORM_BUFFER ? 24 :
+                             target == GL_TRANSFORM_FEEDBACK_BUFFER ? 4 : 0;
+    if (maxBindings == 0) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (index >= maxBindings || offset < 0 || size <= 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    id<MTLBuffer> mtlBuffer = bufferObjects[@(buffer)];
+    if (buffer == 0 || ![bufferObjectNames containsObject:@(buffer)] || !mtlBuffer) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    if ((size_t)offset > mtlBuffer.length || (size_t)size > mtlBuffer.length - (size_t)offset) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (target == GL_UNIFORM_BUFFER && ((uint64_t)offset % 256u) != 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
     glBindBuffer(target, buffer);
+    NSMutableDictionary *bindings = ctx.indexedBufferBindings[@(target)];
+    if (!bindings) {
+        bindings = [NSMutableDictionary dictionary];
+        ctx.indexedBufferBindings[@(target)] = bindings;
+    }
+    bindings[@(index)] = @{@"buffer": @(buffer), @"offset": @((GLint64)offset), @"size": @((GLint64)size)};
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
-    (void)index;
+    NSUInteger maxBindings = target == GL_UNIFORM_BUFFER ? 24 :
+                             target == GL_TRANSFORM_FEEDBACK_BUFFER ? 4 : 0;
+    if (maxBindings == 0) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (index >= maxBindings) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (buffer != 0 && ![bufferObjectNames containsObject:@(buffer)]) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
     glBindBuffer(target, buffer);
+    NSMutableDictionary *bindings = ctx.indexedBufferBindings[@(target)];
+    if (!bindings) {
+        bindings = [NSMutableDictionary dictionary];
+        ctx.indexedBufferBindings[@(target)] = bindings;
+    }
+    id<MTLBuffer> mtlBuffer = bufferObjects[@(buffer)];
+    bindings[@(index)] = @{@"buffer": @(buffer), @"offset": @0,
+                           @"size": @((GLint64)(mtlBuffer ? mtlBuffer.length : 0))};
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
+    if (!gl4metalValidBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
 
     if (currentBound == 0) {
-        printf("[gl4metal] ERROR: glBufferData called with no bound buffer for target 0x%X\n", target);
+        gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
 
-    if (size <= 0) {
+    if (size < 0) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
@@ -1054,9 +1688,18 @@ void APIENTRY glBufferData(GLenum target, GLsizeiptr size, const void *data, GLe
         return;
     }
 
+    if (size == 0) {
+        [bufferObjects removeObjectForKey:@(currentBound)];
+        bufferSizes[@(currentBound)] = @0;
+        bufferUsages[@(currentBound)] = @(usage);
+        gl4metalClearIndexCaches();
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
+
     id<MTLBuffer> oldBuffer = bufferObjects[@(currentBound)];
     if (oldBuffer) {
-        [convertedIndexBuffers removeAllObjects];
+        gl4metalClearIndexCaches();
     }
 
     id<MTLBuffer> mtlBuffer = nil;
@@ -1084,14 +1727,25 @@ void APIENTRY glDeleteBuffers(GLsizei n, const GLuint *buffers) {
     for (GLsizei i = 0; i < n; i++) {
         GLuint buffer = buffers[i];
         if (buffer == 0) continue;
+        [bufferGeneratedNames removeObject:@(buffer)];
         [bufferObjectNames removeObject:@(buffer)];
         [bufferObjects removeObjectForKey:@(buffer)];
         [bufferSizes removeObjectForKey:@(buffer)];
         [bufferUsages removeObjectForKey:@(buffer)];
         [mappedBufferPointers removeObjectForKey:@(buffer)];
-        [convertedIndexBuffers removeAllObjects];
+        [mappedBufferOffsets removeObjectForKey:@(buffer)];
+        [mappedBufferLengths removeObjectForKey:@(buffer)];
+        [mappedBufferAccesses removeObjectForKey:@(buffer)];
+        gl4metalClearIndexCaches();
         for (NSNumber *target in [ctx.boundBuffers.allKeys copy]) {
             if ([ctx.boundBuffers[target] unsignedIntValue] == buffer) ctx.boundBuffers[target] = @(0);
+        }
+        for (NSNumber *target in ctx.indexedBufferBindings) {
+            NSMutableDictionary *bindings = ctx.indexedBufferBindings[target];
+            for (NSNumber *index in [bindings.allKeys copy]) {
+                if ([bindings[index][@"buffer"] unsignedIntValue] == buffer)
+                    bindings[index] = @{@"buffer": @0, @"offset": @0, @"size": @0};
+            }
         }
         for (gl4metalVertexArray *vao in vaoObjects.allValues) {
             if (vao->arrayBufferID == buffer) vao->arrayBufferID = 0;
@@ -1105,13 +1759,14 @@ void APIENTRY glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 }
 
 void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
+    if (!gl4metalValidBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
     id<MTLBuffer> buffer = bufferObjects[@(currentBound)];
     if (mappedBufferPointers[@(currentBound)]) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
-    if (!buffer || !data) {
+    if (!buffer || (size > 0 && !data)) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
@@ -1120,6 +1775,8 @@ void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, c
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+
+    if (size == 0) { gl4metalSetError(GL_NO_ERROR); return; }
 
     if (gl4metalSafeResourceUpdatesEnabled() && gl4metalBufferIsInFlight(currentBound)) {
         id<MTLBuffer> replacement = gl4metalCopyBufferForWrite(currentBound, buffer, offset, size, data);
@@ -1131,11 +1788,12 @@ void APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, c
     } else {
         memcpy((char *)[buffer contents] + offset, data, (size_t)size);
     }
-    [convertedIndexBuffers removeAllObjects];
+    gl4metalClearIndexCaches();
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data) {
+    if (!gl4metalValidBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
     id<MTLBuffer> buffer = bufferObjects[@(currentBound)];
     if (!buffer || (size > 0 && !data)) {
@@ -1154,6 +1812,10 @@ void APIENTRY glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size
 void APIENTRY glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
                                   GLintptr readOffset, GLintptr writeOffset,
                                   GLsizeiptr size) {
+    if (!gl4metalValidBufferTarget(readTarget) || !gl4metalValidBufferTarget(writeTarget)) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
     GLuint readBufferName = gl4metalGetBoundBufferForTarget(readTarget);
     GLuint writeBufferName = gl4metalGetBoundBufferForTarget(writeTarget);
     id<MTLBuffer> source = bufferObjects[@(readBufferName)];
@@ -1189,7 +1851,7 @@ void APIENTRY glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
         memcpy((uint8_t *)destination.contents + writeOffset,
                (const uint8_t *)source.contents + readOffset, (size_t)size);
     }
-    [convertedIndexBuffers removeAllObjects];
+    gl4metalClearIndexCaches();
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1216,6 +1878,15 @@ void APIENTRY glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params)
         case GL_BUFFER_MAPPED:
             params[0] = mappedBufferPointers[@(currentBound)] ? GL_TRUE : GL_FALSE;
             break;
+        case GL_BUFFER_ACCESS_FLAGS:
+            params[0] = [mappedBufferAccesses[@(currentBound)] intValue];
+            break;
+        case GL_BUFFER_MAP_OFFSET:
+            params[0] = (GLint)[mappedBufferOffsets[@(currentBound)] longLongValue];
+            break;
+        case GL_BUFFER_MAP_LENGTH:
+            params[0] = (GLint)[mappedBufferLengths[@(currentBound)] longLongValue];
+            break;
         default:
             gl4metalSetError(GL_INVALID_ENUM);
             return;
@@ -1241,6 +1912,12 @@ void APIENTRY glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *par
         case GL_BUFFER_SIZE:
             params[0] = (GLint64)[buffer length];
             break;
+        case GL_BUFFER_MAP_OFFSET:
+            params[0] = [mappedBufferOffsets[@(currentBound)] longLongValue];
+            break;
+        case GL_BUFFER_MAP_LENGTH:
+            params[0] = [mappedBufferLengths[@(currentBound)] longLongValue];
+            break;
         default:
             gl4metalSetError(GL_INVALID_ENUM);
             return;
@@ -1254,17 +1931,68 @@ void APIENTRY glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
 
-    gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     switch (target) {
-        case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING:
+        case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: {
+            if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
             data[0] = (GLint)(vao && index < 16 ? vao->attribs[index].boundVBO : 0);
             break;
-        default:
-            data[0] = 0;
+        }
+        case GL_UNIFORM_BUFFER_BINDING:
+        case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING: {
+            NSUInteger maxBindings = target == GL_UNIFORM_BUFFER_BINDING ? 24 : 4;
+            if (index >= maxBindings) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            NSDictionary *binding = ctx.indexedBufferBindings[@(target == GL_UNIFORM_BUFFER_BINDING
+                ? GL_UNIFORM_BUFFER : GL_TRANSFORM_FEEDBACK_BUFFER)][@(index)];
+            data[0] = [binding[@"buffer"] intValue];
             break;
+        }
+        case GL_SAMPLER_BINDING:
+            if (index >= 32) { gl4metalSetError(GL_INVALID_VALUE); return; }
+            data[0] = (GLint)gl4metalGetSamplerNameForUnit(index);
+            break;
+        default:
+            gl4metalSetError(GL_INVALID_ENUM);
+            return;
     }
 
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetInteger64i_v(GLenum target, GLuint index, GLint64 *data) {
+    if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    GLenum bindingTarget = 0;
+    NSUInteger maxBindings = 0;
+    BOOL wantOffset = NO;
+    if (target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE) {
+        bindingTarget = GL_UNIFORM_BUFFER; maxBindings = 24;
+        wantOffset = target == GL_UNIFORM_BUFFER_START;
+    } else if (target == GL_TRANSFORM_FEEDBACK_BUFFER_START || target == GL_TRANSFORM_FEEDBACK_BUFFER_SIZE) {
+        bindingTarget = GL_TRANSFORM_FEEDBACK_BUFFER; maxBindings = 4;
+        wantOffset = target == GL_TRANSFORM_FEEDBACK_BUFFER_START;
+    } else {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if (index >= maxBindings) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSDictionary *binding = ctx.indexedBufferBindings[@(bindingTarget)][@(index)];
+    data[0] = [binding[wantOffset ? @"offset" : @"size"] longLongValue];
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetInteger64v(GLenum pname, GLint64 *data) {
+    if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (pname == GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT) {
+        data[0] = 256;
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
+    GLint value = 0;
+    glGetIntegerv(pname, &value);
+    data[0] = value;
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -1298,12 +2026,33 @@ void* APIENTRY glMapBuffer(GLenum target, GLenum access) {
 
     void *mapped = [mtlBuffer contents];
     mappedBufferPointers[@(currentBound)] = [NSValue valueWithPointer:mapped];
+    mappedBufferOffsets[@(currentBound)] = @0;
+    mappedBufferLengths[@(currentBound)] = @([mtlBuffer length]);
+    GLbitfield mapFlags = access == GL_READ_ONLY ? GL_MAP_READ_BIT :
+                          access == GL_WRITE_ONLY ? GL_MAP_WRITE_BIT :
+                          (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT);
+    mappedBufferAccesses[@(currentBound)] = @(mapFlags);
     gl4metalSetError(GL_NO_ERROR);
     return mapped;
 }
 
 void *APIENTRY glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
-    (void)access;
+    const GLbitfield validFlags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT |
+        GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT |
+        GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT;
+    if ((access & ~validFlags) != 0) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return NULL;
+    }
+    if ((access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) == 0 ||
+        ((access & GL_MAP_INVALIDATE_RANGE_BIT) && (access & GL_MAP_INVALIDATE_BUFFER_BIT)) ||
+        ((access & GL_MAP_READ_BIT) && (access & (GL_MAP_INVALIDATE_RANGE_BIT |
+                                                  GL_MAP_INVALIDATE_BUFFER_BIT |
+                                                  GL_MAP_UNSYNCHRONIZED_BIT))) ||
+        ((access & GL_MAP_FLUSH_EXPLICIT_BIT) && !(access & GL_MAP_WRITE_BIT))) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return NULL;
+    }
     GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
     if (currentBound == 0 || mappedBufferPointers[@(currentBound)]) {
         gl4metalSetError(GL_INVALID_OPERATION);
@@ -1312,13 +2061,18 @@ void *APIENTRY glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr lengt
     id<MTLBuffer> mtlBuffer = bufferObjects[@(currentBound)];
     if (!mtlBuffer) { gl4metalSetError(GL_INVALID_OPERATION); return NULL; }
 
-    if (offset < 0 || length < 0 || (size_t)offset > (size_t)[mtlBuffer length] || (size_t)length > (size_t)[mtlBuffer length] - (size_t)offset) {
+    if (offset < 0 || length <= 0 || (size_t)offset > (size_t)[mtlBuffer length] || (size_t)length > (size_t)[mtlBuffer length] - (size_t)offset) {
         printf("[gl4metal][BOUNDS] glMapBufferRange OOB: buffer=%u offset=%ld length=%ld bufferLength=%lu\n", currentBound, (long)offset, (long)length, (unsigned long)[mtlBuffer length]);
         gl4metalSetError(GL_INVALID_VALUE);
         return NULL;
     }
     if (gl4metalSafeResourceUpdatesEnabled() && gl4metalBufferIsInFlight(currentBound)) {
-        id<MTLBuffer> replacement = gl4metalCopyBufferForWrite(currentBound, mtlBuffer, 0, (GLsizeiptr)[mtlBuffer length], mtlBuffer.contents);
+        // INVALIDATE_BUFFER explicitly discards the old contents. Avoid copying
+        // the full in-flight allocation only to zero it immediately below.
+        id<MTLBuffer> replacement = (access & GL_MAP_INVALIDATE_BUFFER_BIT)
+            ? [ctx.device newBufferWithLength:mtlBuffer.length options:MTLResourceStorageModeShared]
+            : gl4metalCopyBufferForWrite(currentBound, mtlBuffer, 0,
+                                         (GLsizeiptr)mtlBuffer.length, mtlBuffer.contents);
         if (!replacement) {
             gl4metalSetError(GL_OUT_OF_MEMORY);
             return NULL;
@@ -1326,10 +2080,36 @@ void *APIENTRY glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr lengt
         bufferObjects[@(currentBound)] = replacement;
         mtlBuffer = replacement;
     }
+    if (access & GL_MAP_INVALIDATE_BUFFER_BIT) {
+        memset([mtlBuffer contents], 0, [mtlBuffer length]);
+    } else if (access & GL_MAP_INVALIDATE_RANGE_BIT) {
+        memset((uint8_t *)[mtlBuffer contents] + offset, 0, (size_t)length);
+    }
     gl4metalSetError(GL_NO_ERROR);
     void *mapped = (void *)((char *)[mtlBuffer contents] + offset);
     mappedBufferPointers[@(currentBound)] = [NSValue valueWithPointer:mapped];
+    mappedBufferOffsets[@(currentBound)] = @(offset);
+    mappedBufferLengths[@(currentBound)] = @(length);
+    mappedBufferAccesses[@(currentBound)] = @(access);
     return mapped;
+}
+
+void APIENTRY glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
+    GLuint currentBound = gl4metalGetBoundBufferForTarget(target);
+    NSNumber *flags = mappedBufferAccesses[@(currentBound)];
+    if (currentBound == 0 || !mappedBufferPointers[@(currentBound)] || !flags ||
+        !([flags unsignedIntValue] & GL_MAP_FLUSH_EXPLICIT_BIT)) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    GLintptr mappedLength = (GLintptr)[mappedBufferLengths[@(currentBound)] longLongValue];
+    if (offset < 0 || length < 0 || offset > mappedLength || length > mappedLength - offset) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    // MTLBuffer uses shared storage for GL buffer objects, so writes are
+    // coherent already; validating the explicit flush range is sufficient.
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 GLboolean APIENTRY glUnmapBuffer(GLenum target) {
@@ -1339,6 +2119,10 @@ GLboolean APIENTRY glUnmapBuffer(GLenum target) {
         return GL_FALSE;
     }
     [mappedBufferPointers removeObjectForKey:@(currentBound)];
+    [mappedBufferOffsets removeObjectForKey:@(currentBound)];
+    [mappedBufferLengths removeObjectForKey:@(currentBound)];
+    [mappedBufferAccesses removeObjectForKey:@(currentBound)];
+    gl4metalClearIndexCaches();
     gl4metalSetError(GL_NO_ERROR);
     return GL_TRUE;
 }
@@ -1363,6 +2147,14 @@ void APIENTRY glGetBufferPointerv(GLenum target, GLenum pname, void **params) {
 
 // VAO State
 void APIENTRY glBindVertexArray(GLuint array) {
+    if (!ctx) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    if (array != 0 && ![vertexArrayGeneratedNames containsObject:@(array)]) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
     // VAO changes alter the vertex descriptor selected by the current GL
     // program. The pipeline cache key includes VAO state, but a previously
     // resolved ctx.pipelineState must never survive a VAO switch.
@@ -1925,8 +2717,14 @@ void APIENTRY glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (!ctx) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
     for (GLsizei i = 0; i < n; i++) {
+        if (arrays[i] == 0) continue;
         if (ctx.currentVAO == arrays[i]) glBindVertexArray(0);
+        [vertexArrayGeneratedNames removeObject:@(arrays[i])];
         [vaoObjects removeObjectForKey:@(arrays[i])];
     }
     gl4metalSetError(GL_NO_ERROR);
@@ -1943,6 +2741,11 @@ GLboolean APIENTRY glIsVertexArray(GLuint array) {
 GLuint APIENTRY glCreateShader(GLenum type) {
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
+        return 0;
+    }
+    if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER &&
+        type != GL_GEOMETRY_SHADER) {
+        gl4metalSetError(GL_INVALID_ENUM);
         return 0;
     }
 
@@ -1962,6 +2765,10 @@ void APIENTRY glShaderSource(GLuint shader, GLsizei count, const GLchar *const*s
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (shaderSources.find(shader) == shaderSources.end()) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
 
     std::string source;
     for (GLsizei i = 0; i < count; i++) {
@@ -1972,11 +2779,6 @@ void APIENTRY glShaderSource(GLuint shader, GLsizei count, const GLchar *const*s
         } else {
             source.append(string[i]);
         }
-
-        // GLSL line comments run until a newline. glShaderSource() may be
-        // called with a source string that does not end in one, so always
-        // terminate each input string before concatenating the next one.
-        source.push_back('\n');
     }
 
     shaderSources[shader].glslSource = source;
@@ -1993,13 +2795,25 @@ void APIENTRY glCompileShader(GLuint shader) {
     }
 
     GLShader &shaderData = it->second;
+    shaderData.compiled = false;
+    shaderData.mslSource.clear();
+    shaderData.infoLog.clear();
+    shaderData.mtlLibrary = nil;
+    shaderData.mtlFunction = nil;
+    shaderCompileStatus[@(shader)] = @(GL_FALSE);
 
-    std::string mslSource = transpileGLSLToMSL(shaderData.type, shaderData.glslSource);
+    std::string transpileDiagnostics;
+    std::string mslSource = transpileGLSLToMSL(
+        shaderData.type, shaderData.glslSource, &transpileDiagnostics);
+    shaderData.mslSource = mslSource;
     if (mslSource.empty()) {
         shaderData.compiled = false;
         shaderCompileStatus[@(shader)] = @(GL_FALSE);
-        shaderInfoLog[@(shader)] = @"Failed to transpile GLSL to MSL";
-        gl4metalSetError(GL_INVALID_OPERATION);
+        shaderData.infoLog = transpileDiagnostics.empty()
+            ? "Failed to transpile GLSL to MSL" : transpileDiagnostics;
+        NSString *message = [NSString stringWithUTF8String:shaderData.infoLog.c_str()];
+        shaderInfoLog[@(shader)] = message ?: @"Failed to transpile GLSL to MSL";
+        gl4metalSetError(GL_NO_ERROR);
         return;
     }
 
@@ -2011,11 +2825,13 @@ void APIENTRY glCompileShader(GLuint shader) {
     shaderData.mtlLibrary = [ctx.device newLibraryWithSource:sourceCode options:options error:&error];
 
     if (error || !shaderData.mtlLibrary) {
-        printf("[gl4metal] Shader compilation error: %s\n", error.localizedDescription.UTF8String);
+        NSString *message = error.localizedDescription ?: @"Unknown Metal shader compilation error";
+        printf("[gl4metal] Shader compilation error: %s\n", message.UTF8String);
         shaderData.compiled = false;
         shaderCompileStatus[@(shader)] = @(GL_FALSE);
-        shaderInfoLog[@(shader)] = error.localizedDescription ?: @"Unknown error";
-        gl4metalSetError(GL_INVALID_OPERATION);
+        shaderData.infoLog = message.UTF8String ? message.UTF8String : "Unknown Metal shader compilation error";
+        shaderInfoLog[@(shader)] = message;
+        gl4metalSetError(GL_NO_ERROR);
         return;
     }
 
@@ -2029,10 +2845,12 @@ void APIENTRY glCompileShader(GLuint shader) {
 
     if (!shaderData.compiled) {
         shaderInfoLog[@(shader)] = @"Metal library compiled, but shader entry point 'main0' was not found";
-        gl4metalSetError(GL_INVALID_OPERATION);
+        shaderData.infoLog = "Metal library compiled, but shader entry point 'main0' was not found";
+        gl4metalSetError(GL_NO_ERROR);
         return;
     }
 
+    shaderData.infoLog.clear();
     shaderInfoLog[@(shader)] = @"";
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -2139,6 +2957,17 @@ void APIENTRY glLinkProgram(GLuint program) {
 
     programLinkStatus[@(program)] = @(GL_TRUE);
     programInfoLog[@(program)] = @"";
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glValidateProgram(GLuint program) {
+    if (!programShaders[@(program)]) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    // Pipeline resources are checked when the Metal render pipeline is
+    // assembled. At validation time, the GL-visible prerequisite is that the
+    // executable linked successfully.
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -2298,6 +3127,26 @@ MTLVertexDescriptor *gl4metalCreateVertexDescriptorForCurrentVAO(void) {
 
 static id<MTLRenderPipelineState> gl4metalResolveCurrentPipeline(void) {
     if (!ctx) return nil;
+    if (gl4metalColorLogicOperationEnabled &&
+        (gl4metalLogicOperation != GL_COPY || currentProgram == 0)) {
+        // Metal has no fixed-function bitwise color logic operation. Reject
+        // draws we cannot reproduce instead of silently rendering the wrong
+        // pixels. GL_COPY is handled in the real-program pipeline below.
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return nil;
+    }
+    if (currentProgram != 0) {
+        NSDictionary *indices = programFragDataIndices[@(currentProgram)];
+        for (NSDictionary *output in gl4metalProgramFragmentOutputs(currentProgram)) {
+            if ([indices[output[@"name"]] unsignedIntValue] == 1 &&
+                indices[output[@"name"]] != nil) {
+                // Metal does not expose the dual-source fragment output pair
+                // required by GL index 1.
+                gl4metalSetError(GL_INVALID_OPERATION);
+                return nil;
+            }
+        }
+    }
 
     // A GL program's pipeline must be resolved from the current program and
     // current vertex-array layout. Never let the generic fallback pipeline
@@ -2337,9 +3186,11 @@ void APIENTRY glUseProgram(GLuint program) {
         return;
     }
 
+    GLuint previousProgram = currentProgram;
     if (program == 0) {
         currentProgram = 0;
         ctx.pipelineState = defaultFallbackPipeline;
+        gl4metalFinalizePendingProgramDelete(previousProgram);
         gl4metalSetError(GL_NO_ERROR);
         return;
     }
@@ -2352,6 +3203,8 @@ void APIENTRY glUseProgram(GLuint program) {
     }
 
     currentProgram = program;
+    if (previousProgram != program)
+        gl4metalFinalizePendingProgramDelete(previousProgram);
 
     // Do not keep the previous program/fallback pipeline merely because the
     // program ID is unchanged. Resolve against the current VAO/layout.
@@ -2368,34 +3221,86 @@ void APIENTRY glUseProgram(GLuint program) {
 }
 
 GLint APIENTRY glGetUniformLocation(GLuint program, const GLchar *name) {
-    if (!ctx || program == 0 || name == nil) {
+    if (!ctx || name == nil) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return -1;
+    }
+    if (!programShaders[@(program)]) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return -1;
+    }
+    if (![programLinkStatus[@(program)] boolValue]) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return -1;
     }
 
-    GLint location = gl4metalResolveLocationFromName(program, name);
-    uniformLocationNames[@(location)] = [NSString stringWithUTF8String:name];
+    NSString *requestedName = [NSString stringWithUTF8String:name];
+    BOOL active = NO;
+    for (NSDictionary *variable in gl4metalProgramVariables(program, YES)) {
+        NSString *activeName = variable[@"name"];
+        NSString *baseName = [activeName hasSuffix:@"[0]"]
+            ? [activeName substringToIndex:activeName.length - 3] : activeName;
+        if ([requestedName isEqualToString:activeName] || [requestedName isEqualToString:baseName]) {
+            active = YES;
+            break;
+        }
+    }
+    if (!active) {
+        gl4metalSetError(GL_NO_ERROR);
+        return -1;
+    }
+
+    NSString *canonicalName = requestedName;
+    if ([requestedName hasSuffix:@"[0]"]) {
+        canonicalName = [requestedName substringToIndex:requestedName.length - 3];
+    }
+    GLint location = gl4metalResolveLocationFromName(program, canonicalName.UTF8String);
+    while (uniformLocationNames[@(location)] &&
+           (![uniformLocationPrograms[@(location)] isEqual:@(program)] ||
+            ![uniformLocationNames[@(location)] isEqualToString:canonicalName])) {
+        location = location == INT_MAX ? 1 : location + 1;
+    }
+    uniformLocationNames[@(location)] = canonicalName;
     uniformLocationPrograms[@(location)] = @(program);
     gl4metalSetError(GL_NO_ERROR);
     return location;
 }
 
+static BOOL gl4metalUniformUpdateUnavailable(GLint location) {
+    if (location == -1) return YES;
+    NSNumber *owner = uniformLocationPrograms[@(location)];
+    if (!ctx || currentProgram == 0 || !owner || owner.unsignedIntValue != currentProgram) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return YES;
+    }
+    return NO;
+}
+
+static void gl4metalStoreUniformRaw(GLint location, const void *bytes, NSUInteger length) {
+    if (location < 0 || !bytes || length == 0) return;
+    uniformRawValues[@(location)] = [NSData dataWithBytes:bytes length:length];
+}
+
 void APIENTRY glUniform1f(GLint location, GLfloat v0) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     uniform1fValues[@(location)] = [NSValue valueWithBytes:&v0 objCType:@encode(GLfloat)];
+    gl4metalStoreUniformRaw(location, &v0, sizeof(v0));
     gl4metalTraceUniformUpdate(location, "1f", &v0, 1);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform1i(GLint location, GLint v0) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     uniform1iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, &v0, sizeof(v0));
     if (gl4metalResourceTraceEnabled()) {
         gl4metalTraceUniformUpdateInt(location, "1i", &v0, 1);
     }
@@ -2403,51 +3308,62 @@ void APIENTRY glUniform1i(GLint location, GLint v0) {
 }
 
 void APIENTRY glUniform2f(GLint location, GLfloat v0, GLfloat v1) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     GLfloat values[2] = { v0, v1 };
     uniform2fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[2])];
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform2i(GLint location, GLint v0, GLint v1) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
-    uniform2iValues[@(location)] = [NSNumber numberWithLongLong:(long long)((v0 << 16) | (v1 & 0xffff))];
+    GLint values[2] = { v0, v1 };
+    uniform2iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     GLfloat values[3] = { v0, v1, v2 };
     uniform3fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[3])];
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform3i(GLint location, GLint v0, GLint v1, GLint v2) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     GLint values[3] = { v0, v1, v2 };
-    uniform3iValues[@(location)] = [NSNumber numberWithLongLong:(long long)((uint32_t)v0 | ((uint32_t)v1 << 8) | ((uint32_t)v2 << 16))];
+    uniform3iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
     GLfloat values[4] = { v0, v1, v2, v3 };
     uniform4fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[4])];
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalTraceUniformUpdate(location, "4f", values, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
@@ -2456,84 +3372,149 @@ void APIENTRY glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
 // the scalar convenience calls. Keep the first vector in the same uniform
 // store consumed by the Metal resource bridge.
 void APIENTRY glUniform2fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     GLfloat values[2] = { value[0], value[1] };
     uniform2fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[2])];
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 2 * sizeof(GLfloat));
     gl4metalTraceUniformUpdate(location, "2fv", values, 2);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform3fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     GLfloat values[3] = { value[0], value[1], value[2] };
     uniform3fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[3])];
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 3 * sizeof(GLfloat));
     gl4metalTraceUniformUpdate(location, "3fv", values, 3);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     GLfloat values[4] = { value[0], value[1], value[2], value[3] };
     uniform4fValues[@(location)] = [NSValue valueWithBytes:values objCType:@encode(GLfloat[4])];
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 4 * sizeof(GLfloat));
     gl4metalTraceUniformUpdate(location, "4fv", values, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
-    uniform4iValues[@(location)] = @(v0);
     GLint values[4] = { v0, v1, v2, v3 };
+    uniform4iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values));
     gl4metalTraceUniformUpdateInt(location, "4i", values, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform2iv(GLint location, GLsizei count, const GLint *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     uniform2iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 2 * sizeof(GLint));
     gl4metalTraceUniformUpdateInt(location, "2iv", value, 2);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform3iv(GLint location, GLsizei count, const GLint *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     uniform3iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 3 * sizeof(GLint));
     gl4metalTraceUniformUpdateInt(location, "3iv", value, 3);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform4iv(GLint location, GLsizei count, const GLint *value) {
-    if (!ctx || count <= 0 || !value) {
+    if (count < 0 || (count > 0 && !value)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     uniform4iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 4 * sizeof(GLint));
     gl4metalTraceUniformUpdateInt(location, "4iv", value, 4);
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glUniform1ui(GLint location, GLuint v0) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
+    uniform1iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, &v0, sizeof(v0));
+    gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform2ui(GLint location, GLuint v0, GLuint v1) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
+    GLuint values[2] = {v0, v1}; uniform2iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values)); gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
+    GLuint values[3] = {v0, v1, v2}; uniform3iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values)); gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3) {
+    if (gl4metalUniformUpdateUnavailable(location)) return;
+    GLuint values[4] = {v0, v1, v2, v3}; uniform4iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, values, sizeof(values)); gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform1uiv(GLint location, GLsizei count, const GLuint *value) {
+    if (count < 0 || (count > 0 && !value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
+    uniform1iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * sizeof(GLuint));
+    gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform2uiv(GLint location, GLsizei count, const GLuint *value) {
+    if (count < 0 || (count > 0 && !value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
+    uniform2iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 2 * sizeof(GLuint));
+    gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform3uiv(GLint location, GLsizei count, const GLuint *value) {
+    if (count < 0 || (count > 0 && !value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
+    uniform3iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 3 * sizeof(GLuint));
+    gl4metalSetError(GL_NO_ERROR);
+}
+void APIENTRY glUniform4uiv(GLint location, GLsizei count, const GLuint *value) {
+    if (count < 0 || (count > 0 && !value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
+    uniform4iValues[@(location)] = @(value[0]);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * 4 * sizeof(GLuint));
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glUniform1fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (!ctx || count <= 0 || value == NULL) {
+    if (count < 0 || (count > 0 && value == NULL)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     // A scalar uniform uploaded with glUniform1fv(count=1) must retain a
     // scalar Objective-C type. Storing it as GLfloat[4] makes a later
     // getValue:size: with a 4-byte destination throw NSInvalidArgumentException.
@@ -2547,146 +3528,73 @@ void APIENTRY glUniform1fv(GLint location, GLsizei count, const GLfloat *value) 
         GLfloat scalar = value[0];
         uniform1fValues[@(location)] = [NSValue valueWithBytes:&scalar objCType:@encode(GLfloat)];
     }
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * sizeof(GLfloat));
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *value) {
-    if (!ctx || count <= 0 || value == NULL) {
+    if (count < 0 || (count > 0 && value == NULL)) {
         gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
     GLint v0 = count > 0 ? value[0] : 0;
     uniform1iValues[@(location)] = @(v0);
+    gl4metalStoreUniformRaw(location, value, (NSUInteger)count * sizeof(GLint));
     if (gl4metalResourceTraceEnabled()) {
         gl4metalTraceUniformUpdateInt(location, "1iv", &v0, 1);
     }
     gl4metalSetError(GL_NO_ERROR);
 }
 
-void APIENTRY glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
+static void gl4metalSetUniformMatrix(GLint location, GLsizei count, GLboolean transpose,
+                                     const GLfloat *value, NSUInteger columns, NSUInteger rows) {
+    if (count < 0 || (count > 0 && !value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (count == 0 || gl4metalUniformUpdateUnavailable(location)) return;
+    NSUInteger matrixElements = columns * rows;
+    NSMutableData *canonical = [NSMutableData dataWithLength:(NSUInteger)count * matrixElements * sizeof(GLfloat)];
+    GLfloat *destination = (GLfloat *)canonical.mutableBytes;
+    for (GLsizei matrixIndex = 0; matrixIndex < count; ++matrixIndex) {
+        const GLfloat *source = value + (NSUInteger)matrixIndex * matrixElements;
+        GLfloat *matrix = destination + (NSUInteger)matrixIndex * matrixElements;
+        if (transpose) {
+            for (NSUInteger c = 0; c < columns; ++c)
+                for (NSUInteger r = 0; r < rows; ++r)
+                    matrix[c * rows + r] = source[r * columns + c];
+        } else {
+            memcpy(matrix, source, matrixElements * sizeof(GLfloat));
+        }
     }
-    GLfloat matrix[4] = { value[0], value[1], value[2], value[3] };
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[4])];
+    uniformRawValues[@(location)] = canonical;
     NSString *currentName = uniformLocationNames[@(location)];
-    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
-        gl4metalUpdateFallbackMVP(value, count * 2 * 2);
+    if (columns == 4 && rows == 4 && count > 0 &&
+        ([currentName isEqualToString:@"uMVP"] ||
+         [currentName isEqualToString:@"uModelViewProjectionMatrix"] ||
+         [currentName isEqualToString:@"uProjection"])) {
+        gl4metalUpdateFallbackMVP(destination, 16);
     }
     gl4metalSetError(GL_NO_ERROR);
 }
 
-void APIENTRY glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[9] = { 0 };
-    for (GLsizei i = 0; i < MIN(count * 3 * 3, 9); ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[9])];
-    NSString *currentName = uniformLocationNames[@(location)];
-    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
-        gl4metalUpdateFallbackMVP(value, count * 3 * 3);
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[16] = { 0 };
-    for (GLsizei i = 0; i < 16; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[16])];
-    NSString *currentName = uniformLocationNames[@(location)];
-    if ([currentName isEqualToString:@"uMVP"] || [currentName isEqualToString:@"uModelViewProjectionMatrix"] || [currentName isEqualToString:@"uProjection"]) {
-        gl4metalUpdateFallbackMVP(value, 16);
-    }
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix2x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[6] = { 0 };
-    for (GLsizei i = 0; i < 6; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[6])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix3x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[6] = { 0 };
-    for (GLsizei i = 0; i < 6; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[6])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix2x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[8] = { 0 };
-    for (GLsizei i = 0; i < 8; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[8])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix4x2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[8] = { 0 };
-    for (GLsizei i = 0; i < 8; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[8])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[12] = { 0 };
-    for (GLsizei i = 0; i < 12; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[12])];
-    gl4metalSetError(GL_NO_ERROR);
-}
-
-void APIENTRY glUniformMatrix4x3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    (void)count; (void)transpose;
-    if (!ctx || value == NULL) {
-        gl4metalSetError(GL_INVALID_VALUE);
-        return;
-    }
-    GLfloat matrix[12] = { 0 };
-    for (GLsizei i = 0; i < 12; ++i) matrix[i] = value[i];
-    uniformMatrix4fvValues[@(location)] = [NSValue valueWithBytes:matrix objCType:@encode(GLfloat[12])];
-    gl4metalSetError(GL_NO_ERROR);
-}
+void APIENTRY glUniformMatrix2fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 2, 2); }
+void APIENTRY glUniformMatrix3fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 3, 3); }
+void APIENTRY glUniformMatrix4fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 4, 4); }
+void APIENTRY glUniformMatrix2x3fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 2, 3); }
+void APIENTRY glUniformMatrix3x2fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 3, 2); }
+void APIENTRY glUniformMatrix2x4fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 2, 4); }
+void APIENTRY glUniformMatrix4x2fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 4, 2); }
+void APIENTRY glUniformMatrix3x4fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 3, 4); }
+void APIENTRY glUniformMatrix4x3fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { gl4metalSetUniformMatrix(l, n, t, v, 4, 3); }
 
 void APIENTRY glDeleteProgram(GLuint program) {
-    if (program == 0) return;
-    [programShaders removeObjectForKey:@(program)];
-    [programLinkStatus removeObjectForKey:@(program)];
-    [programInfoLog removeObjectForKey:@(program)];
+    if (program == 0 || !programShaders[@(program)]) return;
+    if (program == currentProgram) {
+        if (!gl4metalPendingProgramDeletes)
+            gl4metalPendingProgramDeletes = [NSMutableSet set];
+        [gl4metalPendingProgramDeletes addObject:@(program)];
+    } else {
+        gl4metalDestroyProgramStorage(program);
+    }
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -2702,16 +3610,15 @@ void APIENTRY glDeleteShader(GLuint shader) {
     for (NSNumber *programId in programShaders) {
         NSArray<NSNumber *> *attached = programShaders[programId];
         if ([attached containsObject:@(shader)]) {
-            printf("[gl4metal] glDeleteShader(%u): shader remains alive because program %u still references it\n", shader, programId.unsignedIntValue);
+            if (!gl4metalPendingShaderDeletes)
+                gl4metalPendingShaderDeletes = [NSMutableSet set];
+            [gl4metalPendingShaderDeletes addObject:@(shader)];
             gl4metalSetError(GL_NO_ERROR);
             return;
         }
     }
 
-    [shaderTypes removeObjectForKey:@(shader)];
-    shaderSources.erase(shader);
-    [shaderCompileStatus removeObjectForKey:@(shader)];
-    [shaderInfoLog removeObjectForKey:@(shader)];
+    gl4metalDeleteShaderStorage(shader);
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -2750,6 +3657,219 @@ void APIENTRY glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
     gl4metalSetError(GL_NO_ERROR);
 }
 
+static GLenum gl4metalGLSLTypeToGLenum(NSString *type) {
+    static NSDictionary<NSString *, NSNumber *> *types = nil;
+    if (!types) {
+        types = @{
+            @"float": @(GL_FLOAT), @"vec2": @(GL_FLOAT_VEC2), @"vec3": @(GL_FLOAT_VEC3), @"vec4": @(GL_FLOAT_VEC4),
+            @"int": @(GL_INT), @"ivec2": @(GL_INT_VEC2), @"ivec3": @(GL_INT_VEC3), @"ivec4": @(GL_INT_VEC4),
+            @"uint": @(GL_UNSIGNED_INT), @"uvec2": @(GL_UNSIGNED_INT_VEC2), @"uvec3": @(GL_UNSIGNED_INT_VEC3), @"uvec4": @(GL_UNSIGNED_INT_VEC4),
+            @"bool": @(GL_BOOL), @"bvec2": @(GL_BOOL_VEC2), @"bvec3": @(GL_BOOL_VEC3), @"bvec4": @(GL_BOOL_VEC4),
+            @"mat2": @(GL_FLOAT_MAT2), @"mat3": @(GL_FLOAT_MAT3), @"mat4": @(GL_FLOAT_MAT4),
+            @"mat2x3": @(GL_FLOAT_MAT2x3), @"mat2x4": @(GL_FLOAT_MAT2x4),
+            @"mat3x2": @(GL_FLOAT_MAT3x2), @"mat3x4": @(GL_FLOAT_MAT3x4),
+            @"mat4x2": @(GL_FLOAT_MAT4x2), @"mat4x3": @(GL_FLOAT_MAT4x3),
+            @"sampler1D": @(GL_SAMPLER_1D), @"sampler2D": @(GL_SAMPLER_2D), @"sampler3D": @(GL_SAMPLER_3D),
+            @"samplerCube": @(GL_SAMPLER_CUBE), @"sampler1DShadow": @(GL_SAMPLER_1D_SHADOW),
+            @"sampler2DShadow": @(GL_SAMPLER_2D_SHADOW), @"samplerCubeShadow": @(GL_SAMPLER_CUBE_SHADOW),
+            @"sampler1DArray": @(GL_SAMPLER_1D_ARRAY), @"sampler2DArray": @(GL_SAMPLER_2D_ARRAY),
+            @"sampler1DArrayShadow": @(GL_SAMPLER_1D_ARRAY_SHADOW), @"sampler2DArrayShadow": @(GL_SAMPLER_2D_ARRAY_SHADOW),
+            @"isampler2D": @(GL_INT_SAMPLER_2D), @"isampler3D": @(GL_INT_SAMPLER_3D), @"isamplerCube": @(GL_INT_SAMPLER_CUBE),
+            @"usampler2D": @(GL_UNSIGNED_INT_SAMPLER_2D), @"usampler3D": @(GL_UNSIGNED_INT_SAMPLER_3D), @"usamplerCube": @(GL_UNSIGNED_INT_SAMPLER_CUBE)
+        };
+    }
+    return types[type].unsignedIntValue;
+}
+
+static NSArray<NSDictionary<NSString *, id> *> *gl4metalProgramVariables(GLuint program, BOOL uniforms) {
+    NSMutableString *allSources = [NSMutableString string];
+    NSArray<NSNumber *> *attached = programShaders[@(program)];
+    for (NSNumber *shaderID in attached) {
+        auto shader = shaderSources.find(shaderID.unsignedIntValue);
+        if (shader == shaderSources.end()) continue;
+        if (!uniforms && shader->second.type != GL_VERTEX_SHADER) continue;
+        [allSources appendFormat:@"\n%s\n", shader->second.glslSource.c_str()];
+    }
+    if (allSources.length == 0) return @[];
+
+    NSRegularExpression *comments = [NSRegularExpression regularExpressionWithPattern:
+        @"/\\*[\\s\\S]*?\\*/|//[^\\r\\n]*" options:0 error:nil];
+    NSString *source = [comments stringByReplacingMatchesInString:allSources options:0
+        range:NSMakeRange(0, allSources.length) withTemplate:@" "];
+    NSString *storage = uniforms ? @"uniform" : @"(?:in|attribute)";
+    NSString *pattern = [NSString stringWithFormat:
+        @"(?:layout\\s*\\([^)]*\\)\\s*)?(?:flat\\s+|smooth\\s+|noperspective\\s+|centroid\\s+|sample\\s+)*"
+         @"%@\\s+(?:(?:lowp|mediump|highp|readonly|writeonly|coherent|volatile|restrict)\\s+)*"
+         @"([A-Za-z_][A-Za-z0-9_]*)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?:\\[\\s*([0-9]+)\\s*\\])?\\s*;", storage];
+    NSRegularExpression *declarations = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    NSMutableArray<NSDictionary<NSString *, id> *> *variables = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenNames = [NSMutableSet set];
+    NSArray<NSTextCheckingResult *> *matches = [declarations matchesInString:source options:0 range:NSMakeRange(0, source.length)];
+    for (NSTextCheckingResult *match in matches) {
+        NSString *typeName = [source substringWithRange:[match rangeAtIndex:1]];
+        NSString *name = [source substringWithRange:[match rangeAtIndex:2]];
+        if ([seenNames containsObject:name]) continue;
+        NSString *identifierPattern = [NSString stringWithFormat:@"\\b%@\\b", [NSRegularExpression escapedPatternForString:name]];
+        NSRegularExpression *identifier = [NSRegularExpression regularExpressionWithPattern:identifierPattern options:0 error:nil];
+        NSUInteger occurrences = [identifier numberOfMatchesInString:source options:0 range:NSMakeRange(0, source.length)];
+        NSUInteger declarationsOfName = 0;
+        for (NSTextCheckingResult *candidate in matches) {
+            if ([[source substringWithRange:[candidate rangeAtIndex:2]] isEqualToString:name]) declarationsOfName++;
+        }
+        if (occurrences <= declarationsOfName) continue;
+
+        GLint size = 1;
+        if ([match rangeAtIndex:3].location != NSNotFound) {
+            size = MAX(1, [[source substringWithRange:[match rangeAtIndex:3]] intValue]);
+        }
+        NSString *activeName = size > 1 ? [name stringByAppendingString:@"[0]"] : name;
+        [variables addObject:@{@"name": activeName, @"type": @(gl4metalGLSLTypeToGLenum(typeName)), @"size": @(size)}];
+        [seenNames addObject:name];
+    }
+    return variables;
+}
+
+static NSArray<NSDictionary<NSString *, id> *> *gl4metalProgramFragmentOutputs(GLuint program) {
+    NSMutableString *allSources = [NSMutableString string];
+    for (NSNumber *shaderID in programShaders[@(program)]) {
+        auto shader = shaderSources.find(shaderID.unsignedIntValue);
+        if (shader != shaderSources.end() && shader->second.type == GL_FRAGMENT_SHADER)
+            [allSources appendFormat:@"\n%s\n", shader->second.glslSource.c_str()];
+    }
+    if (allSources.length == 0) return @[];
+    NSRegularExpression *comments = [NSRegularExpression regularExpressionWithPattern:
+        @"/\\*[\\s\\S]*?\\*/|//[^\\r\\n]*" options:0 error:nil];
+    NSString *source = [comments stringByReplacingMatchesInString:allSources options:0
+        range:NSMakeRange(0, allSources.length) withTemplate:@" "];
+    NSString *pattern = @"(?:layout\\s*\\(([^)]*)\\)\\s*)?(?:flat\\s+|smooth\\s+|noperspective\\s+|centroid\\s+|sample\\s+)*"
+        @"out\\s+(?:(?:lowp|mediump|highp)\\s+)*[A-Za-z_][A-Za-z0-9_]*\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?:\\[\\s*([0-9]+)\\s*\\])?\\s*;";
+    NSRegularExpression *declarations = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    NSArray<NSTextCheckingResult *> *matches = [declarations matchesInString:source options:0 range:NSMakeRange(0, source.length)];
+    NSMutableArray *outputs = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSTextCheckingResult *match in matches) {
+        NSString *name = [source substringWithRange:[match rangeAtIndex:2]];
+        if ([seen containsObject:name]) continue;
+        NSString *escaped = [NSRegularExpression escapedPatternForString:name];
+        NSRegularExpression *identifier = [NSRegularExpression regularExpressionWithPattern:
+            [NSString stringWithFormat:@"\\b%@\\b", escaped] options:0 error:nil];
+        if ([identifier numberOfMatchesInString:source options:0 range:NSMakeRange(0, source.length)] < 2) continue;
+        GLint location = -1;
+        if ([match rangeAtIndex:1].location != NSNotFound) {
+            NSString *layout = [source substringWithRange:[match rangeAtIndex:1]];
+            NSRegularExpression *locationPattern = [NSRegularExpression regularExpressionWithPattern:
+                @"location\\s*=\\s*([0-9]+)" options:NSRegularExpressionCaseInsensitive error:nil];
+            NSTextCheckingResult *locationMatch = [locationPattern firstMatchInString:layout options:0 range:NSMakeRange(0, layout.length)];
+            if (locationMatch) location = [[layout substringWithRange:[locationMatch rangeAtIndex:1]] intValue];
+        }
+        [outputs addObject:@{@"name": name, @"location": @(location)}];
+        [seen addObject:name];
+    }
+    return outputs;
+}
+
+void APIENTRY glBindFragDataLocation(GLuint program, GLuint colorNumber, const GLchar *name) {
+    if (!name || !programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (colorNumber >= 1) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSString *outputName = [NSString stringWithUTF8String:name];
+    if (!outputName) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSMutableDictionary *bindings = programFragDataBindings[@(program)];
+    if (!bindings) {
+        bindings = [NSMutableDictionary dictionary];
+        programFragDataBindings[@(program)] = bindings;
+    }
+    bindings[outputName] = @(colorNumber);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+GLint APIENTRY glGetFragDataLocation(GLuint program, const GLchar *name) {
+    if (!name || !programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return -1; }
+    if (![programLinkStatus[@(program)] boolValue]) { gl4metalSetError(GL_INVALID_OPERATION); return -1; }
+    NSString *outputName = [NSString stringWithUTF8String:name];
+    if (!outputName) { gl4metalSetError(GL_INVALID_VALUE); return -1; }
+    NSArray *outputs = gl4metalProgramFragmentOutputs(program);
+    for (NSUInteger i = 0; i < outputs.count; ++i) {
+        NSDictionary *output = outputs[i];
+        if ([output[@"name"] isEqualToString:outputName]) {
+            NSNumber *bound = programFragDataBindings[@(program)][outputName];
+            GLint location = bound ? bound.intValue : [output[@"location"] intValue];
+            if (location < 0 && i == 0) location = 0;
+            gl4metalSetError(GL_NO_ERROR);
+            return location < 1 ? location : -1;
+        }
+    }
+    gl4metalSetError(GL_NO_ERROR);
+    return -1;
+}
+
+void APIENTRY glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber,
+                                            GLuint index, const GLchar *name) {
+    if (!name || !programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (colorNumber >= 1 || index > 1) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSString *outputName = [NSString stringWithUTF8String:name];
+    if (!outputName) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSMutableDictionary *locations = programFragDataBindings[@(program)];
+    if (!locations) { locations = [NSMutableDictionary dictionary]; programFragDataBindings[@(program)] = locations; }
+    NSMutableDictionary *indices = programFragDataIndices[@(program)];
+    if (!indices) { indices = [NSMutableDictionary dictionary]; programFragDataIndices[@(program)] = indices; }
+    locations[outputName] = @(colorNumber);
+    indices[outputName] = @(index);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+GLint APIENTRY glGetFragDataIndex(GLuint program, const GLchar *name) {
+    if (!name || !programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return -1; }
+    if (![programLinkStatus[@(program)] boolValue]) { gl4metalSetError(GL_INVALID_OPERATION); return -1; }
+    NSString *outputName = [NSString stringWithUTF8String:name];
+    if (!outputName) { gl4metalSetError(GL_INVALID_VALUE); return -1; }
+    for (NSDictionary *output in gl4metalProgramFragmentOutputs(program)) {
+        if ([output[@"name"] isEqualToString:outputName]) {
+            NSNumber *index = programFragDataIndices[@(program)][outputName];
+            gl4metalSetError(GL_NO_ERROR);
+            return index ? index.intValue : 0;
+        }
+    }
+    gl4metalSetError(GL_NO_ERROR);
+    return -1;
+}
+
+static void gl4metalCopyActiveVariableName(NSString *name, GLsizei bufSize, GLsizei *length, GLchar *outName) {
+    if (length) *length = 0;
+    if (bufSize <= 0) return;
+    size_t copyLength = MIN([name lengthOfBytesUsingEncoding:NSUTF8StringEncoding], (NSUInteger)(bufSize - 1));
+    if (!outName) return;
+    NSData *utf8 = [name dataUsingEncoding:NSUTF8StringEncoding];
+    if (copyLength) memcpy(outName, utf8.bytes, copyLength);
+    outName[copyLength] = '\0';
+    if (length) *length = (GLsizei)copyLength;
+}
+
+void APIENTRY glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    if (bufSize < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (![programLinkStatus[@(program)] boolValue]) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    NSArray *variables = gl4metalProgramVariables(program, NO);
+    if (index >= variables.count) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSDictionary *variable = variables[index];
+    if (size) *size = [variable[@"size"] intValue];
+    if (type) *type = [variable[@"type"] unsignedIntValue];
+    gl4metalCopyActiveVariableName(variable[@"name"], bufSize, length, name);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+    if (bufSize < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (![programLinkStatus[@(program)] boolValue]) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    NSArray *variables = gl4metalProgramVariables(program, YES);
+    if (index >= variables.count) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    NSDictionary *variable = variables[index];
+    if (size) *size = [variable[@"size"] intValue];
+    if (type) *type = [variable[@"type"] unsignedIntValue];
+    gl4metalCopyActiveVariableName(variable[@"name"], bufSize, length, name);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
     if (!params) {
         gl4metalSetError(GL_INVALID_VALUE);
@@ -2765,6 +3885,9 @@ void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
         case GL_LINK_STATUS:
             params[0] = [programLinkStatus[@(program)] boolValue] ? GL_TRUE : GL_FALSE;
             break;
+        case GL_VALIDATE_STATUS:
+            params[0] = [programLinkStatus[@(program)] boolValue] ? GL_TRUE : GL_FALSE;
+            break;
         case GL_INFO_LOG_LENGTH: {
             NSString *message = programInfoLog[@(program)] ?: @"";
             params[0] = message.length ? (GLint)strlen(message.UTF8String) + 1 : 0;
@@ -2774,11 +3897,27 @@ void APIENTRY glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
             params[0] = (GLint)[programShaders[@(program)] count];
             break;
         case GL_ACTIVE_UNIFORMS:
-            params[0] = 4;
+            params[0] = [programLinkStatus[@(program)] boolValue]
+                ? (GLint)gl4metalProgramVariables(program, YES).count : 0;
             break;
         case GL_ACTIVE_ATTRIBUTES:
-            params[0] = 8;
+            params[0] = [programLinkStatus[@(program)] boolValue]
+                ? (GLint)gl4metalProgramVariables(program, NO).count : 0;
             break;
+        case GL_ACTIVE_UNIFORM_MAX_LENGTH: {
+            NSUInteger maxLength = 0;
+            for (NSDictionary *variable in ([programLinkStatus[@(program)] boolValue] ? gl4metalProgramVariables(program, YES) : @[]))
+                maxLength = MAX(maxLength, [variable[@"name"] lengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 1);
+            params[0] = (GLint)maxLength;
+            break;
+        }
+        case GL_ACTIVE_ATTRIBUTE_MAX_LENGTH: {
+            NSUInteger maxLength = 0;
+            for (NSDictionary *variable in ([programLinkStatus[@(program)] boolValue] ? gl4metalProgramVariables(program, NO) : @[]))
+                maxLength = MAX(maxLength, [variable[@"name"] lengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 1);
+            params[0] = (GLint)maxLength;
+            break;
+        }
         default:
             gl4metalSetError(GL_INVALID_ENUM);
             return;
@@ -2850,6 +3989,10 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
             data[2] = ctx.scissorRect.width; data[3] = ctx.scissorRect.height;
             break;
         }
+        case GL_DEPTH_RANGE:
+            data[0] = (GLint)ctx.depthRangeNear;
+            data[1] = (GLint)ctx.depthRangeFar;
+            break;
         case GL_CURRENT_PROGRAM:
             data[0] = (GLint)currentProgram;
             break;
@@ -2861,6 +4004,15 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
             break;
         case GL_VERTEX_ARRAY_BINDING:
             data[0] = (GLint)ctx.currentVAO;
+            break;
+        case GL_ACTIVE_TEXTURE:
+            data[0] = (GLint)(GL_TEXTURE0 + gl4metalGetActiveTextureUnit());
+            break;
+        case GL_TEXTURE_BINDING_2D:
+            data[0] = (GLint)gl4metalGetTextureNameForUnit(gl4metalGetActiveTextureUnit());
+            break;
+        case GL_TEXTURE_BINDING_1D:
+            data[0] = (GLint)gl4metalGetTextureNameForTarget(gl4metalGetActiveTextureUnit(), GL_TEXTURE_1D);
             break;
         case GL_MAX_VERTEX_ATTRIBS:
             data[0] = 16;
@@ -2900,8 +4052,43 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
         case GL_READ_FRAMEBUFFER_BINDING:
             data[0] = (GLint)ctx.currentReadFramebuffer;
             break;
+        case GL_DRAW_BUFFER:
+            data[0] = (GLint)ctx.drawBuffer;
+            break;
+        case GL_READ_BUFFER:
+            data[0] = (GLint)ctx.readBuffer;
+            break;
         case GL_DEPTH_FUNC:
             data[0] = (GLint)ctx.depthFunc;
+            break;
+        case GL_LOGIC_OP_MODE:
+            data[0] = (GLint)gl4metalLogicOperation;
+            break;
+        case GL_CLAMP_VERTEX_COLOR:
+            data[0] = (GLint)gl4metalClampVertexColor;
+            break;
+        case GL_CLAMP_FRAGMENT_COLOR:
+            data[0] = (GLint)gl4metalClampFragmentColor;
+            break;
+        case GL_CLAMP_READ_COLOR:
+            data[0] = (GLint)gl4metalClampReadColor;
+            break;
+        case GL_POINT_SIZE_MIN:
+            data[0] = (GLint)gl4metalPointSizeMin;
+            break;
+        case GL_POINT_SIZE_MAX:
+            data[0] = (GLint)gl4metalPointSizeMax;
+            break;
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            data[0] = (GLint)gl4metalPointFadeThreshold;
+            break;
+        case GL_POINT_DISTANCE_ATTENUATION:
+            data[0] = (GLint)gl4metalPointDistanceAttenuation[0];
+            data[1] = (GLint)gl4metalPointDistanceAttenuation[1];
+            data[2] = (GLint)gl4metalPointDistanceAttenuation[2];
+            break;
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            data[0] = (GLint)gl4metalPointSpriteCoordOrigin;
             break;
         case GL_CULL_FACE_MODE:
             data[0] = (GLint)ctx.cullFace;
@@ -2933,6 +4120,27 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
         case GL_STENCIL_PASS_DEPTH_PASS:
             data[0] = (GLint)ctx.stencilDepthPass;
             break;
+        case GL_STENCIL_BACK_FUNC:
+            data[0] = (GLint)ctx.stencilBackFunc;
+            break;
+        case GL_STENCIL_BACK_FAIL:
+            data[0] = (GLint)ctx.stencilBackFail;
+            break;
+        case GL_STENCIL_BACK_PASS_DEPTH_FAIL:
+            data[0] = (GLint)ctx.stencilBackDepthFail;
+            break;
+        case GL_STENCIL_BACK_PASS_DEPTH_PASS:
+            data[0] = (GLint)ctx.stencilBackDepthPass;
+            break;
+        case GL_STENCIL_BACK_REF:
+            data[0] = ctx.stencilBackRef;
+            break;
+        case GL_STENCIL_BACK_VALUE_MASK:
+            data[0] = (GLint)ctx.stencilBackReadMask;
+            break;
+        case GL_STENCIL_BACK_WRITEMASK:
+            data[0] = (GLint)ctx.stencilBackWriteMask;
+            break;
         case GL_BLEND_SRC:
         case GL_BLEND_SRC_RGB:
             data[0] = (GLint)ctx.blendSrcRGB;
@@ -2946,6 +4154,15 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint *data) {
             break;
         case GL_BLEND_DST_ALPHA:
             data[0] = (GLint)ctx.blendDstAlpha;
+            break;
+        case GL_SAMPLE_COVERAGE_VALUE:
+            data[0] = (GLint)ctx.sampleCoverageValue;
+            break;
+        case GL_SAMPLE_COVERAGE_INVERT:
+            data[0] = (GLint)ctx.sampleCoverageInvert;
+            break;
+        case GL_PRIMITIVE_RESTART_INDEX:
+            data[0] = (GLint)ctx.primitiveRestartIndex;
             break;
         case GL_MAJOR_VERSION:
             data[0] = 3;
@@ -2982,12 +4199,58 @@ void APIENTRY glGetFloatv(GLenum pname, GLfloat *data) {
         case GL_LINE_WIDTH:
             data[0] = ctx.lineWidth;
             break;
+        case GL_ALIASED_LINE_WIDTH_RANGE:
+        case GL_SMOOTH_LINE_WIDTH_RANGE:
+            data[0] = 1.0f;
+            data[1] = 1.0f;
+            break;
+        case GL_SMOOTH_LINE_WIDTH_GRANULARITY:
+            data[0] = 1.0f;
+            break;
         case GL_POINT_SIZE:
             data[0] = ctx.pointSize;
+            break;
+        case GL_POINT_SIZE_MIN:
+            data[0] = gl4metalPointSizeMin;
+            break;
+        case GL_POINT_SIZE_MAX:
+            data[0] = gl4metalPointSizeMax;
+            break;
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            data[0] = gl4metalPointFadeThreshold;
+            break;
+        case GL_POINT_DISTANCE_ATTENUATION:
+            data[0] = gl4metalPointDistanceAttenuation[0];
+            data[1] = gl4metalPointDistanceAttenuation[1];
+            data[2] = gl4metalPointDistanceAttenuation[2];
+            break;
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            data[0] = (GLfloat)gl4metalPointSpriteCoordOrigin;
             break;
         case GL_BLEND_COLOR:
             data[0] = ctx.blendConstantRed; data[1] = ctx.blendConstantGreen;
             data[2] = ctx.blendConstantBlue; data[3] = ctx.blendConstantAlpha;
+            break;
+        case GL_DEPTH_RANGE:
+            data[0] = (GLfloat)ctx.depthRangeNear;
+            data[1] = (GLfloat)ctx.depthRangeFar;
+            break;
+        case GL_SAMPLE_COVERAGE_VALUE:
+            data[0] = ctx.sampleCoverageValue;
+            break;
+        case GL_SAMPLE_COVERAGE_INVERT:
+            data[0] = (GLfloat)ctx.sampleCoverageInvert;
+            break;
+        case GL_PRIMITIVE_RESTART_INDEX:
+            data[0] = (GLfloat)ctx.primitiveRestartIndex;
+            break;
+        case GL_VIEWPORT:
+            data[0] = (GLfloat)ctx.viewport.x; data[1] = (GLfloat)ctx.viewport.y;
+            data[2] = (GLfloat)ctx.viewport.width; data[3] = (GLfloat)ctx.viewport.height;
+            break;
+        case GL_SCISSOR_BOX:
+            data[0] = (GLfloat)ctx.scissorRect.x; data[1] = (GLfloat)ctx.scissorRect.y;
+            data[2] = (GLfloat)ctx.scissorRect.width; data[3] = (GLfloat)ctx.scissorRect.height;
             break;
         default:
             gl4metalSetError(GL_INVALID_ENUM);
@@ -3026,6 +4289,18 @@ void APIENTRY glGetBooleanv(GLenum pname, GLboolean *data) {
         case GL_DEPTH_WRITEMASK:
             data[0] = ctx.depthWriteEnabled;
             break;
+        case GL_SAMPLE_COVERAGE_VALUE:
+            data[0] = ctx.sampleCoverageValue != 0.0f ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_SAMPLE_COVERAGE_INVERT:
+            data[0] = ctx.sampleCoverageInvert;
+            break;
+        case GL_PRIMITIVE_RESTART:
+            data[0] = ctx.primitiveRestartEnabled;
+            break;
+        case GL_COLOR_LOGIC_OP:
+            data[0] = gl4metalColorLogicOperationEnabled;
+            break;
         case GL_COLOR_WRITEMASK:
             data[0] = ctx.colorMaskRed; data[1] = ctx.colorMaskGreen;
             data[2] = ctx.colorMaskBlue; data[3] = ctx.colorMaskAlpha;
@@ -3058,12 +4333,50 @@ void APIENTRY glGetDoublev(GLenum pname, GLdouble *data) {
         case GL_LINE_WIDTH:
             data[0] = ctx.lineWidth;
             break;
+        case GL_ALIASED_LINE_WIDTH_RANGE:
+        case GL_SMOOTH_LINE_WIDTH_RANGE:
+            data[0] = 1.0;
+            data[1] = 1.0;
+            break;
+        case GL_SMOOTH_LINE_WIDTH_GRANULARITY:
+            data[0] = 1.0;
+            break;
         case GL_POINT_SIZE:
             data[0] = ctx.pointSize;
+            break;
+        case GL_POINT_SIZE_MIN:
+            data[0] = gl4metalPointSizeMin;
+            break;
+        case GL_POINT_SIZE_MAX:
+            data[0] = gl4metalPointSizeMax;
+            break;
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            data[0] = gl4metalPointFadeThreshold;
+            break;
+        case GL_POINT_DISTANCE_ATTENUATION:
+            data[0] = gl4metalPointDistanceAttenuation[0];
+            data[1] = gl4metalPointDistanceAttenuation[1];
+            data[2] = gl4metalPointDistanceAttenuation[2];
+            break;
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            data[0] = gl4metalPointSpriteCoordOrigin;
             break;
         case GL_BLEND_COLOR:
             data[0] = ctx.blendConstantRed; data[1] = ctx.blendConstantGreen;
             data[2] = ctx.blendConstantBlue; data[3] = ctx.blendConstantAlpha;
+            break;
+        case GL_DEPTH_RANGE:
+            data[0] = ctx.depthRangeNear;
+            data[1] = ctx.depthRangeFar;
+            break;
+        case GL_SAMPLE_COVERAGE_VALUE:
+            data[0] = ctx.sampleCoverageValue;
+            break;
+        case GL_SAMPLE_COVERAGE_INVERT:
+            data[0] = ctx.sampleCoverageInvert;
+            break;
+        case GL_PRIMITIVE_RESTART_INDEX:
+            data[0] = ctx.primitiveRestartIndex;
             break;
         case GL_VIEWPORT:
             data[0] = ctx.viewport.x; data[1] = ctx.viewport.y;
@@ -3081,8 +4394,16 @@ void APIENTRY glGetDoublev(GLenum pname, GLdouble *data) {
 }
 
 void APIENTRY glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) {
-    if (!ctx || program == 0 || name == NULL) {
+    if (name == NULL || index >= 16) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    if (!programShaders[@(program)]) {
+        gl4metalSetError(GL_INVALID_VALUE);
         return;
     }
 
@@ -3098,34 +4419,84 @@ void APIENTRY glBindAttribLocation(GLuint program, GLuint index, const GLchar *n
 
 GLint APIENTRY glGetAttribLocation(GLuint program, const GLchar *name) {
     if (!ctx || name == NULL) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return -1;
+    }
+    if (!programShaders[@(program)]) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return -1;
+    }
+    if (![programLinkStatus[@(program)] boolValue]) {
         gl4metalSetError(GL_INVALID_OPERATION);
         return -1;
     }
 
-    if (program != 0) {
-        NSMutableDictionary<NSNumber *, NSString *> *bindings = programAttribBindings[@(program)];
-        if (bindings) {
-            NSString *attributeName = [NSString stringWithUTF8String:name];
+    GLShader *vertexShader = nullptr;
+    for (NSNumber *shaderID in programShaders[@(program)]) {
+        auto shader = shaderSources.find(shaderID.unsignedIntValue);
+        if (shader != shaderSources.end() && shader->second.type == GL_VERTEX_SHADER) {
+            vertexShader = &shader->second;
+            break;
+        }
+    }
+    if (!vertexShader) { gl4metalSetError(GL_NO_ERROR); return -1; }
+
+    NSString *source = [NSString stringWithUTF8String:vertexShader->glslSource.c_str()];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:
+        @"(?:layout\\s*\\(\\s*location\\s*=\\s*([0-9]+)[^)]*\\)\\s*)?"
+         @"(?:flat\\s+|smooth\\s+|noperspective\\s+|centroid\\s+|sample\\s+)*"
+         @"(?:in|attribute)\\s+(?:(?:lowp|mediump|highp)\\s+)?"
+         @"([A-Za-z_][A-Za-z0-9_]*)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?:\\[[^]]+\\])?\\s*;"
+        options:0 error:nil];
+    NSString *requestedName = [NSString stringWithUTF8String:name];
+    NSMutableDictionary<NSNumber *, NSString *> *bindings = programAttribBindings[@(program)];
+    NSMutableSet<NSNumber *> *usedLocations = [NSMutableSet set];
+    NSUInteger nextImplicitLocation = 0;
+    GLint result = -1;
+    NSArray<NSTextCheckingResult *> *matches = [regex matchesInString:source options:0 range:NSMakeRange(0, source.length)];
+    for (NSTextCheckingResult *match in matches) {
+        NSString *type = [source substringWithRange:[match rangeAtIndex:2]];
+        NSString *attributeName = [source substringWithRange:[match rangeAtIndex:3]];
+        NSString *locationText = ([match rangeAtIndex:1].location == NSNotFound)
+            ? nil : [source substringWithRange:[match rangeAtIndex:1]];
+        NSUInteger location = NSNotFound;
+        if (locationText) {
+            location = (NSUInteger)locationText.integerValue;
+        } else {
             for (NSNumber *index in bindings) {
                 if ([bindings[index] isEqualToString:attributeName]) {
-                    gl4metalSetError(GL_NO_ERROR);
-                    return (GLint)[index intValue];
+                    location = index.unsignedIntegerValue;
+                    break;
                 }
             }
         }
-    }
+        if (location == NSNotFound) {
+            while ([usedLocations containsObject:@(nextImplicitLocation)]) nextImplicitLocation++;
+            location = nextImplicitLocation;
+        }
+        NSUInteger advance = [type isEqualToString:@"mat2"] ? 2 :
+                             [type isEqualToString:@"mat3"] ? 3 :
+                             [type isEqualToString:@"mat4"] ? 4 : 1;
+        nextImplicitLocation = MAX(nextImplicitLocation, location + advance);
+        for (NSUInteger slot = 0; slot < advance; ++slot) [usedLocations addObject:@(location + slot)];
 
-    NSString *attributeName = [NSString stringWithUTF8String:name];
-    NSArray *knownNames = @[@"aPosition", @"aPos", @"position", @"vertex",
-                            @"aNormal", @"normal", @"aTexCoord", @"aUV",
-                            @"aColor", @"color"];
-    NSInteger index = [knownNames indexOfObject:attributeName];
+        if (![attributeName isEqualToString:requestedName]) continue;
+        // An input declaration optimized out of the linked program is not an
+        // active attribute and therefore has no location.
+        NSRegularExpression *identifier = [NSRegularExpression regularExpressionWithPattern:
+            [NSString stringWithFormat:@"\\b%@\\b", [NSRegularExpression escapedPatternForString:attributeName]]
+            options:0 error:nil];
+        if ([identifier numberOfMatchesInString:source options:0 range:NSMakeRange(0, source.length)] > 1 && location < 16) {
+            result = (GLint)location;
+        }
+        break;
+    }
     gl4metalSetError(GL_NO_ERROR);
-    return (index == NSNotFound) ? -1 : (GLint)index;
+    return result;
 }
 
 void APIENTRY glVertexAttrib1f(GLuint index, GLfloat x) {
-    if (index >= 16) return;
+    if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
     gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     if (!vao) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     vao->attribs[index].currentValue[0] = x;
@@ -3147,7 +4518,7 @@ void APIENTRY glVertexAttrib1fv(GLuint index, const GLfloat *v) {
 }
 
 void APIENTRY glVertexAttrib2f(GLuint index, GLfloat x, GLfloat y) {
-    if (index >= 16) return;
+    if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
     gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     if (!vao) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     vao->attribs[index].currentValue[0] = x;
@@ -3169,7 +4540,7 @@ void APIENTRY glVertexAttrib2fv(GLuint index, const GLfloat *v) {
 }
 
 void APIENTRY glVertexAttrib3f(GLuint index, GLfloat x, GLfloat y, GLfloat z) {
-    if (index >= 16) return;
+    if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
     gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     if (!vao) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     vao->attribs[index].currentValue[0] = x;
@@ -3191,7 +4562,7 @@ void APIENTRY glVertexAttrib3fv(GLuint index, const GLfloat *v) {
 }
 
 void APIENTRY glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
-    if (index >= 16) return;
+    if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
     gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
     if (!vao) { gl4metalSetError(GL_INVALID_OPERATION); return; }
     vao->attribs[index].currentValue[0] = x;
@@ -3211,6 +4582,107 @@ void APIENTRY glVertexAttrib4fv(GLuint index, const GLfloat *v) {
     }
     glVertexAttrib4f(index, v[0], v[1], v[2], v[3]);
 }
+
+// OpenGL exposes double, short, and integer overloads for generic current
+// attributes. The current GL value is stored as floating point unless the
+// explicit glVertexAttribI* entrypoint is used.
+void APIENTRY glVertexAttrib1d(GLuint i, GLdouble x) { glVertexAttrib1f(i, (GLfloat)x); }
+void APIENTRY glVertexAttrib1dv(GLuint i, const GLdouble *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib1d(i, v[0]); }
+void APIENTRY glVertexAttrib1s(GLuint i, GLshort x) { glVertexAttrib1f(i, (GLfloat)x); }
+void APIENTRY glVertexAttrib1sv(GLuint i, const GLshort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib1s(i, v[0]); }
+void APIENTRY glVertexAttrib2d(GLuint i, GLdouble x, GLdouble y) { glVertexAttrib2f(i, (GLfloat)x, (GLfloat)y); }
+void APIENTRY glVertexAttrib2dv(GLuint i, const GLdouble *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib2d(i, v[0], v[1]); }
+void APIENTRY glVertexAttrib2s(GLuint i, GLshort x, GLshort y) { glVertexAttrib2f(i, (GLfloat)x, (GLfloat)y); }
+void APIENTRY glVertexAttrib2sv(GLuint i, const GLshort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib2s(i, v[0], v[1]); }
+void APIENTRY glVertexAttrib3d(GLuint i, GLdouble x, GLdouble y, GLdouble z) { glVertexAttrib3f(i, (GLfloat)x, (GLfloat)y, (GLfloat)z); }
+void APIENTRY glVertexAttrib3dv(GLuint i, const GLdouble *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib3d(i, v[0], v[1], v[2]); }
+void APIENTRY glVertexAttrib3s(GLuint i, GLshort x, GLshort y, GLshort z) { glVertexAttrib3f(i, (GLfloat)x, (GLfloat)y, (GLfloat)z); }
+void APIENTRY glVertexAttrib3sv(GLuint i, const GLshort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib3s(i, v[0], v[1], v[2]); }
+void APIENTRY glVertexAttrib4d(GLuint i, GLdouble x, GLdouble y, GLdouble z, GLdouble w) { glVertexAttrib4f(i, (GLfloat)x, (GLfloat)y, (GLfloat)z, (GLfloat)w); }
+void APIENTRY glVertexAttrib4dv(GLuint i, const GLdouble *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4d(i, v[0], v[1], v[2], v[3]); }
+void APIENTRY glVertexAttrib4s(GLuint i, GLshort x, GLshort y, GLshort z, GLshort w) { glVertexAttrib4f(i, (GLfloat)x, (GLfloat)y, (GLfloat)z, (GLfloat)w); }
+void APIENTRY glVertexAttrib4sv(GLuint i, const GLshort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4s(i, v[0], v[1], v[2], v[3]); }
+void APIENTRY glVertexAttrib4bv(GLuint i, const GLbyte *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
+void APIENTRY glVertexAttrib4iv(GLuint i, const GLint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4f(i, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+void APIENTRY glVertexAttrib4ubv(GLuint i, const GLubyte *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
+void APIENTRY glVertexAttrib4uiv(GLuint i, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4f(i, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+void APIENTRY glVertexAttrib4usv(GLuint i, const GLushort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttrib4f(i, v[0], v[1], v[2], v[3]); }
+
+static GLfloat gl4metalNormalizeSigned(GLint value, GLdouble maximum) {
+    return (GLfloat)fmax(-1.0, (GLdouble)value / maximum);
+}
+void APIENTRY glVertexAttrib4Nbv(GLuint i, const GLbyte *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glVertexAttrib4f(i, gl4metalNormalizeSigned(v[0], SCHAR_MAX), gl4metalNormalizeSigned(v[1], SCHAR_MAX), gl4metalNormalizeSigned(v[2], SCHAR_MAX), gl4metalNormalizeSigned(v[3], SCHAR_MAX));
+}
+void APIENTRY glVertexAttrib4Nsv(GLuint i, const GLshort *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glVertexAttrib4f(i, gl4metalNormalizeSigned(v[0], SHRT_MAX), gl4metalNormalizeSigned(v[1], SHRT_MAX), gl4metalNormalizeSigned(v[2], SHRT_MAX), gl4metalNormalizeSigned(v[3], SHRT_MAX));
+}
+void APIENTRY glVertexAttrib4Niv(GLuint i, const GLint *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glVertexAttrib4f(i, gl4metalNormalizeSigned(v[0], INT_MAX), gl4metalNormalizeSigned(v[1], INT_MAX), gl4metalNormalizeSigned(v[2], INT_MAX), gl4metalNormalizeSigned(v[3], INT_MAX));
+}
+void APIENTRY glVertexAttrib4Nub(GLuint i, GLubyte x, GLubyte y, GLubyte z, GLubyte w) {
+    glVertexAttrib4f(i, x / 255.0f, y / 255.0f, z / 255.0f, w / 255.0f);
+}
+void APIENTRY glVertexAttrib4Nubv(GLuint i, const GLubyte *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glVertexAttrib4Nub(i, v[0], v[1], v[2], v[3]);
+}
+void APIENTRY glVertexAttrib4Nusv(GLuint i, const GLushort *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glVertexAttrib4f(i, v[0] / 65535.0f, v[1] / 65535.0f, v[2] / 65535.0f, v[3] / 65535.0f);
+}
+void APIENTRY glVertexAttrib4Nuiv(GLuint i, const GLuint *v) {
+    if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    const GLdouble maximum = 4294967295.0;
+    glVertexAttrib4f(i, (GLfloat)(v[0] / maximum), (GLfloat)(v[1] / maximum), (GLfloat)(v[2] / maximum), (GLfloat)(v[3] / maximum));
+}
+
+static void gl4metalSetIntegerCurrentAttrib(GLuint index, GLint size,
+                                             const GLint *signedValues,
+                                             const GLuint *unsignedValues) {
+    if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
+    if (!vao) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    gl4metalVertexAttrib *attrib = &vao->attribs[index];
+    for (GLint component = 0; component < 4; ++component) {
+        GLint defaultValue = component == 3 ? 1 : 0;
+        GLuint defaultUnsignedValue = component == 3 ? 1u : 0u;
+        if (unsignedValues) {
+            attrib->currentUIntValue[component] = component < size ? unsignedValues[component] : defaultUnsignedValue;
+        } else {
+            attrib->currentUIntValue[component] = (GLuint)(component < size ? signedValues[component] : defaultValue);
+        }
+        if (signedValues) {
+            attrib->currentIntValue[component] = component < size ? signedValues[component] : defaultValue;
+        } else {
+            attrib->currentIntValue[component] = (GLint)(component < size ? unsignedValues[component] : defaultUnsignedValue);
+        }
+    }
+    attrib->currentValueIsInteger = GL_TRUE;
+    attrib->currentValueIsUnsigned = unsignedValues ? GL_TRUE : GL_FALSE;
+    gl4metalUpdateConstantVertexAttribute(index);
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glVertexAttribI1i(GLuint i, GLint x) { gl4metalSetIntegerCurrentAttrib(i, 1, &x, NULL); }
+void APIENTRY glVertexAttribI1ui(GLuint i, GLuint x) { gl4metalSetIntegerCurrentAttrib(i, 1, NULL, &x); }
+void APIENTRY glVertexAttribI2i(GLuint i, GLint x, GLint y) { GLint v[2] = {x,y}; gl4metalSetIntegerCurrentAttrib(i, 2, v, NULL); }
+void APIENTRY glVertexAttribI2ui(GLuint i, GLuint x, GLuint y) { GLuint v[2] = {x,y}; gl4metalSetIntegerCurrentAttrib(i, 2, NULL, v); }
+void APIENTRY glVertexAttribI3i(GLuint i, GLint x, GLint y, GLint z) { GLint v[3] = {x,y,z}; gl4metalSetIntegerCurrentAttrib(i, 3, v, NULL); }
+void APIENTRY glVertexAttribI3ui(GLuint i, GLuint x, GLuint y, GLuint z) { GLuint v[3] = {x,y,z}; gl4metalSetIntegerCurrentAttrib(i, 3, NULL, v); }
+void APIENTRY glVertexAttribI1iv(GLuint i, const GLint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 1, v, NULL); }
+void APIENTRY glVertexAttribI1uiv(GLuint i, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 1, NULL, v); }
+void APIENTRY glVertexAttribI2iv(GLuint i, const GLint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 2, v, NULL); }
+void APIENTRY glVertexAttribI2uiv(GLuint i, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 2, NULL, v); }
+void APIENTRY glVertexAttribI3iv(GLuint i, const GLint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 3, v, NULL); }
+void APIENTRY glVertexAttribI3uiv(GLuint i, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } gl4metalSetIntegerCurrentAttrib(i, 3, NULL, v); }
+void APIENTRY glVertexAttribI4bv(GLuint i, const GLbyte *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } GLint wide[4] = {v[0],v[1],v[2],v[3]}; gl4metalSetIntegerCurrentAttrib(i, 4, wide, NULL); }
+void APIENTRY glVertexAttribI4sv(GLuint i, const GLshort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } GLint wide[4] = {v[0],v[1],v[2],v[3]}; gl4metalSetIntegerCurrentAttrib(i, 4, wide, NULL); }
+void APIENTRY glVertexAttribI4ubv(GLuint i, const GLubyte *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } GLuint wide[4] = {v[0],v[1],v[2],v[3]}; gl4metalSetIntegerCurrentAttrib(i, 4, NULL, wide); }
+void APIENTRY glVertexAttribI4usv(GLuint i, const GLushort *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } GLuint wide[4] = {v[0],v[1],v[2],v[3]}; gl4metalSetIntegerCurrentAttrib(i, 4, NULL, wide); }
 
 void APIENTRY glVertexAttribI4i(GLuint index, GLint x, GLint y, GLint z, GLint w) {
     if (index >= 16) return;
@@ -3250,42 +4722,166 @@ void APIENTRY glVertexAttribI4uiv(GLuint index, const GLuint *v) {
     glVertexAttribI4ui(index, v[0], v[1], v[2], v[3]);
 }
 
-void APIENTRY glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
-    (void)program;
-    if (!ctx || !params) {
-        gl4metalSetError(GL_INVALID_OPERATION);
+static GLint gl4metalSignExtendPacked(GLuint value, GLuint width) {
+    GLuint shift = 32u - width;
+    return (GLint)(value << shift) >> shift;
+}
+
+static void gl4metalVertexAttribPacked(GLuint index, GLenum type, GLboolean normalized,
+                                       GLuint packed, NSUInteger components) {
+    if (type != GL_INT_2_10_10_10_REV && type != GL_UNSIGNED_INT_2_10_10_10_REV) {
+        gl4metalSetError(GL_INVALID_ENUM);
         return;
     }
-    NSValue *value = uniform1fValues[@(location)];
-    if (value) {
-        GLfloat v = 0.0f;
-        [value getValue:&v];
-        params[0] = v;
-    } else {
-        params[0] = 0.0f;
+    BOOL isSigned = type == GL_INT_2_10_10_10_REV;
+    const GLuint widths[4] = {10, 10, 10, 2};
+    const GLuint shifts[4] = {0, 10, 20, 30};
+    GLfloat value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    for (NSUInteger component = 0; component < components; ++component) {
+        GLuint width = widths[component];
+        GLuint mask = (1u << width) - 1u;
+        GLuint raw = (packed >> shifts[component]) & mask;
+        if (isSigned) {
+            GLint signedValue = gl4metalSignExtendPacked(raw, width);
+            value[component] = normalized
+                ? (GLfloat)fmax(-1.0, (GLdouble)signedValue / (GLdouble)((1u << (width - 1)) - 1u))
+                : (GLfloat)signedValue;
+        } else {
+            value[component] = normalized
+                ? (GLfloat)((GLdouble)raw / (GLdouble)mask)
+                : (GLfloat)raw;
+        }
     }
+    glVertexAttrib4f(index, value[0], value[1], value[2], value[3]);
+}
+
+void APIENTRY glVertexAttribP1ui(GLuint i, GLenum t, GLboolean n, GLuint v) { gl4metalVertexAttribPacked(i,t,n,v,1); }
+void APIENTRY glVertexAttribP2ui(GLuint i, GLenum t, GLboolean n, GLuint v) { gl4metalVertexAttribPacked(i,t,n,v,2); }
+void APIENTRY glVertexAttribP3ui(GLuint i, GLenum t, GLboolean n, GLuint v) { gl4metalVertexAttribPacked(i,t,n,v,3); }
+void APIENTRY glVertexAttribP4ui(GLuint i, GLenum t, GLboolean n, GLuint v) { gl4metalVertexAttribPacked(i,t,n,v,4); }
+void APIENTRY glVertexAttribP1uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttribP1ui(i,t,n,v[0]); }
+void APIENTRY glVertexAttribP2uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttribP2ui(i,t,n,v[0]); }
+void APIENTRY glVertexAttribP3uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttribP3ui(i,t,n,v[0]); }
+void APIENTRY glVertexAttribP4uiv(GLuint i, GLenum t, GLboolean n, const GLuint *v) { if (!v) { gl4metalSetError(GL_INVALID_VALUE); return; } glVertexAttribP4ui(i,t,n,v[0]); }
+
+static BOOL gl4metalValidateUniformQuery(GLuint program, GLint location) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return NO; }
+    if (!programShaders[@(program)]) { gl4metalSetError(GL_INVALID_VALUE); return NO; }
+    if (![programLinkStatus[@(program)] boolValue]) { gl4metalSetError(GL_INVALID_OPERATION); return NO; }
+    NSNumber *owner = uniformLocationPrograms[@(location)];
+    if (location < 0 || !owner || owner.unsignedIntValue != program) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return NO;
+    }
+    return YES;
+}
+
+static GLenum gl4metalUniformTypeForLocation(GLuint program, GLint location) {
+    NSString *name = uniformLocationNames[@(location)];
+    for (NSDictionary *variable in gl4metalProgramVariables(program, YES)) {
+        NSString *activeName = variable[@"name"];
+        if ([activeName isEqualToString:name] ||
+            ([activeName hasSuffix:@"[0]"] && [[activeName substringToIndex:activeName.length - 3] isEqualToString:name])) {
+            return [variable[@"type"] unsignedIntValue];
+        }
+    }
+    return 0;
+}
+
+static BOOL gl4metalTypeIsUnsignedInteger(GLenum type) {
+    return type == GL_UNSIGNED_INT || type == GL_UNSIGNED_INT_VEC2 ||
+           type == GL_UNSIGNED_INT_VEC3 || type == GL_UNSIGNED_INT_VEC4;
+}
+static BOOL gl4metalTypeIsInteger(GLenum type) {
+    return type == GL_INT || type == GL_INT_VEC2 || type == GL_INT_VEC3 || type == GL_INT_VEC4 ||
+           type == GL_BOOL || type == GL_BOOL_VEC2 || type == GL_BOOL_VEC3 || type == GL_BOOL_VEC4;
+}
+
+static void gl4metalGetUniformValues(GLuint program, GLint location, void *params, GLenum requestedType) {
+    NSData *raw = uniformRawValues[@(location)];
+    if (raw.length > 0) {
+        GLenum storedType = gl4metalUniformTypeForLocation(program, location);
+        NSUInteger count = raw.length / sizeof(uint32_t);
+        if (gl4metalTypeIsInteger(storedType) || gl4metalTypeIsUnsignedInteger(storedType)) {
+            if (requestedType == GL_FLOAT) {
+                GLfloat *out = (GLfloat *)params;
+                if (gl4metalTypeIsUnsignedInteger(storedType)) {
+                    const GLuint *in = (const GLuint *)raw.bytes;
+                    for (NSUInteger i = 0; i < count; ++i) out[i] = (GLfloat)in[i];
+                } else {
+                    const GLint *in = (const GLint *)raw.bytes;
+                    for (NSUInteger i = 0; i < count; ++i) out[i] = (GLfloat)in[i];
+                }
+            } else if (requestedType == GL_UNSIGNED_INT) {
+                GLuint *out = (GLuint *)params;
+                if (gl4metalTypeIsUnsignedInteger(storedType)) memcpy(out, raw.bytes, raw.length);
+                else { const GLint *in = (const GLint *)raw.bytes; for (NSUInteger i = 0; i < count; ++i) out[i] = (GLuint)in[i]; }
+            } else {
+                GLint *out = (GLint *)params;
+                if (gl4metalTypeIsUnsignedInteger(storedType)) { const GLuint *in = (const GLuint *)raw.bytes; for (NSUInteger i = 0; i < count; ++i) out[i] = (GLint)in[i]; }
+                else memcpy(out, raw.bytes, raw.length);
+            }
+        } else if (requestedType == GL_FLOAT) {
+            memcpy(params, raw.bytes, raw.length);
+        } else if (requestedType == GL_UNSIGNED_INT) {
+            const GLfloat *in = (const GLfloat *)raw.bytes; GLuint *out = (GLuint *)params;
+            for (NSUInteger i = 0; i < count; ++i) out[i] = (GLuint)in[i];
+        } else {
+            const GLfloat *in = (const GLfloat *)raw.bytes; GLint *out = (GLint *)params;
+            for (NSUInteger i = 0; i < count; ++i) out[i] = (GLint)in[i];
+        }
+        return;
+    }
+    NSValue *matrix = uniformMatrix4fvValues[@(location)];
+    if (matrix) {
+        NSUInteger encodedSize = 0;
+        NSGetSizeAndAlignment(matrix.objCType, &encodedSize, NULL);
+        NSUInteger count = encodedSize / sizeof(GLfloat);
+        GLfloat *values = (GLfloat *)malloc(encodedSize);
+        if (!values) return;
+        [matrix getValue:values size:encodedSize];
+        if (requestedType == GL_FLOAT) memcpy(params, values, encodedSize);
+        else if (requestedType == GL_UNSIGNED_INT) {
+            GLuint *out = (GLuint *)params;
+            for (NSUInteger i = 0; i < count; ++i) out[i] = (GLuint)values[i];
+        } else {
+            GLint *out = (GLint *)params;
+            for (NSUInteger i = 0; i < count; ++i) out[i] = (GLint)values[i];
+        }
+        free(values);
+        return;
+    }
+    if (requestedType == GL_FLOAT) {
+        GLfloat value = 0.0f;
+        NSValue *scalar = uniform1fValues[@(location)];
+        NSNumber *integer = uniform1iValues[@(location)];
+        if (scalar) [scalar getValue:&value]; else if (integer) value = (GLfloat)integer.doubleValue;
+        *(GLfloat *)params = value;
+    } else if (requestedType == GL_UNSIGNED_INT) {
+        *(GLuint *)params = [uniform1iValues[@(location)] unsignedIntValue];
+    } else {
+        *(GLint *)params = [uniform1iValues[@(location)] intValue];
+    }
+}
+
+void APIENTRY glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateUniformQuery(program, location)) return;
+    gl4metalGetUniformValues(program, location, params, GL_FLOAT);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glGetUniformiv(GLuint program, GLint location, GLint *params) {
-    (void)program;
-    if (!ctx || !params) {
-        gl4metalSetError(GL_INVALID_OPERATION);
-        return;
-    }
-    NSNumber *value = uniform1iValues[@(location)];
-    params[0] = value ? [value intValue] : 0;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateUniformQuery(program, location)) return;
+    gl4metalGetUniformValues(program, location, params, GL_INT);
     gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
-    (void)program;
-    if (!ctx || !params) {
-        gl4metalSetError(GL_INVALID_OPERATION);
-        return;
-    }
-    NSNumber *value = uniform1iValues[@(location)];
-    params[0] = value ? (GLuint)[value unsignedIntValue] : 0;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalValidateUniformQuery(program, location)) return;
+    gl4metalGetUniformValues(program, location, params, GL_UNSIGNED_INT);
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -3333,43 +4929,149 @@ void APIENTRY glGetShaderSource(GLuint shader,
 
 void APIENTRY glGetProgramBinary(GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary) {
     (void)program;
-    (void)bufSize;
-    (void)length;
-    (void)binaryFormat;
-    (void)binary;
-    gl4metalSetError(GL_NO_ERROR);
+    if (bufSize < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (length) *length = 0;
+    if (binaryFormat) *binaryFormat = 0;
+    if (bufSize > 0 && !binary) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void APIENTRY glProgramBinary(GLuint program, GLenum binaryFormat, const void *binary, GLsizei length) {
-    (void)program;
-    (void)binaryFormat;
-    (void)binary;
-    (void)length;
-    gl4metalSetError(GL_NO_ERROR);
+    (void)program; (void)binaryFormat; (void)binary;
+    if (length < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void APIENTRY glProgramParameteri(GLuint program, GLenum pname, GLint value) {
-    (void)program;
-    (void)pname;
-    (void)value;
-    gl4metalSetError(GL_NO_ERROR);
+    (void)program; (void)pname; (void)value;
+    gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void APIENTRY glGetProgramPipelineiv(GLuint pipeline, GLenum pname, GLint *params) {
-    (void)pipeline;
-    (void)pname;
-    if (params) params[0] = 0;
-    gl4metalSetError(GL_NO_ERROR);
+    (void)pipeline; (void)pname;
+    if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void APIENTRY glBindProgramPipeline(GLuint pipeline) {
     (void)pipeline;
-    gl4metalSetError(GL_NO_ERROR);
+    gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void APIENTRY glDeleteProgramPipelines(GLsizei n, const GLuint *pipelines) {
-    (void)n;
     (void)pipelines;
+    if (n < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalSetError(GL_INVALID_OPERATION);
+}
+
+static NSValue *gl4metalSyncKey(GLsync sync) {
+    return sync ? [NSValue valueWithPointer:(void *)sync] : nil;
+}
+
+static BOOL gl4metalSyncIsSignaled(id<MTLCommandBuffer> commandBuffer) {
+    return commandBuffer.status == MTLCommandBufferStatusCompleted ||
+           commandBuffer.status == MTLCommandBufferStatusError;
+}
+
+GLsync APIENTRY glFenceSync(GLenum condition, GLbitfield flags) {
+    if (condition != GL_SYNC_GPU_COMMANDS_COMPLETE || flags != 0) {
+        gl4metalSetError(condition != GL_SYNC_GPU_COMMANDS_COMPLETE ? GL_INVALID_ENUM : GL_INVALID_VALUE);
+        return NULL;
+    }
+    if (!ctx || !ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return NULL; }
+    gl4metalEncodePendingClear();
+    if (!ctx.currentCommandBuffer) ctx.currentCommandBuffer = gl4metalCreateCommandBuffer();
+    id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
+    if (!commandBuffer) { gl4metalSetError(GL_OUT_OF_MEMORY); return NULL; }
+
+    GLsync sync = (GLsync)malloc(1);
+    if (!sync) { gl4metalSetError(GL_OUT_OF_MEMORY); return NULL; }
+    [commandBuffer commit];
+    ctx.currentCommandBuffer = nil;
+    gl4metalSyncCommands[gl4metalSyncKey(sync)] = commandBuffer;
+    gl4metalSetError(GL_NO_ERROR);
+    return sync;
+}
+
+GLboolean APIENTRY glIsSync(GLsync sync) {
+    if (!sync) return GL_FALSE;
+    return gl4metalSyncCommands[gl4metalSyncKey(sync)] ? GL_TRUE : GL_FALSE;
+}
+
+GLenum APIENTRY glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    id<MTLCommandBuffer> commandBuffer = gl4metalSyncCommands[gl4metalSyncKey(sync)];
+    if (!sync || !commandBuffer) { gl4metalSetError(GL_INVALID_VALUE); return GL_WAIT_FAILED; }
+    if (flags & ~GL_SYNC_FLUSH_COMMANDS_BIT) { gl4metalSetError(GL_INVALID_VALUE); return GL_WAIT_FAILED; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return GL_WAIT_FAILED; }
+    if (flags & GL_SYNC_FLUSH_COMMANDS_BIT) glFlush();
+    if (gl4metalSyncIsSignaled(commandBuffer)) {
+        gl4metalSetError(GL_NO_ERROR);
+        return GL_CONDITION_SATISFIED;
+    }
+    if (timeout == 0) { gl4metalSetError(GL_NO_ERROR); return GL_TIMEOUT_EXPIRED; }
+    if (timeout == GL_TIMEOUT_IGNORED) {
+        [commandBuffer waitUntilCompleted];
+    } else {
+        struct timespec start = {0}, now = {0}, pause = {0, 100000};
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        uint64_t endNS = (uint64_t)start.tv_sec * 1000000000ULL + (uint64_t)start.tv_nsec + timeout;
+        for (;;) {
+            if (gl4metalSyncIsSignaled(commandBuffer)) break;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t nowNS = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+            if (nowNS >= endNS) { gl4metalSetError(GL_NO_ERROR); return GL_TIMEOUT_EXPIRED; }
+            nanosleep(&pause, NULL);
+        }
+    }
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return GL_WAIT_FAILED;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+    return GL_CONDITION_SATISFIED;
+}
+
+void APIENTRY glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    if (!sync || !gl4metalSyncCommands[gl4metalSyncKey(sync)]) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (flags != 0 || timeout != GL_TIMEOUT_IGNORED) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    // All work is submitted to one serial Metal command queue. The fence
+    // command buffer was committed before later GL command buffers, so queue
+    // order provides the server-side wait without blocking the CPU.
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) {
+    if (length) *length = 0;
+    if (bufSize < 0 || (bufSize > 0 && !values)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    id<MTLCommandBuffer> commandBuffer = gl4metalSyncCommands[gl4metalSyncKey(sync)];
+    if (!sync || !commandBuffer) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    GLint value = 0;
+    switch (pname) {
+        case GL_OBJECT_TYPE: value = GL_SYNC_FENCE; break;
+        case GL_SYNC_CONDITION: value = GL_SYNC_GPU_COMMANDS_COMPLETE; break;
+        case GL_SYNC_FLAGS: value = 0; break;
+        case GL_SYNC_STATUS: value = gl4metalSyncIsSignaled(commandBuffer) ? GL_SIGNALED : GL_UNSIGNALED; break;
+        default: gl4metalSetError(GL_INVALID_ENUM); return;
+    }
+    if (bufSize > 0) {
+        values[0] = value;
+        if (length) *length = 1;
+    }
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glDeleteSync(GLsync sync) {
+    NSValue *key = gl4metalSyncKey(sync);
+    if (!sync || !gl4metalSyncCommands[key]) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    [gl4metalSyncCommands removeObjectForKey:key];
+    free((void *)sync);
     gl4metalSetError(GL_NO_ERROR);
 }
 
@@ -3454,9 +5156,8 @@ static BOOL gl4metalReadIndexValue(id<MTLBuffer> buffer, GLenum type, size_t off
     return YES;
 }
 
-// Collect index diagnostics in the same pass already required for max-index bounds
-// validation. This keeps the trace effectively free when disabled and avoids a
-// second walk over large Minecraft index buffers.
+// Collect index bounds in one pass. Samples and the diagnostic hash are only
+// computed when index tracing is enabled; normal draws need only min/max.
 static BOOL gl4metalFindIndexStats(id<MTLBuffer> indexBuffer, GLenum indexType, NSUInteger indexOffset, NSUInteger count,
                                    NSUInteger *outMinIndex, NSUInteger *outMaxIndex,
                                    NSUInteger sampleValues[8], NSUInteger *outSampleCount,
@@ -3465,6 +5166,7 @@ static BOOL gl4metalFindIndexStats(id<MTLBuffer> indexBuffer, GLenum indexType, 
     NSUInteger minIndex = SIZE_MAX;
     NSUInteger maxIndex = 0;
     NSUInteger sampleCount = 0;
+    BOOL collectDiagnostics = sampleValues || outSampleCount || outHash;
     uint64_t hash = 1469598103934665603ULL; // FNV-1a offset basis
     for (NSUInteger i = 0; i < count; ++i) {
         NSUInteger value = 0;
@@ -3474,9 +5176,11 @@ static BOOL gl4metalFindIndexStats(id<MTLBuffer> indexBuffer, GLenum indexType, 
         }
         if (value < minIndex) minIndex = value;
         if (value > maxIndex) maxIndex = value;
-        if (sampleValues && sampleCount < 8) sampleValues[sampleCount++] = value;
-        hash ^= (uint64_t)value;
-        hash *= 1099511628211ULL; // FNV-1a prime
+        if (collectDiagnostics && sampleValues && sampleCount < 8) sampleValues[sampleCount++] = value;
+        if (collectDiagnostics) {
+            hash ^= (uint64_t)value;
+            hash *= 1099511628211ULL; // FNV-1a prime
+        }
     }
     if (count == 0) minIndex = 0;
     *outMinIndex = minIndex;
@@ -3521,6 +5225,26 @@ static MTLIndexType gl4metalIndexTypeForElementType(GLenum type) {
     }
 }
 
+static id<MTLBuffer> gl4metalFindCachedTriangleFanBuffer(NSString *key) {
+    return key ? gl4metalTriangleFanBufferCache[key] : nil;
+}
+
+static void gl4metalCacheTriangleFanBuffer(NSString *key, id<MTLBuffer> buffer, NSUInteger length) {
+    const NSUInteger cacheByteLimit = 16u * 1024u * 1024u;
+    const NSUInteger cacheEntryLimit = 256;
+    if (!key || !buffer || length > cacheByteLimit) return;
+    if (!gl4metalTriangleFanBufferCache) {
+        gl4metalTriangleFanBufferCache = [NSMutableDictionary dictionary];
+    }
+    if (gl4metalTriangleFanBufferCache.count >= cacheEntryLimit ||
+        gl4metalTriangleFanBufferCacheBytes > cacheByteLimit - length) {
+        [gl4metalTriangleFanBufferCache removeAllObjects];
+        gl4metalTriangleFanBufferCacheBytes = 0;
+    }
+    gl4metalTriangleFanBufferCache[key] = buffer;
+    gl4metalTriangleFanBufferCacheBytes += length;
+}
+
 static BOOL gl4metalMakeTriangleFanIndexBuffer(id<MTLBuffer> source,
                                                 NSUInteger sourceOffset,
                                                 GLsizei count,
@@ -3537,7 +5261,16 @@ static BOOL gl4metalMakeTriangleFanIndexBuffer(id<MTLBuffer> source,
     NSUInteger fanTriangles = (NSUInteger)count - 2;
     NSUInteger outCount = fanTriangles * 3;
     NSUInteger outIndexSize = (type == GL_UNSIGNED_INT) ? 4 : 2;
+    if (fanTriangles > NSUIntegerMax / (3 * outIndexSize)) return NO;
     NSUInteger outBytes = outCount * outIndexSize;
+    NSString *cacheKey = [NSString stringWithFormat:@"indexed:%p:%lu:%d:%u",
+                          (void *)source, (unsigned long)sourceOffset, count, type];
+    id<MTLBuffer> cached = gl4metalFindCachedTriangleFanBuffer(cacheKey);
+    if (cached) {
+        *outBuffer = cached;
+        *outType = (type == GL_UNSIGNED_INT) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+        return YES;
+    }
     id<MTLBuffer> out = [ctx.device newBufferWithLength:outBytes options:MTLResourceStorageModeShared];
     if (!out) return NO;
 
@@ -3565,6 +5298,7 @@ static BOOL gl4metalMakeTriangleFanIndexBuffer(id<MTLBuffer> source,
         *outType = MTLIndexTypeUInt32;
     }
     *outBuffer = out;
+    gl4metalCacheTriangleFanBuffer(cacheKey, out, outBytes);
     return YES;
 }
 
@@ -3572,8 +5306,42 @@ static BOOL gl4metalDrawTraceEnabledForProgram(GLuint program) {
     return program == 53 && getenv("GL4METAL_DRAW_TRACE");
 }
 
+static BOOL gl4metalIsValidDrawMode(GLenum mode) {
+    switch (mode) {
+        case GL_POINTS:
+        case GL_LINES:
+        case GL_LINE_LOOP:
+        case GL_LINE_STRIP:
+        case GL_TRIANGLES:
+        case GL_TRIANGLE_STRIP:
+        case GL_TRIANGLE_FAN:
+        case GL_LINES_ADJACENCY:
+        case GL_LINE_STRIP_ADJACENCY:
+        case GL_TRIANGLES_ADJACENCY:
+        case GL_TRIANGLE_STRIP_ADJACENCY:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static BOOL gl4metalModeIsImplemented(GLenum mode, BOOL indexed) {
+    return mode == GL_POINTS || mode == GL_LINES || mode == GL_LINE_STRIP ||
+           mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP ||
+           (indexed && mode == GL_TRIANGLE_FAN);
+}
+
 static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
-    if (!ctx || count <= 0 || instancecount <= 0) return;
+    if (!gl4metalIsValidDrawMode(mode)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (first < 0 || count < 0 || instancecount < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!gl4metalModeIsImplemented(mode, NO)) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (ctx.currentFramebuffer != 0 &&
+        glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+    if (count == 0 || instancecount == 0) { gl4metalSetError(GL_NO_ERROR); return; }
     if (gl4metalDrawTraceEnabledForProgram(currentProgram)) {
         printf("[gl4metal][DRAW_TRACE_BEGIN] kind=arrays program=%u vao=%u fbo=%u mode=0x%X first=%d count=%d instances=%d\n",
                currentProgram, ctx.currentVAO, ctx.currentFramebuffer, mode, first, count, instancecount);
@@ -3583,7 +5351,6 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
         printf("[gl4metal][GPU-DEBUG] draw skipped after previous GPU failure\n");
         return;
     }
-    if (first < 0) { printf("[gl4metal][BOUNDS] glDrawArrays negative first=%d\n", first); return; }
     gl4metalVertexArray *preVAO = gl4metalGetCurrentVAO();
     if (preVAO) gl4metalRecoverPackedInterleavedOffsets(preVAO);
     if (!gl4metalValidateDrawArraysBuffers(preVAO, (NSUInteger)first, (NSUInteger)count, (NSUInteger)instancecount)) {
@@ -3614,13 +5381,13 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
 
     MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
     if (!renderPassDesc) {
-        printf("[gl4metal] ERROR: Failed to create render pass descriptor for glDrawArrays\n");
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
         return;
     }
 
     id<MTLRenderCommandEncoder> encoder = [ctx.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) {
-        printf("[gl4metal] ERROR: Failed to create MTLRenderCommandEncoder\n");
+        gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
 
@@ -3647,7 +5414,8 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
         noDepthState = [ctx.device newDepthStencilStateWithDescriptor:dds];
         if (noDepthState) [encoder setDepthStencilState:noDepthState];
     }
-    [encoder setStencilReferenceValue:(uint32_t)MAX(ctx.stencilRef, 0)];
+    [encoder setStencilFrontReferenceValue:(uint32_t)MAX(ctx.stencilRef, 0)
+                      backReferenceValue:(uint32_t)MAX(ctx.stencilBackRef, 0)];
 
     applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
@@ -3697,16 +5465,20 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
         MTLIndexType indexType = ((NSUInteger)first + (NSUInteger)count <= 65535)
             ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         NSUInteger indexSize = (indexType == MTLIndexTypeUInt16) ? 2 : 4;
-        id<MTLBuffer> fan = [ctx.device newBufferWithLength:indexCount * indexSize options:MTLResourceStorageModeShared];
+        NSUInteger indexBytes = indexCount * indexSize;
+        NSString *cacheKey = [NSString stringWithFormat:@"arrays:%d:%d:%u", first, count, (unsigned)indexType];
+        id<MTLBuffer> fan = gl4metalFindCachedTriangleFanBuffer(cacheKey);
+        BOOL wasCached = fan != nil;
+        if (!wasCached) fan = [ctx.device newBufferWithLength:indexBytes options:MTLResourceStorageModeShared];
         if (fan) {
-            if (indexType == MTLIndexTypeUInt16) {
+            if (!wasCached && indexType == MTLIndexTypeUInt16) {
                 uint16_t *dst = (uint16_t *)fan.contents;
                 for (NSUInteger i = 0; i < triCount; ++i) {
                     dst[i * 3 + 0] = (uint16_t)first;
                     dst[i * 3 + 1] = (uint16_t)(first + (GLint)i + 1);
                     dst[i * 3 + 2] = (uint16_t)(first + (GLint)i + 2);
                 }
-            } else {
+            } else if (!wasCached) {
                 uint32_t *dst = (uint32_t *)fan.contents;
                 for (NSUInteger i = 0; i < triCount; ++i) {
                     dst[i * 3 + 0] = (uint32_t)first;
@@ -3720,6 +5492,9 @@ static void gl4metalDrawArraysInternal(GLenum mode, GLint first, GLsizei count, 
                                 indexBuffer:fan
                           indexBufferOffset:0
                               instanceCount:(NSUInteger)instancecount];
+            if (!wasCached) {
+                gl4metalCacheTriangleFanBuffer(cacheKey, fan, indexBytes);
+            }
         }
     } else {
         MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
@@ -3798,7 +5573,20 @@ static id<MTLBuffer> gl4metalUniformArenaAlloc(NSUInteger length, NSUInteger *ou
 
     if (!arena || offset + alignedLength > arena.length) {
         NSUInteger capacity = MAX(chunkSize, alignedLength);
-        arena = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        @synchronized(gl4metalUniformArenaPool) {
+            for (NSUInteger poolIndex = gl4metalUniformArenaPool.count; poolIndex > 0; --poolIndex) {
+                id<MTLBuffer> candidate = gl4metalUniformArenaPool[poolIndex - 1];
+                if (candidate.length >= capacity) {
+                    arena = candidate;
+                    gl4metalUniformArenaPoolBytes -= candidate.length;
+                    [gl4metalUniformArenaPool removeObjectAtIndex:poolIndex - 1];
+                    break;
+                }
+            }
+        }
+        if (!arena) {
+            arena = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        }
         if (!arena) return nil;
         [ctx.uniformArenaBuffers addObject:arena];
         offset = 0;
@@ -3819,6 +5607,43 @@ static id<MTLBuffer> gl4metalUniformArenaAlloc(NSUInteger length, NSUInteger *ou
 // NSData is CPU-side storage only; the draw path copies it into a per-command
 // buffer arena. The arena is held until command-buffer completion, so earlier
 // draws can never observe later uniform writes.
+static BOOL gl4metalMatrixDimensions(GLenum type, NSUInteger *columns, NSUInteger *rows) {
+    NSUInteger c = 0, r = 0;
+    switch (type) {
+        case GL_FLOAT_MAT2: c = 2; r = 2; break;
+        case GL_FLOAT_MAT3: c = 3; r = 3; break;
+        case GL_FLOAT_MAT4: c = 4; r = 4; break;
+        case GL_FLOAT_MAT2x3: c = 2; r = 3; break;
+        case GL_FLOAT_MAT2x4: c = 2; r = 4; break;
+        case GL_FLOAT_MAT3x2: c = 3; r = 2; break;
+        case GL_FLOAT_MAT3x4: c = 3; r = 4; break;
+        case GL_FLOAT_MAT4x2: c = 4; r = 2; break;
+        case GL_FLOAT_MAT4x3: c = 4; r = 3; break;
+        default: return NO;
+    }
+    if (columns) *columns = c;
+    if (rows) *rows = r;
+    return YES;
+}
+
+static void gl4metalPackMatrixUniform(NSMutableData *destination, NSData *source, GLenum type) {
+    NSUInteger columns = 0, rows = 0;
+    if (!gl4metalMatrixDimensions(type, &columns, &rows) || source.length == 0) return;
+    NSUInteger sourceMatrixBytes = columns * rows * sizeof(GLfloat);
+    NSUInteger columnStride = rows == 2 ? 2 * sizeof(GLfloat) : 4 * sizeof(GLfloat);
+    NSUInteger matrixStride = (columns * columnStride + 15u) & ~15u;
+    const GLfloat *src = (const GLfloat *)source.bytes;
+    for (NSUInteger m = 0; m < source.length / sourceMatrixBytes; ++m) {
+        for (NSUInteger c = 0; c < columns; ++c) {
+            NSUInteger dstOffset = m * matrixStride + c * columnStride;
+            NSUInteger srcOffset = m * columns * rows + c * rows;
+            if (dstOffset + rows * sizeof(GLfloat) > destination.length) return;
+            memcpy((uint8_t *)destination.mutableBytes + dstOffset, src + srcOffset,
+                   rows * sizeof(GLfloat));
+        }
+    }
+}
+
 static NSData *gl4metalUniformDataForName(NSString *name, GLuint program, NSUInteger length) {
     if (!ctx || !ctx.device || !name || length == 0) return nil;
 
@@ -3833,29 +5658,15 @@ static NSData *gl4metalUniformDataForName(NSString *name, GLuint program, NSUInt
                location >= 0 ? "FOUND" : "MISSING");
     }
     if (location >= 0) {
-        // Matrix uniforms: the reflection dataSize is the Metal ABI size.
-        // mat4 is 64 bytes; mat3 is 48 bytes because each column occupies a
-        // 16-byte slot in Metal's constant-buffer ABI.
-        NSValue *matrix = uniformMatrix4fvValues[@(location)];
-        if (matrix) {
-            if (length >= 64) {
-                float values[16] = {0};
-                if (!gl4metalCopyNSValueBytes(matrix, values, sizeof(values))) return data;
-                memcpy(data.mutableBytes, values, MIN(length, sizeof(values)));
-                return data;
+        NSData *rawValue = uniformRawValues[@(location)];
+        if (rawValue.length > 0) {
+            GLenum type = gl4metalUniformTypeForLocation(program, location);
+            if (gl4metalMatrixDimensions(type, NULL, NULL)) {
+                gl4metalPackMatrixUniform(data, rawValue, type);
+            } else {
+                memcpy(data.mutableBytes, rawValue.bytes, MIN(length, rawValue.length));
             }
-            if (length >= 48) {
-                float values[9] = {0};
-                if (!gl4metalCopyNSValueBytes(matrix, values, sizeof(values))) return data;
-                float *dst = (float *)data.mutableBytes;
-                for (int c = 0; c < 3; ++c) {
-                    dst[c * 4 + 0] = values[c * 3 + 0];
-                    dst[c * 4 + 1] = values[c * 3 + 1];
-                    dst[c * 4 + 2] = values[c * 3 + 2];
-                    dst[c * 4 + 3] = 0.0f;
-                }
-                return data;
-            }
+            return data;
         }
 
         NSValue *vec4 = uniform4fValues[@(location)];
@@ -4098,8 +5909,74 @@ void APIENTRY glMultiDrawArrays(GLenum mode, const GLint *first,
     }
 }
 
-static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
-    if (!ctx || count <= 0 || instancecount <= 0) return;
+static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type,
+                                         const void *indices, GLsizei instancecount,
+                                         GLint baseVertex) {
+    if (!gl4metalIsValidDrawMode(mode)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+    if (count < 0 || instancecount < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_INT) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    if (!gl4metalModeIsImplemented(mode, YES)) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (ctx.currentFramebuffer != 0 &&
+        glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+    if (count == 0 || instancecount == 0) { gl4metalSetError(GL_NO_ERROR); return; }
+    if (ctx.primitiveRestartEnabled) {
+        gl4metalVertexArray *vao = gl4metalGetCurrentVAO();
+        GLuint elementBuffer = vao ? vao->elementArrayBufferID
+            : [ctx.boundBuffers[@(GL_ELEMENT_ARRAY_BUFFER)] unsignedIntValue];
+        id<MTLBuffer> indicesBuffer = bufferObjects[@(elementBuffer)];
+        size_t indexWidth = type == GL_UNSIGNED_BYTE ? 1u :
+                            type == GL_UNSIGNED_SHORT ? 2u : 4u;
+        uintptr_t offset = (uintptr_t)indices;
+        if (!elementBuffer || !indicesBuffer) {
+            gl4metalSetError(GL_INVALID_OPERATION);
+            return;
+        }
+        if (offset > indicesBuffer.length ||
+            (size_t)count > (indicesBuffer.length - (size_t)offset) / indexWidth) {
+            gl4metalSetError(GL_INVALID_OPERATION);
+            return;
+        }
+        uint64_t maxIndexValue = type == GL_UNSIGNED_BYTE ? UINT8_MAX :
+                                 type == GL_UNSIGNED_SHORT ? UINT16_MAX : UINT32_MAX;
+        uint64_t restartValue = ctx.primitiveRestartIndex;
+        if (restartValue > maxIndexValue) restartValue = UINT64_MAX;
+        GLsizei segmentStart = 0;
+        ctx.primitiveRestartEnabled = GL_FALSE;
+        for (GLsizei index = 0; index < count; ++index) {
+            NSUInteger value = 0;
+            if (!gl4metalReadIndexValue(indicesBuffer, type, (NSUInteger)offset,
+                                        (NSUInteger)index, &value)) {
+                ctx.primitiveRestartEnabled = GL_TRUE;
+                gl4metalSetError(GL_INVALID_OPERATION);
+                return;
+            }
+            if ((uint64_t)value == restartValue) {
+                GLsizei segmentCount = index - segmentStart;
+                if (segmentCount > 0) {
+                    uintptr_t segmentOffset = offset + (uintptr_t)segmentStart * indexWidth;
+                    gl4metalDrawElementsInternal(mode, segmentCount, type,
+                        (const void *)segmentOffset, instancecount, baseVertex);
+                }
+                segmentStart = index + 1;
+            }
+        }
+        GLsizei finalSegmentCount = count - segmentStart;
+        if (finalSegmentCount > 0) {
+            uintptr_t segmentOffset = offset + (uintptr_t)segmentStart * indexWidth;
+            gl4metalDrawElementsInternal(mode, finalSegmentCount, type,
+                (const void *)segmentOffset, instancecount, baseVertex);
+        }
+        ctx.primitiveRestartEnabled = GL_TRUE;
+        gl4metalSetError(GL_NO_ERROR);
+        return;
+    }
     if (gl4metalDrawTraceEnabledForProgram(currentProgram)) {
         printf("[gl4metal][DRAW_TRACE_BEGIN] kind=elements program=%u vao=%u fbo=%u mode=0x%X count=%d type=0x%X instances=%d indices=%p\n",
                currentProgram, ctx.currentVAO, ctx.currentFramebuffer, mode, count, type, instancecount, indices);
@@ -4134,7 +6011,6 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
         printf("[gl4metal] ERROR: Index MTLBuffer not found for VBO ID %u\n", elementVBO);
         return;
     }
-    gl4metalMarkBufferUsed(elementVBO);
     size_t indexWidth = (type == GL_UNSIGNED_BYTE) ? 1 : (type == GL_UNSIGNED_SHORT ? 2 : (type == GL_UNSIGNED_INT ? 4 : 0));
     if (!indexWidth) { printf("[gl4metal][BOUNDS] Unsupported index type 0x%X\n", type); return; }
     GLintptr rawIndexOffset = (indices == NULL) ? 0 : (GLintptr)(uintptr_t)indices;
@@ -4147,11 +6023,39 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
     NSUInteger sampleValues[8] = {0};
     NSUInteger sampleCount = 0;
     uint64_t indexHash = 0;
-    if (!gl4metalFindIndexStats(indexBuffer, type, (NSUInteger)rawIndexOffset, (NSUInteger)count,
-                                &minIndex, &maxIndex, sampleValues, &sampleCount, &indexHash)) {
-        printf("[gl4metal][BOUNDS] Aborting glDrawElements: cannot inspect index buffer\n");
+    BOOL collectIndexTrace = getenv("GL4METAL_INDEX_TRACE") != NULL;
+    NSString *statsKey = [NSString stringWithFormat:@"%u:%u:%lu:%lu",
+                          elementVBO, type, (unsigned long)rawIndexOffset, (unsigned long)count];
+    NSData *cachedStats = collectIndexTrace ? nil : gl4metalIndexStatsCache[statsKey];
+    if (cachedStats.length == sizeof(NSUInteger) * 2) {
+        NSUInteger values[2] = {0};
+        memcpy(values, cachedStats.bytes, sizeof(values));
+        minIndex = values[0];
+        maxIndex = values[1];
+    } else {
+        BOOL statsOK = gl4metalFindIndexStats(indexBuffer, type, (NSUInteger)rawIndexOffset,
+            (NSUInteger)count, &minIndex, &maxIndex,
+            collectIndexTrace ? sampleValues : NULL,
+            collectIndexTrace ? &sampleCount : NULL,
+            collectIndexTrace ? &indexHash : NULL);
+        if (!statsOK) {
+            printf("[gl4metal][BOUNDS] Aborting glDrawElements: cannot inspect index buffer\n");
+            return;
+        }
+        if (!collectIndexTrace && gl4metalIndexStatsCache) {
+            if (gl4metalIndexStatsCache.count >= 4096) [gl4metalIndexStatsCache removeAllObjects];
+            NSUInteger values[2] = {minIndex, maxIndex};
+            gl4metalIndexStatsCache[statsKey] = [NSData dataWithBytes:values length:sizeof(values)];
+        }
+    }
+    int64_t effectiveMinIndex = (int64_t)minIndex + (int64_t)baseVertex;
+    int64_t effectiveMaxIndex = (int64_t)maxIndex + (int64_t)baseVertex;
+    if (effectiveMinIndex < 0 || effectiveMaxIndex < effectiveMinIndex ||
+        (uint64_t)effectiveMaxIndex > (uint64_t)SIZE_MAX) {
+        gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
+    NSUInteger effectiveMaxVertex = (NSUInteger)effectiveMaxIndex;
     if (getenv("GL4METAL_DEBUG")) {
         printf("[gl4metal][BOUNDS] index check: EBO=%u offset=%ld count=%d type=0x%X width=%zu buffer=%lu minIndex=%lu maxIndex=%lu\n",
                elementVBO, (long)rawIndexOffset, count, type, indexWidth,
@@ -4161,7 +6065,7 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
     // Opt-in indexed-draw trace used to diagnose stretched triangles / bad VAO-EBO
     // state without permanently flooding the normal render log. Each unique
     // draw signature+index-data hash is printed once per process.
-    if (getenv("GL4METAL_INDEX_TRACE")) {
+    if (collectIndexTrace) {
         static NSMutableSet<NSString *> *seenIndexTraces = nil;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{ seenIndexTraces = [NSMutableSet set]; });
@@ -4209,10 +6113,21 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
     }
 
     MTLRenderPassDescriptor *renderPassDesc = createRenderPassDescriptor();
-
+    if (!renderPassDesc) {
+        gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+        return;
+    }
+    if (!ctx.currentCommandBuffer) {
+        gl4metalSetError(GL_INVALID_OPERATION);
+        return;
+    }
+    // The active command-buffer resource set must be installed before marking
+    // the EBO; otherwise the first indexed draw after a swap is charged to the
+    // previous frame's resource set and its hazards go untracked.
+    gl4metalMarkBufferUsed(elementVBO);
     id<MTLRenderCommandEncoder> encoder = [ctx.currentCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) {
-        printf("[gl4metal] ERROR: Failed to create MTLRenderCommandEncoder\n");
+        gl4metalSetError(GL_INVALID_OPERATION);
         return;
     }
 
@@ -4238,7 +6153,8 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
         noDepthState = [ctx.device newDepthStencilStateWithDescriptor:dds];
         if (noDepthState) [encoder setDepthStencilState:noDepthState];
     }
-    [encoder setStencilReferenceValue:(uint32_t)MAX(ctx.stencilRef, 0)];
+        [encoder setStencilFrontReferenceValue:(uint32_t)MAX(ctx.stencilRef, 0)
+                          backReferenceValue:(uint32_t)MAX(ctx.stencilBackRef, 0)];
     applyRasterState(encoder);
     [encoder setRenderPipelineState:ctx.pipelineState];
 
@@ -4286,7 +6202,7 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
             gl4metalVertexAttrib *a=&currentVAO->attribs[ai];
             if (!a->enabled || a->boundVBO==0) continue;
             id<MTLBuffer> vb=bufferObjects[@(a->boundVBO)];
-            if (!vb || !gl4metalValidateIndexedVertexAttribRange(a, vb, maxIndex, (NSUInteger)instancecount, ai)) vertexOK=NO;
+            if (!vb || !gl4metalValidateIndexedVertexAttribRange(a, vb, effectiveMaxVertex, (NSUInteger)instancecount, ai)) vertexOK=NO;
         }
         if (!vertexOK) {
             printf("[gl4metal][BOUNDS] Aborting glDrawElements: vertex buffer range invalid\n");
@@ -4326,7 +6242,19 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
                 for (GLsizei i = 0; i < count; i++) {
                     dst[i] = (uint16_t)src[i];
                 }
-                convertedIndexBuffers[cacheKey] = tmpBuffer;
+                // Bound the conversion cache: a game can issue many unique
+                // offset/count pairs against static byte-index buffers.
+                const NSUInteger cacheByteLimit = 64u * 1024u * 1024u;
+                const NSUInteger cacheEntryLimit = 512;
+                if (tmpByteLength <= cacheByteLimit) {
+                    if (convertedIndexBuffers.count >= cacheEntryLimit ||
+                        gl4metalConvertedIndexBufferCacheBytes > cacheByteLimit - tmpByteLength) {
+                        [convertedIndexBuffers removeAllObjects];
+                        gl4metalConvertedIndexBufferCacheBytes = 0;
+                    }
+                    convertedIndexBuffers[cacheKey] = tmpBuffer;
+                    gl4metalConvertedIndexBufferCacheBytes += tmpByteLength;
+                }
                 drawIndexBuffer = tmpBuffer;
                 drawIndexOffset = 0;
                 drawIndexType = MTLIndexTypeUInt16;
@@ -4353,11 +6281,15 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
                                   indexType:fanType
                                 indexBuffer:fanBuffer
                           indexBufferOffset:0
-                              instanceCount:(NSUInteger)instancecount];
+                              instanceCount:(NSUInteger)instancecount
+                                 baseVertex:baseVertex
+                               baseInstance:0];
         }
     } else {
         MTLPrimitiveType primitiveType = getMetalPrimitiveType(mode);
-        [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset instanceCount:(NSUInteger)instancecount];
+        [encoder drawIndexedPrimitives:primitiveType indexCount:(NSUInteger)count indexType:drawIndexType
+                           indexBuffer:drawIndexBuffer indexBufferOffset:drawIndexOffset
+                         instanceCount:(NSUInteger)instancecount baseVertex:baseVertex baseInstance:0];
     }
 
     if (gl4metalDrawTraceEnabledForProgram(currentProgram)) {
@@ -4380,11 +6312,22 @@ static void gl4metalDrawElementsInternal(GLenum mode, GLsizei count, GLenum type
 }
 
 void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-    gl4metalDrawElementsInternal(mode, count, type, indices, 1);
+    gl4metalDrawElementsInternal(mode, count, type, indices, 1, 0);
 }
 
 void APIENTRY glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
-    gl4metalDrawElementsInternal(mode, count, type, indices, instancecount);
+    gl4metalDrawElementsInternal(mode, count, type, indices, instancecount, 0);
+}
+
+void APIENTRY glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
+                                       const void *indices, GLint basevertex) {
+    gl4metalDrawElementsInternal(mode, count, type, indices, 1, basevertex);
+}
+
+void APIENTRY glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
+                                                const void *indices, GLsizei instancecount,
+                                                GLint basevertex) {
+    gl4metalDrawElementsInternal(mode, count, type, indices, instancecount, basevertex);
 }
 
 void APIENTRY glDrawRangeElements(GLenum mode, GLuint start, GLuint end,
@@ -4394,6 +6337,13 @@ void APIENTRY glDrawRangeElements(GLenum mode, GLuint start, GLuint end,
         return;
     }
     glDrawElements(mode, count, type, indices);
+}
+
+void APIENTRY glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end,
+                                            GLsizei count, GLenum type,
+                                            const void *indices, GLint basevertex) {
+    if (start > end || count < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    gl4metalDrawElementsInternal(mode, count, type, indices, 1, basevertex);
 }
 
 void APIENTRY glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type,
@@ -4411,6 +6361,20 @@ void APIENTRY glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type
     for (GLsizei draw = 0; draw < drawcount; ++draw) {
         glDrawElements(mode, count[draw], type, indices[draw]);
     }
+}
+
+void APIENTRY glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count,
+                                            GLenum type, const void *const *indices,
+                                            GLsizei drawcount, const GLint *basevertex) {
+    if (drawcount < 0 || (drawcount > 0 && (!count || !indices || !basevertex))) {
+        gl4metalSetError(GL_INVALID_VALUE);
+        return;
+    }
+    for (GLsizei draw = 0; draw < drawcount; ++draw) {
+        if (count[draw] < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    }
+    for (GLsizei draw = 0; draw < drawcount; ++draw)
+        gl4metalDrawElementsInternal(mode, count[draw], type, indices[draw], 1, basevertex[draw]);
 }
 
 static MTLCompareFunction getMetalCompareFunction(GLenum func) {
@@ -4457,15 +6421,22 @@ static void updateDepthStencilState(void) {
     }
 
     if (ctx.stencilTestEnabled) {
-        MTLStencilDescriptor *stencil = [[MTLStencilDescriptor alloc] init];
-        stencil.stencilCompareFunction = getMetalCompareFunction(ctx.stencilFunc);
-        stencil.stencilFailureOperation = getMetalStencilOperation(ctx.stencilFail);
-        stencil.depthFailureOperation = getMetalStencilOperation(ctx.stencilDepthFail);
-        stencil.depthStencilPassOperation = getMetalStencilOperation(ctx.stencilDepthPass);
-        stencil.readMask = ctx.stencilReadMask;
-        stencil.writeMask = ctx.stencilWriteMask;
-        desc.frontFaceStencil = stencil;
-        desc.backFaceStencil = stencil;
+        MTLStencilDescriptor *front = [[MTLStencilDescriptor alloc] init];
+        front.stencilCompareFunction = getMetalCompareFunction(ctx.stencilFunc);
+        front.stencilFailureOperation = getMetalStencilOperation(ctx.stencilFail);
+        front.depthFailureOperation = getMetalStencilOperation(ctx.stencilDepthFail);
+        front.depthStencilPassOperation = getMetalStencilOperation(ctx.stencilDepthPass);
+        front.readMask = ctx.stencilReadMask;
+        front.writeMask = ctx.stencilWriteMask;
+        MTLStencilDescriptor *back = [[MTLStencilDescriptor alloc] init];
+        back.stencilCompareFunction = getMetalCompareFunction(ctx.stencilBackFunc);
+        back.stencilFailureOperation = getMetalStencilOperation(ctx.stencilBackFail);
+        back.depthFailureOperation = getMetalStencilOperation(ctx.stencilBackDepthFail);
+        back.depthStencilPassOperation = getMetalStencilOperation(ctx.stencilBackDepthPass);
+        back.readMask = ctx.stencilBackReadMask;
+        back.writeMask = ctx.stencilBackWriteMask;
+        desc.frontFaceStencil = front;
+        desc.backFaceStencil = back;
     }
 
     ctx.depthStencilState = [ctx.device newDepthStencilStateWithDescriptor:desc];
@@ -4479,6 +6450,16 @@ static void ensureDepthTexture(CGSize size) {
         ctx.depthTexture = [ctx.device newTextureWithDescriptor:desc];
         printf("[gl4metal] Created new depth texture of size: %.0fx%.0f\n", size.width, size.height);
     }
+}
+
+id<MTLTexture> gl4metalGetDefaultDepthTexture(void) {
+    if (!ctx) return nil;
+    if (!ctx.currentDrawable && ctx.metalLayer) ctx.currentDrawable = [ctx.metalLayer nextDrawable];
+    if (ctx.currentDrawable) {
+        ensureDepthTexture(CGSizeMake(ctx.currentDrawable.texture.width,
+                                      ctx.currentDrawable.texture.height));
+    }
+    return ctx.depthTexture;
 }
 
 static const char *gl4metalArgumentTypeName(MTLArgumentType type) {
@@ -4553,16 +6534,22 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
     MTLPixelFormat targetColorFormat = gl4metalGetCurrentColorPixelFormat();
     MTLPixelFormat targetDepthFormat = gl4metalGetCurrentDepthPixelFormat();
     MTLPixelFormat targetStencilFormat = gl4metalGetCurrentStencilPixelFormat();
+    // Metal validates this pipeline field against stencil-capable pixel
+    // formats. A depth-only attachment must never be advertised as stencil.
+    if (targetStencilFormat != MTLPixelFormatStencil8 &&
+        targetStencilFormat != MTLPixelFormatDepth32Float_Stencil8) {
+        targetStencilFormat = MTLPixelFormatInvalid;
+    }
     if (targetColorFormat == MTLPixelFormatInvalid) {
         printf("[gl4metal] ERROR: No valid current color render-target format for program %u\n", program);
         return NO;
     }
     pipelineDesc.colorAttachments[0].pixelFormat = targetColorFormat;
-    pipelineDesc.colorAttachments[0].writeMask =
-        (ctx.colorMaskRed ? MTLColorWriteMaskRed : 0) |
-        (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
-        (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
-        (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0);
+    pipelineDesc.colorAttachments[0].writeMask = ctx.drawBuffer == GL_NONE ? MTLColorWriteMaskNone :
+        ((ctx.colorMaskRed ? MTLColorWriteMaskRed : 0) |
+         (ctx.colorMaskGreen ? MTLColorWriteMaskGreen : 0) |
+         (ctx.colorMaskBlue ? MTLColorWriteMaskBlue : 0) |
+         (ctx.colorMaskAlpha ? MTLColorWriteMaskAlpha : 0));
     // Blend state is taken directly from the emulated OpenGL state. Do not
     // force a blend mode by program number: Program 53 is the important
     // alpha-text candidate in vanilla 1.20.1, while Program 17 is used by
@@ -4573,7 +6560,7 @@ static BOOL gl4metalCreatePipelineStateInternal(GLuint program,
     GLenum effectiveDstAlpha = ctx.blendDstAlpha;
     GLenum effectiveEqRGB = ctx.blendEquationRGB;
     GLenum effectiveEqAlpha = ctx.blendEquationAlpha;
-    BOOL effectiveBlendEnabled = ctx.blendEnabled;
+    BOOL effectiveBlendEnabled = ctx.blendEnabled && !gl4metalColorLogicOperationEnabled;
 
     // Optional canonical alpha-blend A/B test for the vanilla 1.20.1 text
     // program. No default behavior changes unless the env var is present.
@@ -4762,6 +6749,20 @@ void APIENTRY glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alp
     gl4metalSetError(GL_NO_ERROR);
 }
 
+void APIENTRY glSampleCoverage(GLclampf value, GLboolean invert) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (value < 0.0f || value > 1.0f) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    ctx.sampleCoverageValue = value;
+    ctx.sampleCoverageInvert = invert ? GL_TRUE : GL_FALSE;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
+void APIENTRY glPrimitiveRestartIndex(GLuint index) {
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    ctx.primitiveRestartIndex = index;
+    gl4metalSetError(GL_NO_ERROR);
+}
+
 void APIENTRY glEnable(GLenum cap) {
     if (!ctx) {
         gl4metalSetError(GL_INVALID_OPERATION);
@@ -4786,6 +6787,20 @@ void APIENTRY glEnable(GLenum cap) {
         }
     } else if (cap == GL_CULL_FACE) {
         ctx.cullEnabled = GL_TRUE;
+    } else if (cap == GL_POLYGON_OFFSET_FILL) {
+        ctx.polygonOffsetFillEnabled = GL_TRUE;
+    } else if (cap == GL_POLYGON_OFFSET_LINE) {
+        ctx.polygonOffsetLineEnabled = GL_TRUE;
+    } else if (cap == GL_POLYGON_OFFSET_POINT) {
+        ctx.polygonOffsetPointEnabled = GL_TRUE;
+    } else if (cap == GL_SAMPLE_COVERAGE) {
+        ctx.sampleCoverageEnabled = GL_TRUE;
+    } else if (cap == GL_PRIMITIVE_RESTART) {
+        ctx.primitiveRestartEnabled = GL_TRUE;
+    } else if (cap == GL_COLOR_LOGIC_OP) {
+        gl4metalColorLogicOperationEnabled = GL_TRUE;
+        ctx.pipelineState = nil;
+        [pipelineLayoutCache removeAllObjects];
     } else {
         gl4metalSetError(GL_INVALID_ENUM);
         return;
@@ -4816,6 +6831,20 @@ void APIENTRY glDisable(GLenum cap) {
         }
     } else if (cap == GL_CULL_FACE) {
         ctx.cullEnabled = GL_FALSE;
+    } else if (cap == GL_POLYGON_OFFSET_FILL) {
+        ctx.polygonOffsetFillEnabled = GL_FALSE;
+    } else if (cap == GL_POLYGON_OFFSET_LINE) {
+        ctx.polygonOffsetLineEnabled = GL_FALSE;
+    } else if (cap == GL_POLYGON_OFFSET_POINT) {
+        ctx.polygonOffsetPointEnabled = GL_FALSE;
+    } else if (cap == GL_SAMPLE_COVERAGE) {
+        ctx.sampleCoverageEnabled = GL_FALSE;
+    } else if (cap == GL_PRIMITIVE_RESTART) {
+        ctx.primitiveRestartEnabled = GL_FALSE;
+    } else if (cap == GL_COLOR_LOGIC_OP) {
+        gl4metalColorLogicOperationEnabled = GL_FALSE;
+        ctx.pipelineState = nil;
+        [pipelineLayoutCache removeAllObjects];
     } else {
         gl4metalSetError(GL_INVALID_ENUM);
         return;
@@ -4834,10 +6863,64 @@ GLboolean APIENTRY glIsEnabled(GLenum cap) {
         case GL_STENCIL_TEST: return ctx.stencilTestEnabled;
         case GL_SCISSOR_TEST: return ctx.scissorTestEnabled;
         case GL_CULL_FACE: return ctx.cullEnabled;
+        case GL_POLYGON_OFFSET_FILL: return ctx.polygonOffsetFillEnabled;
+        case GL_POLYGON_OFFSET_LINE: return ctx.polygonOffsetLineEnabled;
+        case GL_POLYGON_OFFSET_POINT: return ctx.polygonOffsetPointEnabled;
+        case GL_SAMPLE_COVERAGE: return ctx.sampleCoverageEnabled;
+        case GL_PRIMITIVE_RESTART: return ctx.primitiveRestartEnabled;
+        case GL_COLOR_LOGIC_OP: return gl4metalColorLogicOperationEnabled;
         default:
             gl4metalSetError(GL_INVALID_ENUM);
             return GL_FALSE;
     }
+}
+
+void APIENTRY glEnablei(GLenum cap, GLuint index) {
+    if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    glEnable(cap);
+}
+
+void APIENTRY glDisablei(GLenum cap, GLuint index) {
+    if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    glDisable(cap);
+}
+
+GLboolean APIENTRY glIsEnabledi(GLenum cap, GLuint index) {
+    if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return GL_FALSE; }
+    if (cap != GL_BLEND && cap != GL_SCISSOR_TEST) {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return GL_FALSE;
+    }
+    return glIsEnabled(cap);
+}
+
+void APIENTRY glColorMaski(GLuint index, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+    if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    glColorMask(red, green, blue, alpha);
+}
+
+void APIENTRY glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
+    if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+    if (!ctx) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+    if (target == GL_COLOR_WRITEMASK) {
+        data[0] = ctx.colorMaskRed; data[1] = ctx.colorMaskGreen;
+        data[2] = ctx.colorMaskBlue; data[3] = ctx.colorMaskAlpha;
+    } else if (target == GL_BLEND) {
+        data[0] = ctx.blendEnabled;
+    } else {
+        gl4metalSetError(GL_INVALID_ENUM);
+        return;
+    }
+    gl4metalSetError(GL_NO_ERROR);
 }
 
 void APIENTRY glDepthFunc(GLenum func) {

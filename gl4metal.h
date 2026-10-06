@@ -51,6 +51,9 @@ typedef struct {
 @property (nonatomic, copy) NSString *gpuFamilyName;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *boundBuffers;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, NSDictionary<NSString *, NSNumber *> *> *> *indexedBufferBindings;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *framebufferDrawBuffers;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *framebufferReadBuffers;
 @property (nonatomic, assign) GLuint currentVAO;
 @property (nonatomic, assign) GLuint currentFramebuffer;
 @property (nonatomic, assign) GLuint currentReadFramebuffer;
@@ -73,6 +76,13 @@ typedef struct {
 @property (nonatomic, assign) GLenum stencilFail;
 @property (nonatomic, assign) GLenum stencilDepthFail;
 @property (nonatomic, assign) GLenum stencilDepthPass;
+@property (nonatomic, assign) GLenum stencilBackFunc;
+@property (nonatomic, assign) GLint stencilBackRef;
+@property (nonatomic, assign) GLuint stencilBackReadMask;
+@property (nonatomic, assign) GLuint stencilBackWriteMask;
+@property (nonatomic, assign) GLenum stencilBackFail;
+@property (nonatomic, assign) GLenum stencilBackDepthFail;
+@property (nonatomic, assign) GLenum stencilBackDepthPass;
 @property (nonatomic, assign) GLboolean blendEnabled;
 @property (nonatomic, assign) GLenum blendSrcRGB;
 @property (nonatomic, assign) GLenum blendDstRGB;
@@ -92,6 +102,18 @@ typedef struct {
 @property (nonatomic, assign) GLenum polygonMode;
 @property (nonatomic, assign) GLfloat lineWidth;
 @property (nonatomic, assign) GLfloat pointSize;
+@property (nonatomic, assign) GLfloat polygonOffsetFactor;
+@property (nonatomic, assign) GLfloat polygonOffsetUnits;
+@property (nonatomic, assign) GLboolean polygonOffsetFillEnabled;
+@property (nonatomic, assign) GLboolean polygonOffsetLineEnabled;
+@property (nonatomic, assign) GLboolean polygonOffsetPointEnabled;
+@property (nonatomic, assign) GLboolean sampleCoverageEnabled;
+@property (nonatomic, assign) GLfloat sampleCoverageValue;
+@property (nonatomic, assign) GLboolean sampleCoverageInvert;
+@property (nonatomic, assign) GLboolean primitiveRestartEnabled;
+@property (nonatomic, assign) GLuint primitiveRestartIndex;
+@property (nonatomic, assign) GLdouble depthRangeNear;
+@property (nonatomic, assign) GLdouble depthRangeFar;
 @property (nonatomic, assign) GLint clearStencil;
 @property (nonatomic, assign) GLuint stencilWriteMask;
 @property (nonatomic, assign) GLboolean colorMaskRed;
@@ -99,6 +121,7 @@ typedef struct {
 @property (nonatomic, assign) GLboolean colorMaskBlue;
 @property (nonatomic, assign) GLboolean colorMaskAlpha;
 @property (nonatomic, assign) GLenum drawBuffer;
+@property (nonatomic, assign) GLenum readBuffer;
 
 @property (nonatomic, strong) id<MTLDepthStencilState> depthStencilState;
 @property (nonatomic, strong) id<MTLTexture> depthTexture;
@@ -107,6 +130,9 @@ typedef struct {
 @property (nonatomic, assign) double clearDepth;
 @property (nonatomic, assign) GLbitfield pendingClearFlags;
 @property (nonatomic, assign) GLuint pendingClearFramebuffer;
+@property (nonatomic, assign) MTLClearColor pendingClearColor;
+@property (nonatomic, assign) double pendingClearDepth;
+@property (nonatomic, assign) GLuint pendingClearStencil;
 
 @property (nonatomic, assign) gl4metalRect viewport;
 @property (nonatomic, assign) gl4metalRect scissorRect;
@@ -145,21 +171,30 @@ BOOL gl4metalCreatePipelineState(id<MTLFunction> vertexFunction, id<MTLFunction>
 BOOL gl4metalCreatePipelineStateForProgram(GLuint program, id<MTLFunction> vertexFunction, id<MTLFunction> fragmentFunction, MTLVertexDescriptor *vertexDescriptor);
 void gl4metalDumpProgramResourceInfo(GLuint program);
 void gl4metalSetError(GLenum error);
+void gl4metalFlushPendingClear(void);
+id<MTLTexture> gl4metalGetDefaultDepthTexture(void);
 void gl4metalRegisterConstantVertexAttribute(NSUInteger index, MTLVertexFormat format);
 void gl4metalUpdateConstantVertexAttribute(NSUInteger index);
 void gl4metalInitTextureState(void);
 void gl4metalInitFramebufferState(void);
+void gl4metalResetFramebufferState(void);
 
 // Current GL framebuffer -> Metal render-target bridge.
 id<MTLTexture> gl4metalGetCurrentFramebufferColorTexture(void);
 id<MTLTexture> gl4metalGetCurrentFramebufferDepthTexture(void);
 id<MTLTexture> gl4metalGetCurrentFramebufferStencilTexture(void);
+NSUInteger gl4metalGetCurrentFramebufferColorLevel(void);
+NSUInteger gl4metalGetCurrentFramebufferDepthLevel(void);
+NSUInteger gl4metalGetCurrentFramebufferStencilLevel(void);
 MTLPixelFormat gl4metalGetCurrentColorPixelFormat(void);
 MTLPixelFormat gl4metalGetCurrentDepthPixelFormat(void);
 MTLPixelFormat gl4metalGetCurrentStencilPixelFormat(void);
 id<MTLTexture> gl4metalGetTextureForUnit(GLuint unit);
 id<MTLSamplerState> gl4metalGetSamplerForUnit(GLuint unit);
 GLuint gl4metalGetTextureNameForUnit(GLuint unit);
+GLuint gl4metalGetTextureNameForTarget(GLuint unit, GLenum target);
+GLuint gl4metalGetSamplerNameForUnit(GLuint unit);
+GLuint gl4metalGetActiveTextureUnit(void);
 
 #ifdef __cplusplus
 }

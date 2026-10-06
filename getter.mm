@@ -1,11 +1,15 @@
-#import "gl4metal.h"
+#import "gl4metal_runtime.h"
 #include "glcorearb.h"
 
-extern GLenum lastGL4MetalError;
-
 GLenum APIENTRY glGetError() {
-    GLenum error = lastGL4MetalError;
-    lastGL4MetalError = GL_NO_ERROR;
+    if (!gl4metalPendingErrors || gl4metalPendingErrors.count == 0) {
+        lastGL4MetalError = GL_NO_ERROR;
+        return GL_NO_ERROR;
+    }
+    GLenum error = gl4metalPendingErrors.firstObject.unsignedIntValue;
+    [gl4metalPendingErrors removeObjectAtIndex:0];
+    lastGL4MetalError = gl4metalPendingErrors.count
+        ? gl4metalPendingErrors.firstObject.unsignedIntValue : GL_NO_ERROR;
     return error;
 }
 
@@ -29,37 +33,10 @@ void APIENTRY glGetPointerv(GLenum pname, void**params) {
 static NSArray<NSString *> *gl4metalGetExtensionList(void) {
     static NSArray<NSString *> *cachedExtensions = nil;
     if (cachedExtensions == nil) {
-        NSMutableArray<NSString *> *items = [NSMutableArray arrayWithArray:@[
-            @"GL_ARB_buffer_object",
-            @"GL_ARB_vertex_array_object",
-            @"GL_ARB_vertex_buffer_object",
-            @"GL_ARB_framebuffer_object",
-            @"GL_EXT_framebuffer_object",
-            @"GL_OES_vertex_array_object"
-        ]];
-
-        NSUInteger family = gl4metalGetGPUFamily();
-        if (family > 0) {
-            [items addObject:[NSString stringWithFormat:@"GL_APPLE_gpu_family_%lu", (unsigned long)family]];
-            [items addObjectsFromArray:@[
-                @"GL_APPLE_framebuffer_multisample",
-                @"GL_APPLE_rgb_422"
-            ]];
-            if (family >= 3) {
-                [items addObjectsFromArray:@[
-                    @"GL_EXT_color_buffer_float",
-                    @"GL_EXT_shader_framebuffer_fetch"
-                ]];
-            }
-            if (family >= 4) {
-                [items addObjectsFromArray:@[
-                    @"GL_EXT_texture_compression_astc_decode_mode",
-                    @"GL_KHR_texture_compression_astc_ldr"
-                ]];
-            }
-        }
-
-        cachedExtensions = [items copy];
+        // No optional GL extensions are exposed. The previous list claimed
+        // multisample, ASTC, framebuffer-fetch, and VAO aliases that this
+        // backend does not implement as those extensions specify.
+        cachedExtensions = @[];
     }
     return cachedExtensions;
 }
@@ -75,7 +52,7 @@ GLint gl4metalGetExtensionCount(void) {
 
 const GLubyte* APIENTRY glGetString(GLenum name) {
     static const char *vendor = "congcq";
-    static const char *version = "3.3.0 Core Profile";
+    static const char *version = "3.3.0 GL4Metal";
     static const char *slVersion = "3.30";
 
     switch(name) {
@@ -88,10 +65,11 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
         case GL_SHADING_LANGUAGE_VERSION:
             return (const GLubyte *)slVersion;
         case GL_EXTENSIONS: {
-            NSString *extensions = getExtensions();
-            return (const GLubyte *)extensions.UTF8String;
+            gl4metalSetError(GL_INVALID_ENUM);
+            return NULL;
         }
         default:
+            gl4metalSetError(GL_INVALID_ENUM);
             return NULL;
     }
 }

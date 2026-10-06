@@ -4,8 +4,10 @@
 
 #include <regex>
 #include <algorithm>
-#include <set>
 #include <cctype>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
 
 NSString *gl4metalBuildPipelineCacheKey(GLuint program, gl4metalVertexArray *vao) {
     NSMutableString *key = [NSMutableString stringWithFormat:@"p%u:rtC%luD%luS%lu:B%d/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u;",
@@ -468,113 +470,30 @@ BOOL gl4metalCreateProgramPipelineForProgram(GLuint program) {
     return YES;
 }
 
-// Rewrite framebuffer/post-process sampling without changing ordinary texture
-// uploads. Minecraft's DiffuseSampler is used for compositor framebuffer
-// textures; their Metal render-target origin is opposite to GL texture-space
-// Y. Applying the flip at this exact sampling site avoids double-flipping
-// normal asset textures such as the loading-screen texture.
-static std::string gl4metalRewriteDiffuseSamplerY(const std::string &source) {
-    if (source.find("DiffuseSampler") == std::string::npos) return source;
-    if (getenv("GL4METAL_NO_FBO_Y_FLIP")) return source;
-
-    std::string out;
-    out.reserve(source.size() + 128);
-    size_t cursor = 0;
-    bool changed = false;
-
-    while (cursor < source.size()) {
-        size_t pos = source.find("texture", cursor);
-        if (pos == std::string::npos) {
-            out.append(source, cursor, std::string::npos);
-            break;
-        }
-
-        // Avoid identifiers such as textureProj or mytexture.
-        bool leftOk = (pos == 0) || !(std::isalnum((unsigned char)source[pos - 1]) || source[pos - 1] == '_');
-        size_t afterName = pos + 7;
-        bool exactTextureName = afterName <= source.size() &&
-            (afterName == source.size() || std::isspace((unsigned char)source[afterName]) || source[afterName] == '(');
-        size_t open = source.find('(', afterName);
-        if (!leftOk || !exactTextureName || open == std::string::npos) {
-            out.append(source, cursor, afterName - cursor);
-            cursor = afterName;
-            continue;
-        }
-
-        // Find the first argument and the top-level comma.
-        size_t i = open + 1;
-        while (i < source.size() && std::isspace((unsigned char)source[i])) ++i;
-        const std::string samplerName = "DiffuseSampler";
-        if (source.compare(i, samplerName.size(), samplerName) != 0) {
-            out.append(source, cursor, open + 1 - cursor);
-            cursor = open + 1;
-            continue;
-        }
-        i += samplerName.size();
-        while (i < source.size() && std::isspace((unsigned char)source[i])) ++i;
-        if (i >= source.size() || source[i] != ',') {
-            out.append(source, cursor, i - cursor);
-            cursor = i;
-            continue;
-        }
-
-        size_t exprStart = i + 1;
-        while (exprStart < source.size() && std::isspace((unsigned char)source[exprStart])) ++exprStart;
-
-        int depth = 1;
-        bool inString = false;
-        char stringQuote = '\0';
-        size_t exprEnd = exprStart;
-        for (; exprEnd < source.size(); ++exprEnd) {
-            char c = source[exprEnd];
-            if (inString) {
-                if (c == stringQuote && (exprEnd == 0 || source[exprEnd - 1] != '\\')) inString = false;
-                continue;
-            }
-            if (c == '"' || c == '\'') {
-                inString = true;
-                stringQuote = c;
-            } else if (c == '(') {
-                ++depth;
-            } else if (c == ')') {
-                --depth;
-                if (depth == 0) break;
-            }
-        }
-        if (exprEnd >= source.size()) {
-            out.append(source, cursor, std::string::npos);
-            cursor = source.size();
-            break;
-        }
-
-        std::string coordExpr = source.substr(exprStart, exprEnd - exprStart);
-        out.append(source, cursor, pos - cursor);
-        out.append("texture(DiffuseSampler, vec2((");
-        out.append(coordExpr);
-        out.append(").x, 1.0 - (" );
-        out.append(coordExpr);
-        out.append(").y))");
-        cursor = exprEnd + 1;
-        changed = true;
-    }
-
-    if (changed) {
-        printf("[gl4metal][ORIGIN] DiffuseSampler Y-flip enabled for framebuffer/post-process sampling\n");
-        return out;
-    }
-    return source;
-}
-
 static std::string stripGLSLComments(const std::string &source) {
     std::string out;
     out.reserve(source.size());
 
     bool inLineComment = false;
     bool inBlockComment = false;
+    char stringDelimiter = '\0';
+    bool escaped = false;
 
     for (size_t i = 0; i < source.size(); ++i) {
         const char c = source[i];
         const char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+
+        if (stringDelimiter != '\0') {
+            out.push_back(c);
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == stringDelimiter) {
+                stringDelimiter = '\0';
+            }
+            continue;
+        }
 
         if (inLineComment) {
             // Keep newlines so glslang line/column diagnostics stay useful.
@@ -599,19 +518,29 @@ static std::string stripGLSLComments(const std::string &source) {
         }
 
         if (c == '/' && next == '/') {
+            if (!out.empty() && !std::isspace((unsigned char)out.back())) out.push_back(' ');
             inLineComment = true;
             ++i;
             continue;
         }
 
         if (c == '/' && next == '*') {
+            if (!out.empty() && !std::isspace((unsigned char)out.back())) out.push_back(' ');
             inBlockComment = true;
             ++i;
             continue;
         }
 
+        if (c == '"' || c == '\'') {
+            stringDelimiter = c;
+            out.push_back(c);
+            continue;
+        }
+
         out.push_back(c);
     }
+
+    if (inBlockComment) out.append("/*");
 
     // Never feed an unterminated trailing line to glslang.
     if (out.empty() || (out.back() != '\n' && out.back() != '\r')) {
@@ -623,31 +552,358 @@ static std::string stripGLSLComments(const std::string &source) {
     return out;
 }
 
-std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource) {
-    if (glslSource.empty()) return "";
+static void replaceGLSLIdentifier(std::string &source, const char *identifier,
+                                  const char *replacement) {
+    const std::regex token(std::string(R"(\b)") + identifier + R"(\b)");
+    source = std::regex_replace(source, token, replacement);
+}
+
+static bool insertGLSLDeclarationBeforeCode(std::string &source,
+                                             const std::string &declaration) {
+    size_t lineStart = 0;
+    bool continuingDirective = false;
+    while (lineStart < source.size()) {
+        size_t lineEnd = source.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = source.size();
+        size_t first = lineStart;
+        while (first < lineEnd && (source[first] == ' ' || source[first] == '\t' || source[first] == '\r')) ++first;
+        size_t last = lineEnd;
+        while (last > first && (source[last - 1] == ' ' || source[last - 1] == '\t' || source[last - 1] == '\r')) --last;
+
+        bool isDirective = first < lineEnd && source[first] == '#';
+        bool isBlank = first == lineEnd;
+        bool isConditional = isDirective &&
+            (source.compare(first, 3, "#if") == 0 ||
+             source.compare(first, 5, "#else") == 0 ||
+             source.compare(first, 6, "#endif") == 0);
+        if (isConditional && !continuingDirective) {
+            source.insert(lineStart, declaration);
+            return true;
+        }
+        if (!continuingDirective && !isDirective && !isBlank) {
+            source.insert(lineStart, declaration);
+            return true;
+        }
+        continuingDirective = last > first && source[last - 1] == '\\';
+        lineStart = lineEnd < source.size() ? lineEnd + 1 : source.size();
+    }
+    source.append(declaration);
+    return true;
+}
+
+static std::string gl4metalFlipDiffuseSamplerY(const std::string &source) {
+    const std::string samplerName = "DiffuseSampler";
+    const std::string textureName = "texture";
+    std::string output;
+    output.reserve(source.size() + 64);
+    size_t cursor = 0;
+    bool changed = false;
+
+    while (cursor < source.size()) {
+        size_t call = source.find(textureName, cursor);
+        if (call == std::string::npos) {
+            output.append(source, cursor, std::string::npos);
+            break;
+        }
+
+        size_t afterName = call + textureName.size();
+        const bool leftBoundary = call == 0 ||
+            !(std::isalnum((unsigned char)source[call - 1]) || source[call - 1] == '_');
+        const bool rightBoundary = afterName == source.size() ||
+            !(std::isalnum((unsigned char)source[afterName]) || source[afterName] == '_');
+        size_t open = afterName;
+        while (open < source.size() && std::isspace((unsigned char)source[open])) ++open;
+        if (!leftBoundary || !rightBoundary || open >= source.size() || source[open] != '(') {
+            output.append(source, cursor, afterName - cursor);
+            cursor = afterName;
+            continue;
+        }
+
+        size_t samplerStart = open + 1;
+        while (samplerStart < source.size() && std::isspace((unsigned char)source[samplerStart])) ++samplerStart;
+        const size_t samplerEnd = samplerStart + samplerName.size();
+        if (samplerEnd > source.size() || source.compare(samplerStart, samplerName.size(), samplerName) != 0 ||
+            (samplerEnd < source.size() &&
+             (std::isalnum((unsigned char)source[samplerEnd]) || source[samplerEnd] == '_'))) {
+            output.append(source, cursor, afterName - cursor);
+            cursor = afterName;
+            continue;
+        }
+
+        size_t comma = samplerEnd;
+        while (comma < source.size() && std::isspace((unsigned char)source[comma])) ++comma;
+        if (comma >= source.size() || source[comma] != ',') {
+            output.append(source, cursor, samplerEnd - cursor);
+            cursor = samplerEnd;
+            continue;
+        }
+
+        size_t coordinateStart = comma + 1;
+        while (coordinateStart < source.size() && std::isspace((unsigned char)source[coordinateStart])) ++coordinateStart;
+        size_t callEnd = coordinateStart;
+        int depth = 1;
+        char quote = '\0';
+        bool escaped = false;
+        for (; callEnd < source.size(); ++callEnd) {
+            const char c = source[callEnd];
+            if (quote != '\0') {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == quote) quote = '\0';
+                continue;
+            }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(') ++depth;
+            else if (c == ')' && --depth == 0) break;
+        }
+        if (callEnd >= source.size()) {
+            output.append(source, cursor, std::string::npos);
+            break;
+        }
+
+        output.append(source, cursor, call);
+        output.append("texture(DiffuseSampler, ((");
+        output.append(source, coordinateStart, callEnd - coordinateStart);
+        output.append(") * vec2(1.0, -1.0) + vec2(0.0, 1.0)))");
+        cursor = callEnd + 1;
+        changed = true;
+    }
+
+    if (changed) {
+        printf("[gl4metal][ORIGIN] flipped framebuffer Y for DiffuseSampler\n");
+        return output;
+    }
+    return source;
+}
+
+static bool normalizeGLSLForSPIRV(GLenum shaderType, std::string &source,
+                                  std::string *diagnostics) {
+    static const std::regex versionDirective(
+        R"(#version[ \t]+([0-9]+)(?:[ \t]+(core|compatibility|es))?[^\r\n]*)");
+    std::smatch versionMatch;
+    const bool hasVersion = std::regex_search(source, versionMatch, versionDirective);
+    int sourceVersion = 110;
+    if (hasVersion) {
+        try {
+            sourceVersion = std::stoi(versionMatch[1].str());
+        } catch (...) {
+            if (diagnostics) *diagnostics = "Invalid GLSL #version directive.";
+            return false;
+        }
+    }
+    const std::string profile = hasVersion && versionMatch.size() > 2
+        ? versionMatch[2].str() : std::string();
+
+    if (profile == "compatibility" && sourceVersion >= 330) {
+        if (diagnostics) *diagnostics = "GLSL compatibility-profile shaders cannot be represented by the OpenGL SPIR-V to Metal path.";
+        return false;
+    }
+
+    // OpenGL SPIR-V requires desktop GLSL 3.30+. Older valid OpenGL source
+    // is upgraded after translating its legacy interface and texture names.
+    // Keep newer #version directives intact so their language features are
+    // not silently erased by a downgrade to 330.
+    const bool upgradeLegacy = !hasVersion || sourceVersion < 330 || profile == "es";
+    if (upgradeLegacy) {
+        if (hasVersion) source.replace((size_t)versionMatch.position(), (size_t)versionMatch.length(), "#version 330 core");
+        else source.insert(0, "#version 330 core\n");
+
+        // Precision qualifiers have no effect in desktop GLSL or Metal's
+        // unified float model. Remove ESSL precision statements and tokens.
+        source = std::regex_replace(source,
+            std::regex(R"(\bprecision\s+(?:lowp|mediump|highp)\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*)"), "");
+        source = std::regex_replace(source,
+            std::regex(R"(\b(?:lowp|mediump|highp)\b\s*)"), "");
+
+        if (shaderType == GL_VERTEX_SHADER) {
+            replaceGLSLIdentifier(source, "attribute", "in");
+            replaceGLSLIdentifier(source, "varying", "out");
+        } else {
+            replaceGLSLIdentifier(source, "varying", "in");
+            replaceGLSLIdentifier(source, "gl_FragColor", "gl4metal_FragColor");
+            replaceGLSLIdentifier(source, "gl_FragData", "gl4metal_FragData");
+        }
+
+        const char *legacyTextureFunctions[] = {
+            "texture1D", "texture2D", "texture3D", "textureCube",
+            "texture1DProj", "texture2DProj", "texture3DProj"
+        };
+        for (const char *name : legacyTextureFunctions) {
+            replaceGLSLIdentifier(source, name,
+                (std::string(name).find("Proj") != std::string::npos) ? "textureProj" : "texture");
+        }
+        replaceGLSLIdentifier(source, "shadow1D", "texture");
+        replaceGLSLIdentifier(source, "shadow2D", "texture");
+        replaceGLSLIdentifier(source, "shadow2DProj", "textureProj");
+
+        if (shaderType == GL_FRAGMENT_SHADER) {
+            const bool usesFragColor = source.find("gl4metal_FragColor") != std::string::npos;
+            const bool usesFragData = source.find("gl4metal_FragData") != std::string::npos;
+            if (usesFragData) {
+                source = std::regex_replace(source,
+                    std::regex(R"(\bgl4metal_FragData\s*\[\s*0\s*\])"), "gl4metal_FragData0");
+                if (std::regex_search(source, std::regex(R"(\bgl4metal_FragData\b)"))) {
+                    if (diagnostics) *diagnostics = "Legacy gl_FragData outputs above location 0 are not supported by this single-color Metal backend.";
+                    return false;
+                }
+            }
+            std::string outputs;
+            if (usesFragColor) outputs += "layout(location = 0) out vec4 gl4metal_FragColor;\n";
+            if (usesFragData) outputs += "layout(location = 0) out vec4 gl4metal_FragData0;\n";
+            if (!outputs.empty()) insertGLSLDeclarationBeforeCode(source, outputs);
+        }
+    }
+
+    return true;
+}
+
+    static void gl4metalDumpShaderSection(unsigned long long compileId,
+                          GLenum shaderType,
+                          const char *section,
+                          const std::string &source) {
+        fprintf(stderr, "\n[gl4metal][SHADER_DUMP][%llu][%s][%s] BEGIN (%zu bytes)\n",
+            compileId, shaderType == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT",
+            section, source.size());
+        if (!source.empty()) fwrite(source.data(), 1, source.size(), stderr);
+        if (source.empty() || source.back() != '\n') fputc('\n', stderr);
+        fprintf(stderr, "[gl4metal][SHADER_DUMP][%llu][%s][%s] END\n",
+            compileId, shaderType == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT",
+            section);
+        fflush(stderr);
+    }
+
+    static void gl4metalReserveVertexBufferSlots(spirv_cross::CompilerMSL &compiler,
+                                                bool dumpShaders,
+                                                unsigned long long compileId,
+                                                GLenum shaderType) {
+        const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+        uint32_t nextBufferIndex = 16;
+        uint32_t nextPlainUniformBinding = 0;
+
+        const auto reserveExistingBinding = [&](const spirv_cross::Resource &resource) {
+            if (!compiler.has_decoration(resource.id, spv::DecorationBinding)) return;
+            uint32_t binding = compiler.get_decoration(resource.id, spv::DecorationBinding);
+            if (binding >= nextPlainUniformBinding && binding != UINT32_MAX) {
+                nextPlainUniformBinding = binding + 1;
+            }
+        };
+        for (const spirv_cross::Resource &resource : resources.uniform_buffers) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.gl_plain_uniforms) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.subpass_inputs) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.storage_images) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.sampled_images) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.atomic_counters) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.acceleration_structures) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.tensors) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.push_constant_buffers) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.shader_record_buffers) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.separate_images) {
+            reserveExistingBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.separate_samplers) {
+            reserveExistingBinding(resource);
+        }
+
+        const auto addBufferBinding = [&](const spirv_cross::Resource &resource) {
+            spirv_cross::MSLResourceBinding binding;
+            binding.stage = compiler.get_execution_model();
+            binding.desc_set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet);
+            binding.binding = compiler.get_decoration(resource.id, spv::DecorationBinding);
+            binding.msl_buffer = nextBufferIndex++;
+            compiler.add_msl_resource_binding(binding);
+            if (dumpShaders) {
+                fprintf(stderr,
+                    "[gl4metal][SHADER_DUMP][%llu][%s][RESOURCE_BINDING] %s set=%u binding=%u -> buffer(%u)\n",
+                    compileId, shaderType == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT",
+                    resource.name.c_str(), binding.desc_set, binding.binding, binding.msl_buffer);
+            }
+        };
+
+        for (const spirv_cross::Resource &resource : resources.uniform_buffers) {
+            addBufferBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.gl_plain_uniforms) {
+            uint32_t descriptorSet = compiler.has_decoration(resource.id, spv::DecorationDescriptorSet)
+                ? compiler.get_decoration(resource.id, spv::DecorationDescriptorSet) : 0;
+            compiler.set_decoration(resource.id, spv::DecorationDescriptorSet, descriptorSet);
+            compiler.set_decoration(resource.id, spv::DecorationBinding, nextPlainUniformBinding++);
+            addBufferBinding(resource);
+        }
+        for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+            addBufferBinding(resource);
+        }
+    }
+
+std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
+                               std::string *diagnostics) {
+    if (diagnostics) diagnostics->clear();
+    if (shaderType != GL_VERTEX_SHADER && shaderType != GL_FRAGMENT_SHADER) {
+        if (diagnostics) *diagnostics = "Only vertex and fragment shaders can be translated to Metal.";
+        return "";
+    }
+    if (glslSource.empty()) {
+        if (diagnostics) *diagnostics = "Shader source is empty.";
+        return "";
+    }
+
+    const char *dumpSetting = getenv("GL4METAL_DUMP_SHADERS");
+    const bool dumpShaders = dumpSetting && dumpSetting[0] != '\0' &&
+        strcmp(dumpSetting, "0") != 0 && strcmp(dumpSetting, "false") != 0;
+    static unsigned long long nextCompileId = 0;
+    const unsigned long long compileId = dumpShaders ? ++nextCompileId : 0;
+    if (dumpShaders) {
+        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_SOURCE", glslSource);
+    }
 
     // Minecraft frequently appends generated // [TAG] annotations. Strip
     // GLSL comments before parsing so glslang never sees an EOF comment.
     std::string glsl = stripGLSLComments(glslSource);
 
-    // Framebuffer/post-process textures use GL texture coordinates against
-    // Metal render-target origin. Keep ordinary texture uploads untouched and
-    // correct only DiffuseSampler reads here.
-    glsl = gl4metalRewriteDiffuseSamplerY(glsl);
+    if (!normalizeGLSLForSPIRV(shaderType, glsl, diagnostics)) {
+        return "";
+    }
 
-    std::regex versionRegex(R"(#version\s+\d+([^\r\n]*))");
+    if (shaderType == GL_FRAGMENT_SHADER) {
+        glsl = gl4metalFlipDiffuseSamplerY(glsl);
+    }
 
-    if (std::regex_search(glsl, versionRegex)) {
-        glsl = std::regex_replace(glsl, versionRegex, "#version 330 core");
-    } else {
-        glsl = "#version 330 core\n" + glsl;
+    if (dumpShaders) {
+        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_TRANSLATION_INPUT", glsl);
     }
 
     EShLanguage stage = (shaderType == GL_VERTEX_SHADER) ? EShLangVertex : EShLangFragment;
 
     glslang::TShader shader(stage);
     const char *shaderStrings = glsl.c_str();
-    shader.setStrings(&shaderStrings, 1);
+    if (glsl.size() > (size_t)INT_MAX) {
+        if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
+        return "";
+    }
+    const int shaderLength = (int)glsl.size();
+    shader.setStringsWithLengths(&shaderStrings, &shaderLength, 1);
 
     shader.setAutoMapLocations(true);
     shader.setAutoMapBindings(true);
@@ -661,7 +917,11 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
     EShMessages messages = (EShMessages)(EShMsgDefault | EShMsgSpvRules);
 
     if (!shader.parse(resources, defaultVersion, false, messages)) {
-        printf("[gl4metal] ERROR: GLSL parsing failed: %s\n", shader.getInfoLog());
+        std::string message = shader.getInfoLog() ? shader.getInfoLog() : "";
+        std::string debug = shader.getInfoDebugLog() ? shader.getInfoDebugLog() : "";
+        if (!debug.empty()) message += (message.empty() ? "" : "\n") + debug;
+        if (diagnostics) *diagnostics = message.empty() ? "GLSL parsing failed." : message;
+        printf("[gl4metal] ERROR: GLSL parsing failed: %s\n", message.c_str());
         return "";
     }
 
@@ -669,17 +929,29 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
     program.addShader(&shader);
 
     if (!program.link(messages)) {
-        printf("[gl4metal] ERROR: GLSL linking failed: %s\n", program.getInfoLog());
+        std::string message = program.getInfoLog() ? program.getInfoLog() : "";
+        std::string debug = program.getInfoDebugLog() ? program.getInfoDebugLog() : "";
+        if (!debug.empty()) message += (message.empty() ? "" : "\n") + debug;
+        if (diagnostics) *diagnostics = message.empty() ? "GLSL stage linking failed." : message;
+        printf("[gl4metal] ERROR: GLSL linking failed: %s\n", message.c_str());
         return "";
     }
 
     program.mapIO();
 
     std::vector<unsigned int> spirv;
-    glslang::GlslangToSpv(*program.getIntermediate(stage), spirv);
+    const glslang::TIntermediate *intermediate = program.getIntermediate(stage);
+    if (!intermediate) {
+        if (diagnostics) *diagnostics = "glslang did not produce an intermediate shader representation.";
+        return "";
+    }
+    spv::SpvBuildLogger spirvLogger;
+    glslang::GlslangToSpv(*intermediate, spirv, &spirvLogger);
 
     if (spirv.empty()) {
-        printf("[gl4metal] ERROR: SPIR-V generation failed\n");
+        std::string message = spirvLogger.getAllMessages();
+        if (diagnostics) *diagnostics = message.empty() ? "SPIR-V generation failed." : message;
+        printf("[gl4metal] ERROR: SPIR-V generation failed: %s\n", message.c_str());
         return "";
     }
 
@@ -690,101 +962,11 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
         mslOptions.platform = spirv_cross::CompilerMSL::Options::iOS;
         mslOptions.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(2, 1);
         mslCompiler.set_msl_options(mslOptions);
+        gl4metalReserveVertexBufferSlots(mslCompiler, dumpShaders, compileId, shaderType);
 
         std::string mslSource = mslCompiler.compile();
-
-        // Keep Metal buffer(0..15) reserved for vertex-input resources.
-        // SPIRV-Cross may place GLSL uniforms in the same low buffer slots,
-        // which collides with the GL4Metal vertex-buffer namespace. Remap
-        // known GLSL uniform declarations to a separate buffer namespace.
-        // Vertex and fragment stages have independent Metal buffer namespaces.
-        // We intentionally keep texture()/sampler() indices unchanged.
-        {
-            std::regex uniformDecl(
-                R"(\buniform\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*;)"
-            );
-            std::vector<std::string> uniformNames;
-            for (std::sregex_iterator it(glsl.begin(), glsl.end(), uniformDecl), end; it != end; ++it) {
-                uniformNames.push_back((*it)[1].str());
-            }
-
-            // Also catch sampler/image uniforms. These are not remapped as
-            // buffers, but are included here so the name scan stays explicit.
-            std::regex uniformAny(
-                R"(\buniform\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*;)"
-            );
-            for (std::sregex_iterator it(glsl.begin(), glsl.end(), uniformAny), end; it != end; ++it) {
-                std::string n = (*it)[1].str();
-                if (std::find(uniformNames.begin(), uniformNames.end(), n) == uniformNames.end())
-                    uniformNames.push_back(n);
-            }
-
-            // Metal buffer namespaces are independent for vertex and fragment
-            // stages, but resource indices must still be unique *within one
-            // stage*. Do not give ColorModulator and ProjMat the same slot in
-            // a fragment shader (both can be present there).
-            //
-            // Keep 0..15 reserved for vertex attributes and put uniforms at
-            // 16+. Give the common Minecraft uniforms deterministic,
-            // stage-local slots, then allocate the remaining uniforms after
-            // them.
-            const bool isFragmentStage = (shaderType == GL_FRAGMENT_SHADER);
-            std::set<NSUInteger> usedUniformSlots;
-            // Reserve every fixed slot before allocating generic uniforms.
-            // This prevents declaration-order dependent collisions when a
-            // generic uniform appears before ProjMat/ModelViewMat/etc.
-            if (!isFragmentStage) {
-                usedUniformSlots.insert(16); // ProjMat
-                usedUniformSlots.insert(17); // ModelViewMat
-                usedUniformSlots.insert(18); // ColorModulator, if present
-            } else {
-                usedUniformSlots.insert(16); // ColorModulator, if present
-                usedUniformSlots.insert(17); // ProjMat, if present
-                usedUniformSlots.insert(18); // ModelViewMat, if present
-            }
-            NSUInteger nextUniformSlot = 19;
-
-            for (const std::string &name : uniformNames) {
-                NSUInteger slot = 0;
-                bool isFixedSlot = false;
-
-                if (!isFragmentStage) {
-                    // Vertex stage: matrices occupy the first uniform slots.
-                    if (name == "ProjMat") { slot = 16; isFixedSlot = true; }
-                    else if (name == "ModelViewMat") { slot = 17; isFixedSlot = true; }
-                    else if (name == "ColorModulator") { slot = 18; isFixedSlot = true; }
-                } else {
-                    // Fragment stage: ColorModulator and ProjMat are both legal
-                    // here, so they MUST have different Metal buffer indices.
-                    if (name == "ColorModulator") { slot = 16; isFixedSlot = true; }
-                    else if (name == "ProjMat") { slot = 17; isFixedSlot = true; }
-                    else if (name == "ModelViewMat") { slot = 18; isFixedSlot = true; }
-                }
-
-                if (!isFixedSlot) {
-                    while (usedUniformSlots.count(nextUniformSlot) != 0) ++nextUniformSlot;
-                    slot = nextUniformSlot++;
-                }
-                usedUniformSlots.insert(slot);
-
-                // Only remap a declaration that SPIRV-Cross emitted as a
-                // Metal buffer. Samplers/textures use different attributes.
-                std::string marker = name + " [[buffer(";
-                size_t search = 0;
-                bool changed = false;
-                while ((search = mslSource.find(marker, search)) != std::string::npos) {
-                    size_t numberStart = search + marker.size();
-                    size_t numberEnd = mslSource.find(")]]", numberStart);
-                    if (numberEnd == std::string::npos) break;
-                    std::string replacement = name + " [[buffer(" + std::to_string(slot) + ")]]";
-                    mslSource.replace(search, numberEnd + 3 - search, replacement);
-                    printf("[gl4metal][RESOURCES] remapped uniform %s -> buffer(%lu) stage=%s\n",
-                           name.c_str(), (unsigned long)slot, isFragmentStage ? "fragment" : "vertex");
-                    search += replacement.size();
-                    changed = true;
-                }
-                (void)changed;
-            }
+        if (dumpShaders) {
+            gl4metalDumpShaderSection(compileId, shaderType, "MSL_SPIRV_CROSS", mslSource);
         }
 
         // SPIRV-Cross can emit scalar helper parameters as references. Metal
@@ -805,8 +987,19 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
             std::string needle = std::string(type) + "&";
             size_t pos = 0;
             while ((pos = mslSource.find(needle, pos)) != std::string::npos) {
-                bool alreadyThread = pos >= 7 && mslSource.compare(pos - 7, 7, "thread ") == 0;
-                if (!alreadyThread) {
+                static const char *addressSpacePrefixes[] = {
+                    "constant ", "device ", "threadgroup ", "thread "
+                };
+                bool hasAddressSpace = false;
+                for (const char *prefix : addressSpacePrefixes) {
+                    size_t prefixLength = strlen(prefix);
+                    if (pos >= prefixLength &&
+                        mslSource.compare(pos - prefixLength, prefixLength, prefix) == 0) {
+                        hasAddressSpace = true;
+                        break;
+                    }
+                }
+                if (!hasAddressSpace) {
                     // Avoid touching struct/resource declarations or pointer-like
                     // syntax; only normalize a type reference token.
                     mslSource.insert(pos, "thread ");
@@ -817,8 +1010,12 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource)
             }
         }
 
+        if (dumpShaders) {
+            gl4metalDumpShaderSection(compileId, shaderType, "MSL_FINAL", mslSource);
+        }
         return mslSource;
     } catch (const std::exception &e) {
+        if (diagnostics) *diagnostics = e.what();
         printf("[gl4metal] ERROR: SPIR-V to MSL transpilation failed: %s\n", e.what());
         return "";
     }
