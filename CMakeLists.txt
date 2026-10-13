@@ -31,7 +31,7 @@ include(CheckIPOSupported)
 check_ipo_supported(RESULT supported)
 
 if(supported)
-    set(INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
 add_compile_options(-O3)
