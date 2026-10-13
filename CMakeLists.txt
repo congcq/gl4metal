@@ -28,6 +28,9 @@ include_directories(
     "external/SPIRV-Cross"
 )
 
+add_compile_options(-flto=thin)
+add_link_options(-flto=thin)
+
 add_compile_options(-O2)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
