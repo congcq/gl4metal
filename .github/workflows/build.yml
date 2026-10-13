@@ -30,3 +30,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           path: build/libgl4metal.dylib
+
+      - name: Upload all build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: build/*
