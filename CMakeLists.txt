@@ -27,7 +27,16 @@ include_directories(
     "external/SPIRV-Cross"
 )
 
-add_compile_options(-O2)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT supported)
+
+if(supported)
+    set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION TRUE
+    )
+endif()
+
+add_compile_options(-O3)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
     getter.m
