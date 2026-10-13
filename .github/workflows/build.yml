@@ -25,6 +25,7 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_C_FLAGS="-arch arm64" \
+            -DCMAKE_CXX_FLAGS="-arch arm64" \
             ..
           cmake --build . --config Release --target gl4metal
 
