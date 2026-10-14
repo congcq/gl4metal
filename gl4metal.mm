@@ -691,7 +691,7 @@ GLboolean APIENTRY gl4metalInit(void) {
     gl4metalInitTextureState();
     gl4metalResetFramebufferState();
 
-    glslang::InitializeProcess();
+    //glslang::InitializeProcess();
     updateDepthStencilState();
 
     printf("[gl4metal] Initialized with Metal device: %s\n", ctx.device.name.UTF8String);
@@ -841,11 +841,9 @@ void APIENTRY glSwapBuffers(void) {
         return;
     }
 
-    id<MTLCommandBuffer> presentCommandBuffer = ctx.currentCommandBuffer;
-    if (!presentCommandBuffer) presentCommandBuffer = gl4metalCreateCommandBuffer();
-    if (!presentCommandBuffer) return;
-    [presentCommandBuffer presentDrawable:ctx.currentDrawable];
-    [presentCommandBuffer commit];
+    if (!ctx.currentCommandBuffer) return;
+    [ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
+    [ctx.currentCommandBuffer commit];
     if (getenv("GL4METAL_PRESENT_TRACE")) {
         printf("[gl4metal][PRESENT_TRACE] present submitted\\n");
     }
