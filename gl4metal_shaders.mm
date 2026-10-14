@@ -887,11 +887,11 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
     //}
 
     if (shaderType == GL_FRAGMENT_SHADER) {
-        glsl = gl4metalFlipDiffuseSamplerY(glsl);
+        glsl = gl4metalFlipDiffuseSamplerY(glslSource);
     }
 
     if (dumpShaders) {
-        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_TRANSLATION_INPUT", glsl);
+        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_TRANSLATION_INPUT", glslSource);
     }
 
     EShLanguage stage = (shaderType == GL_VERTEX_SHADER) ? EShLangVertex : EShLangFragment;
