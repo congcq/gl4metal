@@ -898,10 +898,10 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
 
     glslang::TShader shader(stage);
     const char *shaderStrings = glslSource.c_str();
-    if (glsl.size() > (size_t)INT_MAX) {
-        if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
-        return "";
-    }
+    //if (glsl.size() > (size_t)INT_MAX) {
+        //if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
+        //return "";
+    //}
     const int shaderLength = (int)glslSource.size();
     shader.setStringsWithLengths(&shaderStrings, &shaderLength, 1);
 
