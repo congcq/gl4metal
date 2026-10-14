@@ -880,11 +880,11 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
 
     // Minecraft frequently appends generated // [TAG] annotations. Strip
     // GLSL comments before parsing so glslang never sees an EOF comment.
-    std::string glsl = stripGLSLComments(glslSource);
+    //std::string glsl = stripGLSLComments(glslSource);
 
-    if (!normalizeGLSLForSPIRV(shaderType, glsl, diagnostics)) {
-        return "";
-    }
+    //if (!normalizeGLSLForSPIRV(shaderType, glsl, diagnostics)) {
+        //return "";
+    //}
 
     if (shaderType == GL_FRAGMENT_SHADER) {
         glsl = gl4metalFlipDiffuseSamplerY(glsl);
@@ -897,18 +897,18 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
     EShLanguage stage = (shaderType == GL_VERTEX_SHADER) ? EShLangVertex : EShLangFragment;
 
     glslang::TShader shader(stage);
-    const char *shaderStrings = glsl.c_str();
+    const char *shaderStrings = glslSource.c_str();
     if (glsl.size() > (size_t)INT_MAX) {
         if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
         return "";
     }
-    const int shaderLength = (int)glsl.size();
+    const int shaderLength = (int)glslSource.size();
     shader.setStringsWithLengths(&shaderStrings, &shaderLength, 1);
 
     shader.setAutoMapLocations(true);
     shader.setAutoMapBindings(true);
 
-    int defaultVersion = 330;
+    int defaultVersion = 460;
     shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientOpenGL, defaultVersion);
     shader.setEnvClient(glslang::EShClientOpenGL, glslang::EShTargetOpenGL_450);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
