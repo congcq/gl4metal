@@ -887,7 +887,7 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
     //}
 
     if (shaderType == GL_FRAGMENT_SHADER) {
-        glsl = gl4metalFlipDiffuseSamplerY(glslSource);
+        glslSource = gl4metalFlipDiffuseSamplerY(glslSource);
     }
 
     if (dumpShaders) {
