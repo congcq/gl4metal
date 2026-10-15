@@ -880,29 +880,30 @@ std::string transpileGLSLToMSL(GLenum shaderType, const std::string &glslSource,
 
     // Minecraft frequently appends generated // [TAG] annotations. Strip
     // GLSL comments before parsing so glslang never sees an EOF comment.
-    //std::string glsl = stripGLSLComments(glslSource);
+    std::string glsl = stripGLSLComments(glslSource);
 
-    //if (!normalizeGLSLForSPIRV(shaderType, glsl, diagnostics)) {
-        //return "";
-    //}
+    if (!normalizeGLSLForSPIRV(shaderType, glsl, diagnostics)) {
+        return "";
+    }
 
     if (shaderType == GL_FRAGMENT_SHADER) {
-        //glslSource = gl4metalFlipDiffuseSamplerY(glslSource);
+        glsl = gl4metalFlipDiffuseSamplerY(glsl);
     }
 
     if (dumpShaders) {
-        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_TRANSLATION_INPUT", glslSource);
+        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_ORIGINAL_INPUT", glslSource);
+        gl4metalDumpShaderSection(compileId, shaderType, "GLSL_TRANSLATION_INPUT", glsl);
     }
 
     EShLanguage stage = (shaderType == GL_VERTEX_SHADER) ? EShLangVertex : EShLangFragment;
 
     glslang::TShader shader(stage);
-    const char *shaderStrings = glslSource.c_str();
-    //if (glsl.size() > (size_t)INT_MAX) {
-        //if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
-        //return "";
-    //}
-    const int shaderLength = (int)glslSource.size();
+    const char *shaderStrings = glsl.c_str();
+    if (glsl.size() > (size_t)INT_MAX) {
+        if (diagnostics) *diagnostics = "Shader source exceeds the maximum size supported by glslang.";
+        return "";
+    }
+    const int shaderLength = (int)glsl.size();
     shader.setStringsWithLengths(&shaderStrings, &shaderLength, 1);
 
     shader.setAutoMapLocations(true);
