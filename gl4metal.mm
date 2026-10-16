@@ -856,7 +856,7 @@ void APIENTRY glSwapInterval(GLint interval) {
     ctx.swapInterval = interval;
     // Metal presentation is already asynchronous. Reducing drawable queue
     // depth for interval 0 adds back-pressure without disabling display sync.
-    if (ctx.metalLayer) ctx.metalLayer.maximumDrawableCount = 3;
+    if (ctx.metalLayer) ctx.metalLayer.maximumDrawableCount = 2;
 }
 
 void APIENTRY glClear(GLbitfield mask) {
