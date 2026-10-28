@@ -40,6 +40,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl4metal/context.mm
     gl4metal/draw.mm
     gl4metal/enable.mm
+    gl4metal/export.mm
     gl4metal/framebuffer.mm
     gl4metal/getter.mm
     gl4metal/program.mm
