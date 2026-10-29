@@ -48,6 +48,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl4metal/renderbuffer.mm
     gl4metal/sampler.mm
     gl4metal/shaders.mm
+		gl4metal/sync.mm
     gl4metal/texture.mm
     gl4metal/transformfeedback.mm
     gl4metal/uniform.mm
