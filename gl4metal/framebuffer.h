@@ -10,6 +10,10 @@
 
 #import "gl4metal.h"
 
+#include <GL/gl.h>
+#include <GL/glcorearb.h>
+#include <GL/glext.h>
+
 id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask);  // ends the open pass, starts one on glBindFramebuffer's target
 void endRenderEncoder(void);
 void applyViewportAndScissor(void);
