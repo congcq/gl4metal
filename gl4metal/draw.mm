@@ -196,7 +196,7 @@ static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
 // and Metal wants exactly that type bound, so there is one fallback per sampler dimensionality.
 static id<MTLTexture> fallbackTexture(TranslatedUniform::Dim dim) {
 	static id<MTLTexture> textures[4] = { nil, nil, nil, nil };
-	id<MTLTexture> &slot = textures[(int)dim];
+	__strong id<MTLTexture> &slot = textures[(int)dim];
 	if (!slot) {
 		MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
 		d.textureType = typeForDim(dim);

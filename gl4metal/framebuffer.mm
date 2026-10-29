@@ -481,7 +481,7 @@ void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stenc
 
 
 // glClearBuffer*: one draw buffer of the current framebuffer.
-static void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
+void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
 	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glClearBuffer*: draw buffer %d is out of range (GL_INVALID_VALUE)", drawbuffer);
@@ -509,7 +509,7 @@ static void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
 	ctx.clear_color = saved;
 }
 
-static void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil) {
+void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil) {
 	double savedDepth = ctx.clear_depth;
 	GLint savedStencil = ctx.clear_stencil;
 	ctx.clear_depth = clamp01(depth);
@@ -599,7 +599,7 @@ static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
 
 static id<MTLSamplerState> blitSampler(bool linear) {
 	static id<MTLSamplerState> samplers[2] = { nil, nil };
-	id<MTLSamplerState> s = samplers[linear ? 1 : 0];
+	__strong id<MTLSamplerState> &s = samplers[linear ? 1 : 0];
 	if (!s) {
 		MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
 		d.minFilter = d.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
