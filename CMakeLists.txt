@@ -67,5 +67,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
     "-framework Foundation"
     "-framework Metal"
     "-framework QuartzCore"
-		"-framework UIKit"
+    "-framework UIKit"
 )
