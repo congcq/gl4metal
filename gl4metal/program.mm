@@ -1,4 +1,5 @@
 #import "program.h"
+#import "shaders.h"
 
 // MARK: - Helpers
 
@@ -51,6 +52,7 @@ GLboolean glIsProgram(GLuint program) {
 void glAttachShader(GLuint program, GLuint shader) {
 	ProgramObject *p = findProgram(program);
 	if (!p || ctx.shader_objects.find(shader) == ctx.shader_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glAttachShader: invalid program %u or shader %u", program, shader);
 		return;
 	}
@@ -64,6 +66,7 @@ void glAttachShader(GLuint program, GLuint shader) {
 void glDetachShader(GLuint program, GLuint shader) {
 	ProgramObject *p = findProgram(program);
 	if (!p) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glDetachShader: invalid program %u", program);
 		return;
 	}
@@ -95,6 +98,7 @@ void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei *count, GLui
 void glLinkProgram(GLuint program) {
 	ProgramObject *pp = findProgram(program);
 	if (!pp) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glLinkProgram: invalid program %u", program);
 		return;
 	}
@@ -249,6 +253,7 @@ void glUseProgram(GLuint program) {
 	if (program != 0) {
 		ProgramObject *p = findProgram(program);
 		if (!p || !p->linked) {
+			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("glUseProgram: program %u does not exist or is not linked (GL_INVALID_OPERATION)", program);
 			return;
 		}
@@ -273,6 +278,7 @@ void glValidateProgram(GLuint program) {
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 	ProgramObject *p = findProgram(program);
 	if (!p) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetProgramiv: invalid program %u", program);
 		*params = 0;
 		return;
@@ -327,6 +333,7 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 			break;
 		}
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetProgramiv: unhandled pname 0x%X", pname);
 			*params = 0;
 			break;
@@ -343,6 +350,7 @@ void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLcha
 void glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) {
 	ProgramObject *p = findProgram(program);
 	if (!p || index >= 16 || !name || strncmp(name, "gl_", 3) == 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindAttribLocation: invalid program %u, index %u or name", program, index);
 		return;
 	}
@@ -363,17 +371,36 @@ GLint glGetAttribLocation(GLuint program, const GLchar *name) {
 }
 
 void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
-	GL4METAL_LOG("glGetActiveAttrib: Unimplemented");
+	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || index >= it->second.attribs.size()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glGetActiveAttrib: invalid program %u or attribute index %u (GL_INVALID_VALUE)", program, index);
+		if (length) {
+			*length = 0;
+		}
+		return;
+	}
+	const ProgramAttrib &a = it->second.attribs[index];
+	static const GLenum floats[4] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
+	static const GLenum ints[4]   = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
+	int c = std::min(std::max((int)a.vecsize, 1), 4) - 1;
+	if (size) {
+		*size = 1;
+	}
+	if (type) {
+		*type = a.is_integer ? ints[c] : floats[c];
+	}
+	copyGLString(a.name, bufSize, length, name);
 }
 
 // MARK: - Fragment output locations
 
 void glBindFragDataLocation(GLuint program, GLuint color, const GLchar *name) {
-	GL4METAL_LOG("glBindFragDataLocation: Unimplemented");
+	// one colour output: the translator numbers it 0
 }
 
 void glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const GLchar *name) {
-	GL4METAL_LOG("glBindFragDataLocationIndexed: Unimplemented");
+	// dual-source blending is not supported
 }
 
 GLint glGetFragDataLocation(GLuint program, const GLchar *name) {
@@ -386,6 +413,5 @@ GLint glGetFragDataLocation(GLuint program, const GLchar *name) {
 }
 
 GLint glGetFragDataIndex(GLuint program, const GLchar *name) {
-	GL4METAL_LOG("glGetFragDataIndex: Unimplemented, defaulting return -1");
-	return -1;
+	return glGetFragDataLocation(program, name) >= 0 ? 0 : -1;
 }

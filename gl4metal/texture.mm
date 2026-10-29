@@ -147,6 +147,7 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 						 GLenum format, GLenum type, const void *pixels, const char *caller, NSUInteger slice = 0) {
 	GLsizei lw = std::max(1, t.width >> level), lh = std::max(1, t.height >> level);
 	if (level < 0 || (NSUInteger)level >= t.texture.mipmapLevelCount || x < 0 || y < 0 || w < 0 || h < 0 || x + w > lw || y + h > lh) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: region %d,%d %dx%d does not fit level %d (%dx%d)", caller, x, y, w, h, level, lw, lh);
 		return;
 	}
@@ -209,6 +210,23 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 	[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:(size_t)w * dstBpp bytesPerImage:0];
 }
 
+// Colour attachment of the read framebuffer (what glCopyTex*Image2D and glReadPixels read), nil for the default framebuffer.
+static id<MTLTexture> readAttachment(GLint &level) {
+	level = 0;
+	if (ctx.read_fbo == 0) {
+		return nil;
+	}
+	auto it = ctx.fbo_objects.find(ctx.read_fbo);
+	if (it == ctx.fbo_objects.end() || it->second.read_buffer < GL_COLOR_ATTACHMENT0 ||
+		it->second.read_buffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		return nil;
+	}
+	const FBOAttachment &a = it->second.color[it->second.read_buffer - GL_COLOR_ATTACHMENT0];
+	auto texture = ctx.texture_objects.find(a.texture);
+	level = a.level;
+	return (a.texture != 0 && texture != ctx.texture_objects.end()) ? texture->second.texture : nil;
+}
+
 // MARK: - Texture objects
 
 void glGenTextures(GLsizei n, GLuint *textures) {
@@ -261,6 +279,7 @@ GLboolean glIsTexture(GLuint texture) {
 
 void glActiveTexture(GLenum texture) {
 	if (texture < GL_TEXTURE0 || texture >= GL_TEXTURE0 + GL4METAL_MAX_TEXTURE_UNITS) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glActiveTexture: invalid texture unit 0x%X", texture);
 		return;
 	}
@@ -285,7 +304,22 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 }
 
 void glGenerateMipmap(GLenum target) {
-	GL4METAL_LOG("glGenerateMipmap: Unimplemented");
+	TextureObject *tex = boundTexture(target);
+	if (!tex || !tex->texture) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGenerateMipmap: no allocated texture bound to target 0x%X (GL_INVALID_OPERATION)", target);
+		return;
+	}
+	if (tex->texture.mipmapLevelCount < 2 || isDepthStencilFormat(tex->texture.pixelFormat)) {
+		return; // nothing to generate (levels are allocated from GL_TEXTURE_MAX_LEVEL / the min filter)
+	}
+	endRenderEncoder();
+	if (!ctx.currentCommandBuffer) {
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	}
+	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
+	[blit generateMipmapsForTexture:tex->texture];
+	[blit endEncoding];
 }
 
 // MARK: - Pixel storage
@@ -299,6 +333,7 @@ void glPixelStorei(GLenum pname, GLint param) {
 		case GL_UNPACK_ALIGNMENT:
 		case GL_PACK_ALIGNMENT:
 			if (param != 1 && param != 2 && param != 4 && param != 8) {
+				gl4metalSetError(GL_INVALID_ENUM);
 				GL4METAL_LOG("glPixelStorei: invalid alignment %d", param);
 				return;
 			}
@@ -311,6 +346,7 @@ void glPixelStorei(GLenum pname, GLint param) {
 		case GL_PACK_SKIP_PIXELS:    ctx.pack_skip_pixels = param; break;
 		case GL_PACK_SKIP_ROWS:      ctx.pack_skip_rows = param; break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glPixelStorei: unhandled pname 0x%X", pname);
 			break;
 	}
@@ -336,11 +372,13 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	}
 	int face = cubeFace(target); // -1: a plain 2D texture
 	if (target != GL_TEXTURE_2D && face < 0) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glTexImage2D: unsupported target 0x%X", target);
 		return;
 	}
 	TextureObject *t = boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D);
 	if (!t) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexImage2D: no texture bound to target 0x%X", face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D);
 		return;
 	}
@@ -349,6 +387,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		return;
 	}
 	if (!valid) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glTexImage2D: invalid level %d, size %dx%d or internalformat 0x%X", level, width, height, internalformat);
 		return;
 	}
@@ -380,6 +419,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		t->internalformat = (GLenum)internalformat;
 	} else if (!t->texture || (NSUInteger)level >= t->texture.mipmapLevelCount ||
 			   width != std::max(1, t->width >> level) || height != std::max(1, t->height >> level)) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glTexImage2D: level %d (%dx%d) does not fit the allocated mip chain", level, width, height);
 		return;
 	}
@@ -409,6 +449,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
 	int face = cubeFace(target);
 	TextureObject *t = (target == GL_TEXTURE_2D || face >= 0) ? boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D) : nullptr;
 	if (!t || !t->texture) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexSubImage2D: no allocated texture bound (target 0x%X)", target);
 		return;
 	}
@@ -424,7 +465,8 @@ void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x
 }
 
 void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border) {
-	GL4METAL_LOG("glCopyTexImage2D: Unimplemented");
+	glTexImage2D(target, level, (GLint)internalformat, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glCopyTexSubImage2D(target, level, 0, 0, x, y, width, height);
 }
 
 void glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) {
@@ -432,7 +474,38 @@ void glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLi
 }
 
 void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
-	GL4METAL_LOG("glCopyTexSubImage2D: Unimplemented");
+	int face = cubeFace(target);
+	TextureObject *dst = (target == GL_TEXTURE_2D || face >= 0) ? boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D) : nullptr;
+	GLint srcLevel = 0;
+	id<MTLTexture> src = readAttachment(srcLevel);
+	if (!dst || !dst->texture || !src) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glCopyTexSubImage2D: needs an allocated texture and a framebuffer texture to read from (the default framebuffer is not readable)");
+		return;
+	}
+	NSUInteger srcW = std::max<NSUInteger>(src.width >> srcLevel, 1), srcH = std::max<NSUInteger>(src.height >> srcLevel, 1);
+	GLsizei dstW = std::max(1, dst->width >> level), dstH = std::max(1, dst->height >> level);
+	if (level < 0 || (NSUInteger)level >= dst->texture.mipmapLevelCount || width <= 0 || height <= 0 ||
+		x < 0 || y < 0 || (NSUInteger)(x + width) > srcW || (NSUInteger)(y + height) > srcH ||
+		xoffset < 0 || yoffset < 0 || xoffset + width > dstW || yoffset + height > dstH) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glCopyTexSubImage2D: the rectangle does not fit the source or destination (GL_INVALID_VALUE)");
+		return;
+	}
+	if (src.pixelFormat != dst->texture.pixelFormat) {
+		GL4METAL_LOG("glCopyTexSubImage2D: pixel formats differ (%d -> %d), not supported", (int)src.pixelFormat, (int)dst->texture.pixelFormat);
+		return;
+	}
+	endRenderEncoder();
+	if (!ctx.currentCommandBuffer) {
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	}
+	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
+	[blit copyFromTexture:src sourceSlice:0 sourceLevel:(NSUInteger)srcLevel sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+			   sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+			    toTexture:dst->texture destinationSlice:(face >= 0 ? (NSUInteger)face : 0) destinationLevel:(NSUInteger)level
+		destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0)];
+	[blit endEncoding];
 }
 
 void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
@@ -470,6 +543,7 @@ void glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint 
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
 	TextureObject *t = boundTexture(target);
 	if (!t) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexParameterf: no texture bound to target 0x%X", target);
 		return;
 	}
@@ -485,12 +559,16 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
 }
 
 void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params) {
-	GL4METAL_LOG("glTexParameterfv: Unimplemented");
+	if (pname == GL_TEXTURE_BORDER_COLOR) {
+		return; // clamp-to-border colours are not available, see addressMode in draw.mm
+	}
+	glTexParameterf(target, pname, params[0]);
 }
 
 void glTexParameteri(GLenum target, GLenum pname, GLint param) {
 	TextureObject *t = boundTexture(target);
 	if (!t) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexParameteri: no texture bound to target 0x%X", target);
 		return;
 	}
@@ -511,21 +589,25 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
 			glTexParameterf(target, pname, (GLfloat)param);
 			break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glTexParameteri: unhandled pname 0x%X", pname);
 			break;
 	}
 }
 
 void glTexParameteriv(GLenum target, GLenum pname, const GLint *params) {
-	GL4METAL_LOG("glTexParameteriv: Unimplemented");
+	if (pname == GL_TEXTURE_BORDER_COLOR || pname == GL_TEXTURE_SWIZZLE_RGBA) {
+		return; // border colours and swizzles are not supported yet
+	}
+	glTexParameteri(target, pname, params[0]);
 }
 
 void glTexParameterIiv(GLenum target, GLenum pname, const GLint *params) {
-	GL4METAL_LOG("glTexParameterIiv: Unimplemented");
+	glTexParameteriv(target, pname, params);
 }
 
 void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) {
-	GL4METAL_LOG("glTexParameterIuiv: Unimplemented");
+	glTexParameteriv(target, pname, (const GLint *)params);
 }
 
 // MARK: - Texture queries
@@ -539,23 +621,56 @@ void glGetCompressedTexImage(GLenum target, GLint level, void *img) {
 }
 
 void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
-	GL4METAL_LOG("glGetTexParameterfv: Unimplemented");
+	TextureObject *tex = boundTexture(target);
+	if (tex && pname == GL_TEXTURE_MIN_LOD)  { *params = tex->min_lod; return; }
+	if (tex && pname == GL_TEXTURE_MAX_LOD)  { *params = tex->max_lod; return; }
+	if (tex && pname == GL_TEXTURE_LOD_BIAS) { *params = tex->lod_bias; return; }
+	GLint value = 0;
+	glGetTexParameteriv(target, pname, &value);
+	*params = (GLfloat)value;
 }
 
 void glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetTexParameteriv: Unimplemented");
+	TextureObject *tex = boundTexture(target);
+	if (!tex) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetTexParameteriv: no texture bound to target 0x%X (GL_INVALID_OPERATION)", target);
+		*params = 0;
+		return;
+	}
+	switch (pname) {
+		case GL_TEXTURE_MIN_FILTER:   *params = (GLint)tex->min_filter; break;
+		case GL_TEXTURE_MAG_FILTER:   *params = (GLint)tex->mag_filter; break;
+		case GL_TEXTURE_WRAP_S:       *params = (GLint)tex->wrap_s; break;
+		case GL_TEXTURE_WRAP_T:       *params = (GLint)tex->wrap_t; break;
+		case GL_TEXTURE_WRAP_R:       *params = (GLint)tex->wrap_r; break;
+		case GL_TEXTURE_BASE_LEVEL:   *params = tex->base_level; break;
+		case GL_TEXTURE_MAX_LEVEL:    *params = tex->max_level; break;
+		case GL_TEXTURE_COMPARE_MODE: *params = (GLint)tex->compare_mode; break;
+		case GL_TEXTURE_COMPARE_FUNC: *params = (GLint)tex->compare_func; break;
+		case GL_TEXTURE_MIN_LOD:      *params = (GLint)tex->min_lod; break;
+		case GL_TEXTURE_MAX_LOD:      *params = (GLint)tex->max_lod; break;
+		case GL_TEXTURE_LOD_BIAS:     *params = (GLint)tex->lod_bias; break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			GL4METAL_LOG("glGetTexParameteriv: unhandled pname 0x%X", pname);
+			*params = 0;
+			break;
+	}
 }
 
 void glGetTexParameterIiv(GLenum target, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetTexParameterIiv: Unimplemented");
+	glGetTexParameteriv(target, pname, params);
 }
 
 void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) {
-	GL4METAL_LOG("glGetTexParameterIuiv: Unimplemented");
+	glGetTexParameteriv(target, pname, (GLint *)params);
 }
 
 void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params) {
-	GL4METAL_LOG("glGetTexLevelParameterfv: Unimplemented");
+	GLint value = 0;
+	glGetTexLevelParameteriv(target, level, pname, &value);
+	*params = (GLfloat)value;
 }
 
 void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params) {
@@ -581,6 +696,7 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 		case GL_TEXTURE_DEPTH:           *params = (w > 0) ? 1 : 0; break;
 		case GL_TEXTURE_INTERNAL_FORMAT: *params = (GLint)internalformat; break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetTexLevelParameteriv: unhandled pname 0x%X", pname);
 			*params = 0;
 			break;

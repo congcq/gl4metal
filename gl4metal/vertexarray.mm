@@ -1,5 +1,56 @@
 #import "vertexarray.h"
 
+// MARK: - Generic vertex attributes (the "current value" used when an attribute has no array enabled)
+
+struct GenericAttrib {
+	float f[4];
+	int32_t i[4];
+};
+
+static GenericAttrib &genericAt(GLuint index) {
+	static GenericAttrib attribs[16];
+	static bool initialized = false;
+	if (!initialized) {
+		initialized = true;
+		for (GenericAttrib &a : attribs) { // GL's initial value is (0, 0, 0, 1)
+			a.f[0] = a.f[1] = a.f[2] = 0.0f; a.f[3] = 1.0f;
+			a.i[0] = a.i[1] = a.i[2] = 0; a.i[3] = 1;
+		}
+	}
+	return attribs[index & 15];
+}
+
+void genericAttribValue(GLuint index, bool integer, void *out16) {
+	GenericAttrib &a = genericAt(index);
+	memcpy(out16, integer ? (const void *)a.i : (const void *)a.f, 16);
+}
+
+static void setGenericFloat(GLuint index, int n, const float *values) {
+	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glVertexAttrib*: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
+		return;
+	}
+	GenericAttrib &a = genericAt(index);
+	for (int c = 0; c < 4; c++) {
+		a.f[c] = c < n ? values[c] : (c == 3 ? 1.0f : 0.0f); // missing components: 0, 0, 0, 1
+	}
+}
+
+static void setGenericInt(GLuint index, int n, const int32_t *values) {
+	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glVertexAttribI*: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
+		return;
+	}
+	GenericAttrib &a = genericAt(index);
+	for (int c = 0; c < 4; c++) {
+		a.i[c] = c < n ? values[c] : (c == 3 ? 1 : 0);
+	}
+}
+
+static float normalizeSigned(double v, double max) { return (float)std::max(v / max, -1.0); }
+
 // MARK: - Vertex array objects
 
 void glGenVertexArrays(GLsizei n, GLuint *arrays) {
@@ -37,6 +88,7 @@ void glBindVertexArray(GLuint array) {
 
 void glEnableVertexAttribArray(GLuint index) {
 	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glEnableVertexAttribArray: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
 		return;
 	}
@@ -45,6 +97,7 @@ void glEnableVertexAttribArray(GLuint index) {
 
 void glDisableVertexAttribArray(GLuint index) {
 	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glDisableVertexAttribArray: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
 		return;
 	}
@@ -53,6 +106,7 @@ void glDisableVertexAttribArray(GLuint index) {
 
 void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer) {
 	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glVertexAttribPointer: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
 		return;
 	}
@@ -68,6 +122,7 @@ void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm
 
 void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer) {
 	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glVertexAttribIPointer: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
 		return;
 	}
@@ -83,6 +138,7 @@ void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei strid
 
 void glVertexAttribDivisor(GLuint index, GLuint divisor) {
 	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glVertexAttribDivisor: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
 		return;
 	}
@@ -92,255 +148,457 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
 // MARK: - Vertex attribute queries
 
 void glGetVertexAttribdv(GLuint index, GLenum pname, GLdouble *params) {
-	GL4METAL_LOG("glGetVertexAttribdv: Unimplemented");
+	GLfloat values[4] = { 0, 0, 0, 0 };
+	glGetVertexAttribfv(index, pname, values);
+	int count = pname == GL_CURRENT_VERTEX_ATTRIB ? 4 : 1;
+	for (int c = 0; c < count; c++) {
+		params[c] = values[c];
+	}
 }
 
 void glGetVertexAttribfv(GLuint index, GLenum pname, GLfloat *params) {
-	GL4METAL_LOG("glGetVertexAttribfv: Unimplemented");
+	if (pname == GL_CURRENT_VERTEX_ATTRIB && index < 16) {
+		memcpy(params, genericAt(index).f, 16);
+		return;
+	}
+	GLint value = 0;
+	glGetVertexAttribiv(index, pname, &value);
+	*params = (GLfloat)value;
 }
 
 void glGetVertexAttribiv(GLuint index, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetVertexAttribiv: Unimplemented");
+	if (index >= 16) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glGetVertexAttribiv: index %u >= GL_MAX_VERTEX_ATTRIBS (GL_INVALID_VALUE)", index);
+		return;
+	}
+	const VertexAttrib &a = ctx.vao_objects[ctx.current_vao].attribs[index];
+	switch (pname) {
+		case GL_VERTEX_ATTRIB_ARRAY_ENABLED:     *params = a.enabled; break;
+		case GL_VERTEX_ATTRIB_ARRAY_SIZE:        *params = a.size ? a.size : 4; break;
+		case GL_VERTEX_ATTRIB_ARRAY_TYPE:        *params = (GLint)(a.type ? a.type : GL_FLOAT); break;
+		case GL_VERTEX_ATTRIB_ARRAY_NORMALIZED:  *params = a.normalized; break;
+		case GL_VERTEX_ATTRIB_ARRAY_STRIDE:      *params = a.stride; break;
+		case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: *params = (GLint)a.bound_vbo; break;
+		case GL_VERTEX_ATTRIB_ARRAY_DIVISOR:     *params = (GLint)a.divisor; break;
+		case GL_VERTEX_ATTRIB_ARRAY_INTEGER:     *params = a.integer; break;
+		case GL_CURRENT_VERTEX_ATTRIB: {
+			const GenericAttrib &g = genericAt(index);
+			for (int c = 0; c < 4; c++) {
+				params[c] = (GLint)g.f[c];
+			}
+			break;
+		}
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			GL4METAL_LOG("glGetVertexAttribiv: unhandled pname 0x%X", pname);
+			break;
+	}
 }
 
 void glGetVertexAttribIiv(GLuint index, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetVertexAttribIiv: Unimplemented");
+	if (pname == GL_CURRENT_VERTEX_ATTRIB && index < 16) {
+		memcpy(params, genericAt(index).i, 16);
+		return;
+	}
+	glGetVertexAttribiv(index, pname, params);
 }
 
 void glGetVertexAttribIuiv(GLuint index, GLenum pname, GLuint *params) {
-	GL4METAL_LOG("glGetVertexAttribIuiv: Unimplemented");
+	glGetVertexAttribIiv(index, pname, (GLint *)params);
 }
 
 void glGetVertexAttribPointerv(GLuint index, GLenum pname, void **pointer) {
-	GL4METAL_LOG("glGetVertexAttribPointerv: Unimplemented");
+	*pointer = index < 16 ? (void *)ctx.vao_objects[ctx.current_vao].attribs[index].pointer : NULL;
 }
 
 // MARK: - Generic (constant) vertex attributes
 
 void glVertexAttrib1d(GLuint index, GLdouble x) {
-	GL4METAL_LOG("glVertexAttrib1d: Unimplemented");
+	const float values[1] = { (float)x };
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib1dv(GLuint index, const GLdouble *v) {
-	GL4METAL_LOG("glVertexAttrib1dv: Unimplemented");
+	float values[1];
+	for (int i = 0; i < 1; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib1f(GLuint index, GLfloat x) {
-	GL4METAL_LOG("glVertexAttrib1f: Unimplemented");
+	const float values[1] = { (float)x };
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib1fv(GLuint index, const GLfloat *v) {
-	GL4METAL_LOG("glVertexAttrib1fv: Unimplemented");
+	float values[1];
+	for (int i = 0; i < 1; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib1s(GLuint index, GLshort x) {
-	GL4METAL_LOG("glVertexAttrib1s: Unimplemented");
+	const float values[1] = { (float)x };
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib1sv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttrib1sv: Unimplemented");
+	float values[1];
+	for (int i = 0; i < 1; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 1, values);
 }
 
 void glVertexAttrib2d(GLuint index, GLdouble x, GLdouble y) {
-	GL4METAL_LOG("glVertexAttrib2d: Unimplemented");
+	const float values[2] = { (float)x, (float)y };
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib2dv(GLuint index, const GLdouble *v) {
-	GL4METAL_LOG("glVertexAttrib2dv: Unimplemented");
+	float values[2];
+	for (int i = 0; i < 2; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib2f(GLuint index, GLfloat x, GLfloat y) {
-	GL4METAL_LOG("glVertexAttrib2f: Unimplemented");
+	const float values[2] = { (float)x, (float)y };
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib2fv(GLuint index, const GLfloat *v) {
-	GL4METAL_LOG("glVertexAttrib2fv: Unimplemented");
+	float values[2];
+	for (int i = 0; i < 2; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib2s(GLuint index, GLshort x, GLshort y) {
-	GL4METAL_LOG("glVertexAttrib2s: Unimplemented");
+	const float values[2] = { (float)x, (float)y };
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib2sv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttrib2sv: Unimplemented");
+	float values[2];
+	for (int i = 0; i < 2; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 2, values);
 }
 
 void glVertexAttrib3d(GLuint index, GLdouble x, GLdouble y, GLdouble z) {
-	GL4METAL_LOG("glVertexAttrib3d: Unimplemented");
+	const float values[3] = { (float)x, (float)y, (float)z };
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib3dv(GLuint index, const GLdouble *v) {
-	GL4METAL_LOG("glVertexAttrib3dv: Unimplemented");
+	float values[3];
+	for (int i = 0; i < 3; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib3f(GLuint index, GLfloat x, GLfloat y, GLfloat z) {
-	GL4METAL_LOG("glVertexAttrib3f: Unimplemented");
+	const float values[3] = { (float)x, (float)y, (float)z };
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib3fv(GLuint index, const GLfloat *v) {
-	GL4METAL_LOG("glVertexAttrib3fv: Unimplemented");
+	float values[3];
+	for (int i = 0; i < 3; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib3s(GLuint index, GLshort x, GLshort y, GLshort z) {
-	GL4METAL_LOG("glVertexAttrib3s: Unimplemented");
+	const float values[3] = { (float)x, (float)y, (float)z };
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib3sv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttrib3sv: Unimplemented");
+	float values[3];
+	for (int i = 0; i < 3; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 3, values);
 }
 
 void glVertexAttrib4d(GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w) {
-	GL4METAL_LOG("glVertexAttrib4d: Unimplemented");
+	const float values[4] = { (float)x, (float)y, (float)z, (float)w };
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4dv(GLuint index, const GLdouble *v) {
-	GL4METAL_LOG("glVertexAttrib4dv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
-	GL4METAL_LOG("glVertexAttrib4f: Unimplemented");
+	const float values[4] = { (float)x, (float)y, (float)z, (float)w };
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4fv(GLuint index, const GLfloat *v) {
-	GL4METAL_LOG("glVertexAttrib4fv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4s(GLuint index, GLshort x, GLshort y, GLshort z, GLshort w) {
-	GL4METAL_LOG("glVertexAttrib4s: Unimplemented");
+	const float values[4] = { (float)x, (float)y, (float)z, (float)w };
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4sv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttrib4sv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nbv(GLuint index, const GLbyte *v) {
-	GL4METAL_LOG("glVertexAttrib4Nbv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = normalizeSigned(v[i], 127.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Niv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttrib4Niv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = normalizeSigned(v[i], 2147483647.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nsv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttrib4Nsv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = normalizeSigned(v[i], 32767.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nub(GLuint index, GLubyte x, GLubyte y, GLubyte z, GLubyte w) {
-	GL4METAL_LOG("glVertexAttrib4Nub: Unimplemented");
+	const float values[4] = { x / 255.0f, y / 255.0f, z / 255.0f, w / 255.0f };
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nubv(GLuint index, const GLubyte *v) {
-	GL4METAL_LOG("glVertexAttrib4Nubv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)(v[i] / 255.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nuiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttrib4Nuiv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)(v[i] / 4294967295.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4Nusv(GLuint index, const GLushort *v) {
-	GL4METAL_LOG("glVertexAttrib4Nusv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)(v[i] / 65535.0);
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4bv(GLuint index, const GLbyte *v) {
-	GL4METAL_LOG("glVertexAttrib4bv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4iv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttrib4iv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4ubv(GLuint index, const GLubyte *v) {
-	GL4METAL_LOG("glVertexAttrib4ubv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4uiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttrib4uiv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 void glVertexAttrib4usv(GLuint index, const GLushort *v) {
-	GL4METAL_LOG("glVertexAttrib4usv: Unimplemented");
+	float values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (float)v[i];
+	}
+	setGenericFloat(index, 4, values);
 }
 
 // MARK: - Integer vertex attributes
 
 void glVertexAttribI1i(GLuint index, GLint x) {
-	GL4METAL_LOG("glVertexAttribI1i: Unimplemented");
+	const int32_t values[1] = { (int32_t)x };
+	setGenericInt(index, 1, values);
 }
 
 void glVertexAttribI1iv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttribI1iv: Unimplemented");
+	int32_t values[1];
+	for (int i = 0; i < 1; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 1, values);
 }
 
 void glVertexAttribI2i(GLuint index, GLint x, GLint y) {
-	GL4METAL_LOG("glVertexAttribI2i: Unimplemented");
+	const int32_t values[2] = { (int32_t)x, (int32_t)y };
+	setGenericInt(index, 2, values);
 }
 
 void glVertexAttribI2iv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttribI2iv: Unimplemented");
+	int32_t values[2];
+	for (int i = 0; i < 2; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 2, values);
 }
 
 void glVertexAttribI3i(GLuint index, GLint x, GLint y, GLint z) {
-	GL4METAL_LOG("glVertexAttribI3i: Unimplemented");
+	const int32_t values[3] = { (int32_t)x, (int32_t)y, (int32_t)z };
+	setGenericInt(index, 3, values);
 }
 
 void glVertexAttribI3iv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttribI3iv: Unimplemented");
+	int32_t values[3];
+	for (int i = 0; i < 3; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 3, values);
 }
 
 void glVertexAttribI4i(GLuint index, GLint x, GLint y, GLint z, GLint w) {
-	GL4METAL_LOG("glVertexAttribI4i: Unimplemented");
+	const int32_t values[4] = { (int32_t)x, (int32_t)y, (int32_t)z, (int32_t)w };
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4iv(GLuint index, const GLint *v) {
-	GL4METAL_LOG("glVertexAttribI4iv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI1ui(GLuint index, GLuint x) {
-	GL4METAL_LOG("glVertexAttribI1ui: Unimplemented");
+	const int32_t values[1] = { (int32_t)x };
+	setGenericInt(index, 1, values);
 }
 
 void glVertexAttribI1uiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttribI1uiv: Unimplemented");
+	int32_t values[1];
+	for (int i = 0; i < 1; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 1, values);
 }
 
 void glVertexAttribI2ui(GLuint index, GLuint x, GLuint y) {
-	GL4METAL_LOG("glVertexAttribI2ui: Unimplemented");
+	const int32_t values[2] = { (int32_t)x, (int32_t)y };
+	setGenericInt(index, 2, values);
 }
 
 void glVertexAttribI2uiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttribI2uiv: Unimplemented");
+	int32_t values[2];
+	for (int i = 0; i < 2; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 2, values);
 }
 
 void glVertexAttribI3ui(GLuint index, GLuint x, GLuint y, GLuint z) {
-	GL4METAL_LOG("glVertexAttribI3ui: Unimplemented");
+	const int32_t values[3] = { (int32_t)x, (int32_t)y, (int32_t)z };
+	setGenericInt(index, 3, values);
 }
 
 void glVertexAttribI3uiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttribI3uiv: Unimplemented");
+	int32_t values[3];
+	for (int i = 0; i < 3; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 3, values);
 }
 
 void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) {
-	GL4METAL_LOG("glVertexAttribI4ui: Unimplemented");
+	const int32_t values[4] = { (int32_t)x, (int32_t)y, (int32_t)z, (int32_t)w };
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4uiv(GLuint index, const GLuint *v) {
-	GL4METAL_LOG("glVertexAttribI4uiv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4bv(GLuint index, const GLbyte *v) {
-	GL4METAL_LOG("glVertexAttribI4bv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4sv(GLuint index, const GLshort *v) {
-	GL4METAL_LOG("glVertexAttribI4sv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4ubv(GLuint index, const GLubyte *v) {
-	GL4METAL_LOG("glVertexAttribI4ubv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 void glVertexAttribI4usv(GLuint index, const GLushort *v) {
-	GL4METAL_LOG("glVertexAttribI4usv: Unimplemented");
+	int32_t values[4];
+	for (int i = 0; i < 4; i++) {
+		values[i] = (int32_t)v[i];
+	}
+	setGenericInt(index, 4, values);
 }
 
 // MARK: - Packed (2_10_10_10) vertex attributes

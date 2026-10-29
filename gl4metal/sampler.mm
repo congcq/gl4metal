@@ -34,6 +34,7 @@ GLboolean glIsSampler(GLuint sampler) {
 
 void glBindSampler(GLuint unit, GLuint sampler) {
 	if (unit >= GL4METAL_MAX_TEXTURE_UNITS || (sampler != 0 && !findSampler(sampler))) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindSampler: invalid unit %u or sampler %u (GL_INVALID_VALUE)", unit, sampler);
 		return;
 	}
@@ -45,6 +46,7 @@ void glBindSampler(GLuint unit, GLuint sampler) {
 void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
 	SamplerObject *so = findSampler(sampler);
 	if (!so) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glSamplerParameteri: invalid sampler %u", sampler);
 		return;
 	}
@@ -63,6 +65,7 @@ void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
 			glSamplerParameterf(sampler, pname, (GLfloat)param);
 			break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glSamplerParameteri: unhandled pname 0x%X", pname);
 			break;
 	}
@@ -75,6 +78,7 @@ void glSamplerParameteriv(GLuint sampler, GLenum pname, const GLint *param) {
 void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
 	SamplerObject *so = findSampler(sampler);
 	if (!so) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glSamplerParameterf: invalid sampler %u", sampler);
 		return;
 	}
@@ -94,27 +98,56 @@ void glSamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat *param) {
 }
 
 void glSamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param) {
-	GL4METAL_LOG("glSamplerParameterIiv: Unimplemented");
+	glSamplerParameteri(sampler, pname, param[0]);
 }
 
 void glSamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param) {
-	GL4METAL_LOG("glSamplerParameterIuiv: Unimplemented");
+	glSamplerParameteri(sampler, pname, (GLint)param[0]);
 }
 
 // MARK: - Sampler queries
 
 void glGetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetSamplerParameteriv: Unimplemented");
+	SamplerObject *so = findSampler(sampler);
+	if (!so) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glGetSamplerParameteriv: invalid sampler %u (GL_INVALID_VALUE)", sampler);
+		*params = 0;
+		return;
+	}
+	switch (pname) {
+		case GL_TEXTURE_MIN_FILTER:   *params = (GLint)so->min_filter; break;
+		case GL_TEXTURE_MAG_FILTER:   *params = (GLint)so->mag_filter; break;
+		case GL_TEXTURE_WRAP_S:       *params = (GLint)so->wrap_s; break;
+		case GL_TEXTURE_WRAP_T:       *params = (GLint)so->wrap_t; break;
+		case GL_TEXTURE_WRAP_R:       *params = (GLint)so->wrap_r; break;
+		case GL_TEXTURE_COMPARE_MODE: *params = (GLint)so->compare_mode; break;
+		case GL_TEXTURE_COMPARE_FUNC: *params = (GLint)so->compare_func; break;
+		case GL_TEXTURE_MIN_LOD:      *params = (GLint)so->min_lod; break;
+		case GL_TEXTURE_MAX_LOD:      *params = (GLint)so->max_lod; break;
+		case GL_TEXTURE_LOD_BIAS:     *params = (GLint)so->lod_bias; break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			GL4METAL_LOG("glGetSamplerParameteriv: unhandled pname 0x%X", pname);
+			*params = 0;
+			break;
+	}
 }
 
 void glGetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params) {
-	GL4METAL_LOG("glGetSamplerParameterfv: Unimplemented");
+	SamplerObject *so = findSampler(sampler);
+	if (so && pname == GL_TEXTURE_MIN_LOD)  { *params = so->min_lod; return; }
+	if (so && pname == GL_TEXTURE_MAX_LOD)  { *params = so->max_lod; return; }
+	if (so && pname == GL_TEXTURE_LOD_BIAS) { *params = so->lod_bias; return; }
+	GLint value = 0;
+	glGetSamplerParameteriv(sampler, pname, &value);
+	*params = (GLfloat)value;
 }
 
 void glGetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetSamplerParameterIiv: Unimplemented");
+	glGetSamplerParameteriv(sampler, pname, params);
 }
 
 void glGetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params) {
-	GL4METAL_LOG("glGetSamplerParameterIuiv: Unimplemented");
+	glGetSamplerParameteriv(sampler, pname, (GLint *)params);
 }

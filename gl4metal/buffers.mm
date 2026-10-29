@@ -57,10 +57,12 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
 	if (target != GL_UNIFORM_BUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glBindBufferRange: unsupported target 0x%X", target);
 		return;
 	}
 	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindBufferRange: binding point %u is out of range", index);
 		return;
 	}
@@ -79,10 +81,12 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
 	GLuint buf_id = boundBuffer(target);
 	if (buf_id == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glBufferData: no buffer bound to target 0x%X", target);
 		return;
 	}
 	if (size < 0 || (NSUInteger)size > ctx.device.maxBufferLength) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBufferData: invalid size %ld", (long)size);
 		return;
 	}
@@ -102,11 +106,13 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 	GLuint buf_id = boundBuffer(target);
 	auto it = ctx.buffer_objects.find(buf_id);
 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glBufferSubData: no buffer storage bound to target 0x%X", target);
 		return;
 	}
 	id<MTLBuffer> buffer = it->second;
 	if (offset < 0 || size < 0 || (NSUInteger)(offset + size) > buffer.length) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBufferSubData: range %ld+%ld is outside the buffer", (long)offset, (long)size);
 		return;
 	}
@@ -119,11 +125,13 @@ void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *d
 	GLuint buf_id = boundBuffer(target);
 	auto it = ctx.buffer_objects.find(buf_id);
 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glGetBufferSubData: no buffer storage bound to target 0x%X", target);
 		return;
 	}
 	id<MTLBuffer> buffer = it->second;
 	if (offset < 0 || size < 0 || (NSUInteger)(offset + size) > buffer.length) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetBufferSubData: range %ld+%ld is outside the buffer", (long)offset, (long)size);
 		return;
 	}
@@ -140,6 +148,7 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 	id<MTLBuffer> from = src->second;
 	id<MTLBuffer> to = dst->second;
 	if (readOffset < 0 || writeOffset < 0 || size < 0 || (NSUInteger)(readOffset + size) > from.length || (NSUInteger)(writeOffset + size) > to.length) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glCopyBufferSubData: range does not fit the buffers");
 		return;
 	}
@@ -153,6 +162,7 @@ void *glMapBuffer(GLenum target, GLenum access) {
 	GLuint buf_id = boundBuffer(target);
 	auto it = ctx.buffer_objects.find(buf_id);
 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glMapBuffer: no buffer storage bound to target 0x%X", target);
 		return NULL;
 	}
@@ -163,6 +173,7 @@ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 	GLuint buf_id = boundBuffer(target);
 	auto it = ctx.buffer_objects.find(buf_id);
 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glMapBufferRange: no buffer bound to target 0x%X", target);
 		return NULL;
 	}
@@ -200,6 +211,7 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) {
 		case GL_BUFFER_MAP_OFFSET: *params = 0;                    break;
 		case GL_BUFFER_MAP_LENGTH: *params = (GLint)buffer.length; break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetBufferParameteriv: unhandled pname 0x%X", pname);
 			*params = 0;
 			break;
@@ -213,5 +225,5 @@ void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) {
 }
 
 void glGetBufferPointerv(GLenum target, GLenum pname, void **params) {
-	GL4METAL_LOG("glGetBufferPointerv: Unimplemented");
+	*params = NULL; // mappings are not tracked: glMapBuffer hands out the CPU pointer of the shared buffer
 }

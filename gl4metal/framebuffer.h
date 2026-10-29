@@ -13,5 +13,7 @@
 id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask);  // ends the open pass, starts one on glBindFramebuffer's target
 void endRenderEncoder(void);
 void applyViewportAndScissor(void);
+void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil);
+void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba);
 
 #endif /* FRAMEBUFFER_H */

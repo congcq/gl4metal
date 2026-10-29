@@ -1,5 +1,13 @@
 #import "state.h"
 
+// Fixed-function state Metal has no equivalent for (or that is not wired up yet): accepted, reported once, ignored.
+static void notSupported(const char *name) {
+	static std::unordered_set<std::string> reported;
+	if (reported.insert(name).second) {
+		GL4METAL_LOG("%s: not supported by the Metal layer, ignored (reported once)", name);
+	}
+}
+
 // MARK: - Blending
 
 void glBlendFunc(GLenum sfactor, GLenum dfactor) {
@@ -31,7 +39,7 @@ void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
 }
 
 void glLogicOp(GLenum opcode) {
-	GL4METAL_LOG("glLogicOp: Unimplemented");
+	notSupported("glLogicOp");
 }
 
 // MARK: - Depth
@@ -55,27 +63,27 @@ void glDepthRange(GLdouble n, GLdouble f) {
 // MARK: - Stencil
 
 void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
-	GL4METAL_LOG("glStencilFunc: Unimplemented");
+	notSupported("glStencilFunc");
 }
 
 void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
-	GL4METAL_LOG("glStencilFuncSeparate: Unimplemented");
+	notSupported("glStencilFuncSeparate");
 }
 
 void glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) {
-	GL4METAL_LOG("glStencilOp: Unimplemented");
+	notSupported("glStencilOp");
 }
 
 void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass) {
-	GL4METAL_LOG("glStencilOpSeparate: Unimplemented");
+	notSupported("glStencilOpSeparate");
 }
 
 void glStencilMask(GLuint mask) {
-	GL4METAL_LOG("glStencilMask: Unimplemented");
+	notSupported("glStencilMask");
 }
 
 void glStencilMaskSeparate(GLenum face, GLuint mask) {
-	GL4METAL_LOG("glStencilMaskSeparate: Unimplemented");
+	notSupported("glStencilMaskSeparate");
 }
 
 // MARK: - Color write mask
@@ -88,11 +96,13 @@ void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha
 }
 
 void glColorMaski(GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
-	GL4METAL_LOG("glColorMaski: Unimplemented");
+	if (index == 0) { // one mask for all draw buffers for now
+		glColorMask(r, g, b, a);
+	}
 }
 
 void glClampColor(GLenum target, GLenum clamp) {
-	GL4METAL_LOG("glClampColor: Unimplemented");
+	notSupported("glClampColor");
 }
 
 // MARK: - Rasterization
@@ -119,49 +129,49 @@ void glPolygonOffset(GLfloat factor, GLfloat units) {
 }
 
 void glLineWidth(GLfloat width) {
-	GL4METAL_LOG("glLineWidth: Unimplemented");
+	notSupported("glLineWidth");
 }
 
 void glPointSize(GLfloat size) {
-	GL4METAL_LOG("glPointSize: Unimplemented");
+	notSupported("glPointSize");
 }
 
 void glPointParameterf(GLenum pname, GLfloat param) {
-	GL4METAL_LOG("glPointParameterf: Unimplemented");
+	notSupported("glPointParameterf");
 }
 
 void glPointParameterfv(GLenum pname, const GLfloat *params) {
-	GL4METAL_LOG("glPointParameterfv: Unimplemented");
+	notSupported("glPointParameterfv");
 }
 
 void glPointParameteri(GLenum pname, GLint param) {
-	GL4METAL_LOG("glPointParameteri: Unimplemented");
+	notSupported("glPointParameteri");
 }
 
 void glPointParameteriv(GLenum pname, const GLint *params) {
-	GL4METAL_LOG("glPointParameteriv: Unimplemented");
+	notSupported("glPointParameteriv");
 }
 
 void glProvokingVertex(GLenum mode) {
-	GL4METAL_LOG("glProvokingVertex: Unimplemented");
+	notSupported("glProvokingVertex");
 }
 
 void glPrimitiveRestartIndex(GLuint index) {
-	GL4METAL_LOG("glPrimitiveRestartIndex: Unimplemented");
+	notSupported("glPrimitiveRestartIndex");
 }
 
 void glHint(GLenum target, GLenum mode) {
-	GL4METAL_LOG("glHint: Unimplemented");
+	notSupported("glHint");
 }
 
 // MARK: - Multisample
 
 void glSampleCoverage(GLfloat value, GLboolean invert) {
-	GL4METAL_LOG("glSampleCoverage: Unimplemented");
+	notSupported("glSampleCoverage");
 }
 
 void glSampleMaski(GLuint maskNumber, GLbitfield mask) {
-	GL4METAL_LOG("glSampleMaski: Unimplemented");
+	notSupported("glSampleMaski");
 }
 
 // MARK: - Viewport / scissor

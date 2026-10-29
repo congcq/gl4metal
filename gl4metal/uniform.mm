@@ -65,6 +65,7 @@ static void writeVector(GLint location, GLsizei count, int comps, SrcKind kind, 
 	GLint element = 0;
 	ProgramUniform *u = p ? uniformAt(*p, location, element) : nullptr;
 	if (!u) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: no current program or invalid location %d (GL_INVALID_OPERATION)", caller, location);
 		return;
 	}
@@ -108,6 +109,7 @@ static void writeMatrix(GLint location, GLsizei count, int cols, int rows, GLboo
 	GLint element = 0;
 	ProgramUniform *u = p ? uniformAt(*p, location, element) : nullptr;
 	if (!u) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: no current program or invalid location %d (GL_INVALID_OPERATION)", caller, location);
 		return;
 	}
@@ -138,6 +140,96 @@ static void writeMatrix(GLint location, GLsizei count, int cols, int rows, GLboo
 	}
 }
 
+// MARK: - Uniform reflection helpers
+
+static GLenum glTypeOf(const TranslatedUniform &u) {
+	if (u.kind == TranslatedUniform::Sampler) {
+		switch (u.dim) {
+			case TranslatedUniform::DimCube:    return GL_SAMPLER_CUBE;
+			case TranslatedUniform::Dim3D:      return GL_SAMPLER_3D;
+			case TranslatedUniform::Dim2DArray: return GL_SAMPLER_2D_ARRAY;
+			default:                            return GL_SAMPLER_2D;
+		}
+	}
+	int c = std::min(std::max(u.vecsize, 1), 4) - 1;
+	if (u.columns > 1) {
+		static const GLenum square[3] = { GL_FLOAT_MAT2, GL_FLOAT_MAT3, GL_FLOAT_MAT4 };
+		if (u.columns == u.vecsize) {
+			return square[u.columns - 2];
+		}
+		// glUniformMatrix{columns}x{rows}
+		static const GLenum rect[3][3] = { { GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4, 0 }, { GL_FLOAT_MAT3x2, GL_FLOAT_MAT3x4, 0 }, { GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, 0 } };
+		int col = u.columns - 2;
+		int row = u.vecsize == 2 ? 0 : (u.vecsize == 3 ? (u.columns == 2 ? 0 : 1) : 1);
+		if (u.columns == 2) row = u.vecsize == 3 ? 0 : 1;
+		if (u.columns == 3) row = u.vecsize == 2 ? 0 : 1;
+		if (u.columns == 4) row = u.vecsize == 2 ? 0 : 1;
+		return rect[col][row];
+	}
+	static const GLenum floats[4] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
+	static const GLenum ints[4]   = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
+	static const GLenum uints[4]  = { GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4 };
+	static const GLenum bools[4]  = { GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4 };
+	switch (u.kind) {
+		case TranslatedUniform::Int:  return ints[c];
+		case TranslatedUniform::UInt: return uints[c];
+		case TranslatedUniform::Bool: return bools[c];
+		default:                      return floats[c];
+	}
+}
+
+static std::string activeName(const TranslatedUniform &u) {
+	return u.array_size > 1 ? u.name + "[0]" : u.name; // arrays are reported as "name[0]"
+}
+
+// Reads `count` components of a uniform back from the CPU copy of its block.
+static void readUniform(GLuint program, GLint location, int count, double *out) {
+	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || location < 0 || (size_t)location >= it->second.locations.size()) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetUniform*: invalid program %u or location %d (GL_INVALID_OPERATION)", program, location);
+		return;
+	}
+	ProgramObject &p = it->second;
+	const ProgramUniform &u = p.uniforms[(size_t)p.locations[(size_t)location].first];
+	GLint element = p.locations[(size_t)location].second;
+	if (u.info.kind == TranslatedUniform::Sampler) {
+		out[0] = u.units[(size_t)element];
+		return;
+	}
+	for (int s = 0; s < 2; s++) {
+		const TranslatedUniform::Stage &st = u.info.stage[s];
+		if (!st.present) {
+			continue;
+		}
+		size_t base = st.offset + (size_t)element * st.array_stride;
+		int rows = u.info.vecsize, cols = u.info.columns;
+		for (int i = 0; i < count; i++) {
+			size_t at = u.info.columns > 1 ? base + (size_t)(i / rows) * st.matrix_stride + (size_t)(i % rows) * 4 : base + (size_t)i * 4;
+			if (at + 4 > p.uniform_data[s].size() || i >= rows * cols) {
+				break;
+			}
+			if (u.info.kind == TranslatedUniform::Float) {
+				float f; memcpy(&f, p.uniform_data[s].data() + at, 4); out[i] = f;
+			} else if (u.info.kind == TranslatedUniform::Int) {
+				int32_t n; memcpy(&n, p.uniform_data[s].data() + at, 4); out[i] = n;
+			} else {
+				uint32_t n; memcpy(&n, p.uniform_data[s].data() + at, 4); out[i] = n;
+			}
+		}
+		return;
+	}
+}
+
+static int componentsAt(GLuint program, GLint location) {
+	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || location < 0 || (size_t)location >= it->second.locations.size()) {
+		return 0;
+	}
+	const TranslatedUniform &u = it->second.uniforms[(size_t)it->second.locations[(size_t)location].first].info;
+	return u.kind == TranslatedUniform::Sampler ? 1 : u.vecsize * u.columns;
+}
+
 // MARK: - Uniform locations and queries
 
 GLint glGetUniformLocation(GLuint program, const GLchar *name) {
@@ -162,31 +254,107 @@ GLint glGetUniformLocation(GLuint program, const GLchar *name) {
 }
 
 void glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
-	GL4METAL_LOG("glGetUniformfv: Unimplemented");
+	double values[16] = { 0 };
+	int n = componentsAt(program, location);
+	readUniform(program, location, n, values);
+	for (int i = 0; i < n; i++) {
+		params[i] = (GLfloat)values[i];
+	}
 }
 
 void glGetUniformiv(GLuint program, GLint location, GLint *params) {
-	GL4METAL_LOG("glGetUniformiv: Unimplemented");
+	double values[16] = { 0 };
+	int n = componentsAt(program, location);
+	readUniform(program, location, n, values);
+	for (int i = 0; i < n; i++) {
+		params[i] = (GLint)values[i];
+	}
 }
 
 void glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
-	GL4METAL_LOG("glGetUniformuiv: Unimplemented");
+	double values[16] = { 0 };
+	int n = componentsAt(program, location);
+	readUniform(program, location, n, values);
+	for (int i = 0; i < n; i++) {
+		params[i] = (GLuint)values[i];
+	}
 }
 
 void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
-	GL4METAL_LOG("glGetActiveUniform: Unimplemented");
+	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || index >= it->second.uniforms.size()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glGetActiveUniform: invalid program %u or uniform index %u (GL_INVALID_VALUE)", program, index);
+		if (length) {
+			*length = 0;
+		}
+		return;
+	}
+	const TranslatedUniform &u = it->second.uniforms[index].info;
+	if (size) {
+		*size = u.array_size;
+	}
+	if (type) {
+		*type = glTypeOf(u);
+	}
+	copyGLString(activeName(u), bufSize, length, name);
 }
 
 void glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices) {
-	GL4METAL_LOG("glGetUniformIndices: Unimplemented");
+	auto it = ctx.program_objects.find(program);
+	for (GLsizei i = 0; i < uniformCount; i++) {
+		uniformIndices[i] = GL_INVALID_INDEX;
+		if (it == ctx.program_objects.end()) {
+			continue;
+		}
+		std::string wanted(uniformNames[i]);
+		if (wanted.size() > 3 && wanted.compare(wanted.size() - 3, 3, "[0]") == 0) {
+			wanted.resize(wanted.size() - 3);
+		}
+		for (size_t k = 0; k < it->second.uniforms.size(); k++) {
+			if (it->second.uniforms[k].info.name == wanted) {
+				uniformIndices[i] = (GLuint)k;
+				break;
+			}
+		}
+	}
 }
 
 void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetActiveUniformsiv: Unimplemented");
+	auto it = ctx.program_objects.find(program);
+	for (GLsizei i = 0; i < uniformCount; i++) {
+		params[i] = 0;
+		if (it == ctx.program_objects.end() || uniformIndices[i] >= it->second.uniforms.size()) {
+			continue;
+		}
+		const TranslatedUniform &u = it->second.uniforms[uniformIndices[i]].info;
+		const TranslatedUniform::Stage &st = u.stage[u.stage[0].present ? 0 : 1];
+		switch (pname) {
+			case GL_UNIFORM_TYPE:          params[i] = (GLint)glTypeOf(u); break;
+			case GL_UNIFORM_SIZE:          params[i] = u.array_size; break;
+			case GL_UNIFORM_NAME_LENGTH:   params[i] = (GLint)activeName(u).size() + 1; break;
+			case GL_UNIFORM_BLOCK_INDEX:   params[i] = -1; break; // members of the default block
+			case GL_UNIFORM_OFFSET:        params[i] = (GLint)st.offset; break;
+			case GL_UNIFORM_ARRAY_STRIDE:  params[i] = (GLint)st.array_stride; break;
+			case GL_UNIFORM_MATRIX_STRIDE: params[i] = (GLint)st.matrix_stride; break;
+			case GL_UNIFORM_IS_ROW_MAJOR:  params[i] = 0; break;
+			default:
+				gl4metalSetError(GL_INVALID_ENUM);
+				GL4METAL_LOG("glGetActiveUniformsiv: unhandled pname 0x%X", pname);
+				break;
+		}
+	}
 }
 
 void glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformName) {
-	GL4METAL_LOG("glGetActiveUniformName: Unimplemented");
+	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || uniformIndex >= it->second.uniforms.size()) {
+		if (length) {
+			*length = 0;
+		}
+		return;
+	}
+	copyGLString(activeName(it->second.uniforms[uniformIndex].info), bufSize, length, uniformName);
 }
 
 // MARK: - Uniform blocks
@@ -207,6 +375,7 @@ GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName) {
 void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params) {
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || uniformBlockIndex >= it->second.blocks.size()) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetActiveUniformBlockiv: invalid program %u or block %u", program, uniformBlockIndex);
 		*params = 0;
 		return;
@@ -220,6 +389,7 @@ void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum 
 		case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:   *params = b.info.stage[0].present; break;
 		case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: *params = b.info.stage[1].present; break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetActiveUniformBlockiv: unhandled pname 0x%X", pname);
 			*params = 0;
 			break;
@@ -241,6 +411,7 @@ void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint unif
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || uniformBlockIndex >= it->second.blocks.size() ||
 		uniformBlockBinding >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glUniformBlockBinding: invalid program %u, block %u or binding %u", program, uniformBlockIndex, uniformBlockBinding);
 		return;
 	}

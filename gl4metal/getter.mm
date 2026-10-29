@@ -5,21 +5,108 @@
 
 // MARK: - State queries
 
+// GL keeps the first error until glGetError reads (and clears) it.
+static GLenum sError = GL_NO_ERROR;
+
+void gl4metalSetError(GLenum error) {
+	if (sError == GL_NO_ERROR) {
+		sError = error;
+	}
+}
+
 GLenum glGetError(void) {
-	GL4METAL_LOG("glGetError: Unimplemented, defaulting return GL_NO_ERROR");
-	return GL_NO_ERROR;
+	GLenum error = sError;
+	sError = GL_NO_ERROR;
+	return error;
 }
 
 void glGetBooleanv(GLenum pname, GLboolean *data) {
-	GL4METAL_LOG("glGetBooleanv: Unimplemented");
+	switch (pname) {
+		case GL_BLEND:
+		case GL_CULL_FACE:
+		case GL_DEPTH_TEST:
+		case GL_SCISSOR_TEST:
+		case GL_POLYGON_OFFSET_FILL:
+		case GL_STENCIL_TEST:
+		case GL_DITHER:
+			*data = glIsEnabled(pname);
+			break;
+		case GL_DEPTH_WRITEMASK:
+			*data = ctx.depth_write_enabled;
+			break;
+		case GL_COLOR_WRITEMASK:
+			for (int i = 0; i < 4; i++) {
+				data[i] = ctx.color_mask[i];
+			}
+			break;
+		default: {
+			GLint value = 0;
+			glGetIntegerv(pname, &value);
+			*data = value != 0;
+			break;
+		}
+	}
 }
 
 void glGetDoublev(GLenum pname, GLdouble *data) {
-	GL4METAL_LOG("glGetDoublev: Unimplemented");
+	GLfloat values[4] = { 0, 0, 0, 0 };
+	glGetFloatv(pname, values);
+	int count = (pname == GL_COLOR_CLEAR_VALUE || pname == GL_BLEND_COLOR || pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 :
+				((pname == GL_DEPTH_RANGE || pname == GL_MAX_VIEWPORT_DIMS || pname == GL_ALIASED_LINE_WIDTH_RANGE || pname == GL_POINT_SIZE_RANGE) ? 2 : 1);
+	for (int i = 0; i < count; i++) {
+		data[i] = values[i];
+	}
 }
 
 void glGetFloatv(GLenum pname, GLfloat *data) {
-	GL4METAL_LOG("glGetFloatv: Unimplemented");
+	switch (pname) {
+		case GL_COLOR_CLEAR_VALUE:
+			data[0] = (GLfloat)ctx.clear_color.red; data[1] = (GLfloat)ctx.clear_color.green;
+			data[2] = (GLfloat)ctx.clear_color.blue; data[3] = (GLfloat)ctx.clear_color.alpha;
+			break;
+		case GL_DEPTH_CLEAR_VALUE:
+			*data = (GLfloat)ctx.clear_depth;
+			break;
+		case GL_DEPTH_RANGE:
+			data[0] = ctx.depth_range_near; data[1] = ctx.depth_range_far;
+			break;
+		case GL_BLEND_COLOR:
+			for (int i = 0; i < 4; i++) {
+				data[i] = ctx.blend_color[i];
+			}
+			break;
+		case GL_POLYGON_OFFSET_FACTOR:
+			*data = ctx.polygon_offset_factor;
+			break;
+		case GL_POLYGON_OFFSET_UNITS:
+			*data = ctx.polygon_offset_units;
+			break;
+		case GL_LINE_WIDTH:
+			*data = 1.0f; // Metal has no line width
+			break;
+		case GL_ALIASED_LINE_WIDTH_RANGE:
+		case GL_SMOOTH_LINE_WIDTH_RANGE:
+			data[0] = 1.0f; data[1] = 1.0f;
+			break;
+		case GL_POINT_SIZE_RANGE:
+			data[0] = 1.0f; data[1] = 64.0f;
+			break;
+		case GL_MAX_TEXTURE_LOD_BIAS:
+			*data = 15.0f;
+			break;
+		case 0x84FF: // GL_MAX_TEXTURE_MAX_ANISOTROPY
+			*data = 16.0f;
+			break;
+		default: {
+			GLint values[4] = { 0, 0, 0, 0 };
+			glGetIntegerv(pname, values);
+			int count = (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 : (pname == GL_MAX_VIEWPORT_DIMS ? 2 : 1);
+			for (int i = 0; i < count; i++) {
+				data[i] = (GLfloat)values[i];
+			}
+			break;
+		}
+	}
 }
 
 void glGetIntegerv(GLenum pname, GLint *data) {
@@ -158,25 +245,53 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_UNPACK_SKIP_PIXELS: *data = ctx.unpack_skip_pixels; break;
 		case GL_UNPACK_SKIP_ROWS:   *data = ctx.unpack_skip_rows; break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetIntegerv: missing 0x%X", pname);
 			break;
 	}
 }
 
 void glGetInteger64v(GLenum pname, GLint64 *data) {
-	GL4METAL_LOG("glGetInteger64v: Unimplemented");
+	GLint values[4] = { 0, 0, 0, 0 };
+	glGetIntegerv(pname, values);
+	int count = (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 : (pname == GL_MAX_VIEWPORT_DIMS ? 2 : 1);
+	for (int i = 0; i < count; i++) {
+		data[i] = values[i];
+	}
 }
 
 void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
-	GL4METAL_LOG("glGetBooleani_v: Unimplemented");
+	if (target == GL_COLOR_WRITEMASK) { // one mask for all draw buffers for now
+		for (int i = 0; i < 4; i++) {
+			data[i] = ctx.color_mask[i];
+		}
+		return;
+	}
+	gl4metalSetError(GL_INVALID_ENUM);
+	GL4METAL_LOG("glGetBooleani_v: unhandled target 0x%X", target);
 }
 
 void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
-	GL4METAL_LOG("glGetIntegeri_v: Unimplemented");
+	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS && (target == GL_UNIFORM_BUFFER_BINDING || target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glGetIntegeri_v: binding point %u is out of range (GL_INVALID_VALUE)", index);
+		return;
+	}
+	switch (target) {
+		case GL_UNIFORM_BUFFER_BINDING: *data = (GLint)ctx.uniform_buffer_bindings[index].buffer; break;
+		case GL_UNIFORM_BUFFER_START:   *data = (GLint)ctx.uniform_buffer_bindings[index].offset; break;
+		case GL_UNIFORM_BUFFER_SIZE:    *data = (GLint)ctx.uniform_buffer_bindings[index].size; break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			GL4METAL_LOG("glGetIntegeri_v: unhandled target 0x%X", target);
+			break;
+	}
 }
 
 void glGetInteger64i_v(GLenum target, GLuint index, GLint64 *data) {
-	GL4METAL_LOG("glGetInteger64i_v: Unimplemented");
+	GLint value = 0;
+	glGetIntegeri_v(target, index, &value);
+	*data = value;
 }
 
 void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
@@ -184,7 +299,7 @@ void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
 }
 
 void glGetPointerv(GLenum pname, void **params) {
-    GL4METAL_LOG("glGetPointerv: Unimplemented");
+	*params = NULL; // no debug callback, no client-side arrays
 }
 
 NSString *detectDeviceName(utsname si) {
@@ -339,12 +454,12 @@ const GLubyte *glGetString(GLenum name) {
 			return (const GLubyte *)s.UTF8String;
 		}
 		case GL_VERSION:
-			return (const GLubyte *)"3.3 Core Profile (Metal backend)";
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:
 			return (const GLubyte *)""; // does not implement extensions yet
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetString: missing 0x%X", name);
 			return NULL;
 	}

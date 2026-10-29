@@ -4,6 +4,11 @@
 // #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 
+#import "framebuffer.h"
+#import "texture.h"
+#import "shaders.h"
+#import "sync.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -19,16 +24,9 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
-#include "exports.h"
 #include "shadertranslator.h"
 
-#define DEBUG 1
-
-#if DEBUG
 #define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
-#else
-#define GL4METAL_LOG(...)
-#endif
 
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
@@ -66,6 +64,10 @@ struct FBO {
 	FBOAttachment depth, stencil;
 	GLenum draw_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS] = { GL_COLOR_ATTACHMENT0 };
 	GLenum read_buffer = GL_COLOR_ATTACHMENT0;
+};
+
+struct VAO {
+	
 };
 
 // MARK: - Vertex arrays
@@ -265,4 +267,10 @@ void updateDepthStencilState();
 }
 #endif
 
-MTLCompareFunction getMetalCompareFunc(GLenum func);
+// MARK: - Internal helpers (C++ linkage, not part of the GL API)
+
+MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.mm
+void gl4metalSetError(GLenum error);                                // getter.mm: what the next glGetError returns
+void genericAttribValue(GLuint index, bool integer, void *out16);   // vertexarray.mm: glVertexAttrib* current value
+
+#include "exports.h"

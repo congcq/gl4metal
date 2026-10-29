@@ -25,6 +25,7 @@ static MTLBlendFactor blendFactor(GLenum f) {
 		case GL_ONE_MINUS_CONSTANT_ALPHA: return MTLBlendFactorOneMinusBlendAlpha;
 		case GL_SRC_ALPHA_SATURATE:       return MTLBlendFactorSourceAlphaSaturated;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("unsupported blend factor 0x%X, using GL_ONE", f);
 			return MTLBlendFactorOne;
 	}
@@ -38,6 +39,7 @@ static MTLBlendOperation blendOperation(GLenum e) {
 		case GL_MIN:                   return MTLBlendOperationMin;
 		case GL_MAX:                   return MTLBlendOperationMax;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("unsupported blend equation 0x%X, using GL_FUNC_ADD", e);
 			return MTLBlendOperationAdd;
 	}
@@ -194,7 +196,7 @@ static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
 // and Metal wants exactly that type bound, so there is one fallback per sampler dimensionality.
 static id<MTLTexture> fallbackTexture(TranslatedUniform::Dim dim) {
 	static id<MTLTexture> textures[4] = { nil, nil, nil, nil };
-	__strong id<MTLTexture> &slot = textures[(int)dim];
+	id<MTLTexture> &slot = textures[(int)dim];
 	if (!slot) {
 		MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
 		d.textureType = typeForDim(dim);
@@ -377,6 +379,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		case GL_TRIANGLE_STRIP: prim = MTLPrimitiveTypeTriangleStrip; break;
 		case GL_TRIANGLE_FAN:   prim = MTLPrimitiveTypeTriangle; fan = true; break; // Metal has no fans: re-indexed below
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("%s: unsupported primitive mode 0x%X", caller, dc.mode);
 			return;
 	}
@@ -448,7 +451,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// Vertex buffers.
 	for (const ActiveAttrib &aa : attribs) {
 		if (aa.constant) {
-			[enc setVertexBuffer:ctx.constant_attrib_buffer offset:(aa.pa->is_integer ? 16 : 0) atIndex:aa.slot];
+			uint8_t value[16]; // glVertexAttrib*: the attribute's current value
+			genericAttribValue((GLuint)aa.pa->gl_index, aa.pa->is_integer, value);
+			[enc setVertexBytes:value length:sizeof(value) atIndex:aa.slot];
 		} else {
 			[enc setVertexBuffer:aa.buffer offset:aa.offset atIndex:aa.slot];
 		}
@@ -554,12 +559,14 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 
 	auto eit = ctx.buffer_objects.find(vao.element_array_buffer_id);
 	if (vao.element_array_buffer_id == 0 || eit == ctx.buffer_objects.end() || !eit->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: no element array buffer bound to the current VAO", caller);
 		return;
 	}
 	id<MTLBuffer> ebo = eit->second;
 	NSUInteger indexSize = dc.indexType == GL_UNSIGNED_INT ? 4 : (dc.indexType == GL_UNSIGNED_SHORT ? 2 : 1);
 	if (dc.indexType != GL_UNSIGNED_INT && dc.indexType != GL_UNSIGNED_SHORT && dc.indexType != GL_UNSIGNED_BYTE) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: invalid index type 0x%X", caller, dc.indexType);
 		return;
 	}
@@ -622,11 +629,15 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
 }
 
 void glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei drawcount) {
-	GL4METAL_LOG("glMultiDrawArrays: Unimplemented");
+	for (GLsizei i = 0; i < drawcount; i++) {
+		glDrawArrays(mode, first[i], count[i]);
+	}
 }
 
 void glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type, const void *const*indices, GLsizei drawcount) {
-	GL4METAL_LOG("glMultiDrawElements: Unimplemented");
+	for (GLsizei i = 0; i < drawcount; i++) {
+		glDrawElements(mode, count[i], type, indices[i]);
+	}
 }
 
 // MARK: - Instanced
@@ -649,13 +660,16 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
 }
 
 void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
-	GL4METAL_LOG("glDrawRangeElementsBaseVertex: Unimplemented");
+	glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
 }
 
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLint basevertex) {
-	GL4METAL_LOG("glDrawElementsInstancedBaseVertex: Unimplemented");
+	DrawCall dc = { mode, 0, count, true, type, (GLintptr)(uintptr_t)indices, instancecount, basevertex };
+	executeDraw(dc, "glDrawElementsInstancedBaseVertex");
 }
 
 void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum type, const void *const*indices, GLsizei drawcount, const GLint *basevertex) {
-	GL4METAL_LOG("glMultiDrawElementsBaseVertex: Unimplemented");
+	for (GLsizei i = 0; i < drawcount; i++) {
+		glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+	}
 }

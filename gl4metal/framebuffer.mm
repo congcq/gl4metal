@@ -266,6 +266,7 @@ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
 			ctx.read_fbo = framebuffer;
 			break;
 		default:
+			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glBindFramebuffer: invalid target 0x%X", target);
 			break;
 	}
@@ -303,7 +304,7 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 // MARK: - Framebuffer attachments
 
 void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
-	GL4METAL_LOG("glFramebufferTexture: Unimplemented");
+	glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
 }
 
 void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
@@ -313,10 +314,12 @@ void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, 
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
 	GLuint id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
 	if (id == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glFramebufferTexture2D: the default framebuffer is bound (GL_INVALID_OPERATION)");
 		return;
 	}
 	if (texture != 0 && textarget != GL_TEXTURE_2D) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glFramebufferTexture2D: unsupported textarget 0x%X", textarget);
 		return;
 	}
@@ -335,6 +338,7 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		fbo.depth = a;
 		fbo.stencil = a;
 	} else {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glFramebufferTexture2D: invalid attachment 0x%X", attachment);
 		return;
 	}
@@ -356,7 +360,35 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
 }
 
 void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
-	GL4METAL_LOG("glGetFramebufferAttachmentParameteriv: Unimplemented");
+	GLuint id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (id == 0) { // default framebuffer
+		*params = (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) ? GL_FRAMEBUFFER_DEFAULT : 0;
+		return;
+	}
+	auto it = ctx.fbo_objects.find(id);
+	if (it == ctx.fbo_objects.end()) {
+		*params = 0;
+		return;
+	}
+	const FBO &fbo = it->second;
+	const FBOAttachment *a = nullptr;
+	if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		a = &fbo.color[attachment - GL_COLOR_ATTACHMENT0];
+	} else if (attachment == GL_DEPTH_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+		a = &fbo.depth;
+	} else if (attachment == GL_STENCIL_ATTACHMENT) {
+		a = &fbo.stencil;
+	}
+	switch (pname) {
+		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: *params = (a && a->texture) ? GL_TEXTURE : GL_NONE; break;
+		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: *params = a ? (GLint)a->texture : 0; break;
+		case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: *params = a ? a->level : 0; break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			GL4METAL_LOG("glGetFramebufferAttachmentParameteriv: unhandled pname 0x%X", pname);
+			*params = 0;
+			break;
+	}
 }
 
 // MARK: - Draw / read buffers
@@ -420,22 +452,72 @@ void glClearStencil(GLint s) {
 }
 
 void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
-	GL4METAL_LOG("glClearBufferiv: Unimplemented");
+	if (buffer == GL_STENCIL) {
+		clearDepthStencil(GL_STENCIL_BUFFER_BIT, (GLfloat)ctx.clear_depth, value[0]);
+	} else {
+		GL4METAL_LOG("glClearBufferiv: integer colour buffers are not supported");
+	}
 }
 
 void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
-	GL4METAL_LOG("glClearBufferuiv: Unimplemented");
+	GL4METAL_LOG("glClearBufferuiv: integer colour buffers are not supported");
 }
 
 void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
-	GL4METAL_LOG("glClearBufferfv: Unimplemented");
+	if (buffer == GL_COLOR) {
+		clearOneColorBuffer(drawbuffer, value);
+	} else if (buffer == GL_DEPTH) {
+		clearDepthStencil(GL_DEPTH_BUFFER_BIT, value[0], ctx.clear_stencil);
+	} else {
+		GL4METAL_LOG("glClearBufferfv: unsupported buffer 0x%X", buffer);
+	}
 }
 
 void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
-	GL4METAL_LOG("glClearBufferfi: Unimplemented");
+	clearDepthStencil(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, depth, stencil);
 }
 
 // MARK: - Blit / read back
+
+
+// glClearBuffer*: one draw buffer of the current framebuffer.
+static void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
+	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glClearBuffer*: draw buffer %d is out of range (GL_INVALID_VALUE)", drawbuffer);
+		return;
+	}
+	MTLClearColor saved = ctx.clear_color;
+	ctx.clear_color = MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3]);
+	if (ctx.draw_fbo == 0) {
+		beginRenderPass(GL_COLOR_BUFFER_BIT);
+	} else {
+		auto it = ctx.fbo_objects.find(ctx.draw_fbo);
+		if (it != ctx.fbo_objects.end()) {
+			FBO &fbo = it->second;
+			GLenum savedBuffers[GL4METAL_MAX_COLOR_ATTACHMENTS];
+			memcpy(savedBuffers, fbo.draw_buffers, sizeof(savedBuffers));
+			for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
+				fbo.draw_buffers[i] = GL_NONE;
+			}
+			fbo.draw_buffers[0] = savedBuffers[drawbuffer]; // only this buffer takes part in the clearing pass
+			beginRenderPass(GL_COLOR_BUFFER_BIT);
+			endRenderEncoder(); // its attachments differ from the ones draws use
+			memcpy(fbo.draw_buffers, savedBuffers, sizeof(savedBuffers));
+		}
+	}
+	ctx.clear_color = saved;
+}
+
+static void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil) {
+	double savedDepth = ctx.clear_depth;
+	GLint savedStencil = ctx.clear_stencil;
+	ctx.clear_depth = clamp01(depth);
+	ctx.clear_stencil = stencil;
+	beginRenderPass(mask);
+	ctx.clear_depth = savedDepth;
+	ctx.clear_stencil = savedStencil;
+}
 
 // MARK: - Blit helpers
 
@@ -517,7 +599,7 @@ static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
 
 static id<MTLSamplerState> blitSampler(bool linear) {
 	static id<MTLSamplerState> samplers[2] = { nil, nil };
-	__strong id<MTLSamplerState> &s = samplers[linear ? 1 : 0];
+	id<MTLSamplerState> s = samplers[linear ? 1 : 0];
 	if (!s) {
 		MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
 		d.minFilter = d.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -635,5 +717,82 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 }
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
-	GL4METAL_LOG("glReadPixels: Unimplemented");
+	if (ctx.read_fbo == 0) {
+		GL4METAL_LOG("glReadPixels: reading the default framebuffer is not supported (the drawable is framebuffer-only)");
+		return;
+	}
+	auto it = ctx.fbo_objects.find(ctx.read_fbo);
+	if (it == ctx.fbo_objects.end() || it->second.read_buffer < GL_COLOR_ATTACHMENT0 ||
+		it->second.read_buffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		return;
+	}
+	const FBOAttachment &a = it->second.color[it->second.read_buffer - GL_COLOR_ATTACHMENT0];
+	id<MTLTexture> tex = attachmentTexture(a);
+	if (!tex || width <= 0 || height <= 0) {
+		return;
+	}
+
+	// Source: 8-bit colour textures, with the index of R, G, B, A inside one pixel (-1: absent).
+	int srcComps = 0, srcIdx[4] = { -1, -1, -1, -1 };
+	switch (tex.pixelFormat) {
+		case MTLPixelFormatR8Unorm:         srcComps = 1; srcIdx[0] = 0; break;
+		case MTLPixelFormatRG8Unorm:        srcComps = 2; srcIdx[0] = 0; srcIdx[1] = 1; break;
+		case MTLPixelFormatRGBA8Unorm:
+		case MTLPixelFormatRGBA8Unorm_sRGB: srcComps = 4; srcIdx[0] = 0; srcIdx[1] = 1; srcIdx[2] = 2; srcIdx[3] = 3; break;
+		case MTLPixelFormatBGRA8Unorm:      srcComps = 4; srcIdx[2] = 0; srcIdx[1] = 1; srcIdx[0] = 2; srcIdx[3] = 3; break;
+		default:
+			GL4METAL_LOG("glReadPixels: unsupported source MTLPixelFormat %d", (int)tex.pixelFormat);
+			return;
+	}
+	// Destination layout: which source channel (0 R, 1 G, 2 B, 3 A) feeds each component.
+	int dstComps = 0, dstChannel[4] = { 0, 0, 0, 0 };
+	switch (format) {
+		case GL_RED:  dstComps = 1; dstChannel[0] = 0; break;
+		case GL_RG:   dstComps = 2; dstChannel[0] = 0; dstChannel[1] = 1; break;
+		case GL_RGB:  dstComps = 3; dstChannel[0] = 0; dstChannel[1] = 1; dstChannel[2] = 2; break;
+		case GL_BGR:  dstComps = 3; dstChannel[0] = 2; dstChannel[1] = 1; dstChannel[2] = 0; break;
+		case GL_RGBA: dstComps = 4; dstChannel[0] = 0; dstChannel[1] = 1; dstChannel[2] = 2; dstChannel[3] = 3; break;
+		case GL_BGRA: dstComps = 4; dstChannel[0] = 2; dstChannel[1] = 1; dstChannel[2] = 0; dstChannel[3] = 3; break;
+		default:
+			GL4METAL_LOG("glReadPixels: unsupported format 0x%X", format);
+			return;
+	}
+	if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_INT_8_8_8_8_REV) {
+		GL4METAL_LOG("glReadPixels: unsupported type 0x%X", type);
+		return;
+	}
+	NSUInteger levelW = std::max<NSUInteger>(tex.width >> a.level, 1), levelH = std::max<NSUInteger>(tex.height >> a.level, 1);
+	if (x < 0 || y < 0 || (NSUInteger)(x + width) > levelW || (NSUInteger)(y + height) > levelH || tex.storageMode == MTLStorageModePrivate) {
+		GL4METAL_LOG("glReadPixels: region %d,%d %dx%d is outside the %lux%lu attachment or its storage is private", x, y, width, height, (unsigned long)levelW, (unsigned long)levelH);
+		return;
+	}
+
+	flushCommandBuffer(true); // the rendering has to be finished before the CPU reads it
+	std::vector<uint8_t> raw((size_t)width * height * srcComps);
+	[tex getBytes:raw.data() bytesPerRow:(NSUInteger)width * srcComps fromRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)width, (NSUInteger)height) mipmapLevel:(NSUInteger)a.level];
+
+	// GL_PIXEL_PACK_BUFFER bound: `pixels` is a byte offset into that buffer.
+	uint8_t *dst = (uint8_t *)pixels;
+	GLuint pbo = boundBuffer(GL_PIXEL_PACK_BUFFER);
+	if (pbo != 0) {
+		auto buffer = ctx.buffer_objects.find(pbo);
+		if (buffer == ctx.buffer_objects.end() || !buffer->second) {
+			return;
+		}
+		dst = (uint8_t *)buffer->second.contents + (uintptr_t)pixels;
+	}
+	size_t rowLength = ctx.pack_row_length > 0 ? (size_t)ctx.pack_row_length : (size_t)width;
+	size_t align = ctx.pack_alignment > 0 ? (size_t)ctx.pack_alignment : 1;
+	size_t rowBytes = (rowLength * dstComps + align - 1) / align * align;
+	dst += (size_t)ctx.pack_skip_rows * rowBytes + (size_t)ctx.pack_skip_pixels * dstComps;
+	for (GLsizei row = 0; row < height; row++) { // both start at the bottom row: GL framebuffer textures are bottom-first
+		const uint8_t *s = raw.data() + (size_t)row * width * srcComps;
+		uint8_t *d = dst + (size_t)row * rowBytes;
+		for (GLsizei col = 0; col < width; col++, s += srcComps, d += dstComps) {
+			for (int c = 0; c < dstComps; c++) {
+				int idx = srcIdx[dstChannel[c]];
+				d[c] = idx >= 0 ? s[idx] : (dstChannel[c] == 3 ? 255 : 0); // missing alpha = 1, missing colour = 0
+			}
+		}
+	}
 }

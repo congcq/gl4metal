@@ -37,14 +37,13 @@ GLboolean glIsEnabled(GLenum cap) {
 }
 
 void glEnablei(GLenum target, GLuint index) {
-	GL4METAL_LOG("glEnablei: Unimplemented");
+	glEnable(target); // one state for all draw buffers (per-buffer blending is not supported yet)
 }
 
 void glDisablei(GLenum target, GLuint index) {
-	GL4METAL_LOG("glDisablei: Unimplemented");
+	glDisable(target);
 }
 
 GLboolean glIsEnabledi(GLenum target, GLuint index) {
-	GL4METAL_LOG("glIsEnabledi: Unimplemented, defaulting return GL_TRUE");
-	return GL_TRUE;
+	return glIsEnabled(target);
 }
