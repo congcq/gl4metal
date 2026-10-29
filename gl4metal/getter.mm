@@ -339,6 +339,7 @@ const GLubyte *glGetString(GLenum name) {
 			return (const GLubyte *)s.UTF8String;
 		}
 		case GL_VERSION:
+			return (const GLubyte *)"3.3 Core Profile (Metal backend)";
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:

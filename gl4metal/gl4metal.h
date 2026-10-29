@@ -19,9 +19,16 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
+#include "exports.h"
 #include "shadertranslator.h"
 
+#define DEBUG 1
+
+#if DEBUG
 #define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
+#else
+#define GL4METAL_LOG(...)
+#endif
 
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
@@ -59,10 +66,6 @@ struct FBO {
 	FBOAttachment depth, stencil;
 	GLenum draw_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS] = { GL_COLOR_ATTACHMENT0 };
 	GLenum read_buffer = GL_COLOR_ATTACHMENT0;
-};
-
-struct VAO {
-	
 };
 
 // MARK: - Vertex arrays
@@ -262,15 +265,4 @@ void updateDepthStencilState();
 }
 #endif
 
-// MARK: - Internal helpers (C++ linkage, not part of the GL API)
-
-MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.mm
-MTLPixelFormat metalPixelFormat(GLenum internalformat);             // texture.mm
-id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask);  // framebuffer.mm: ends the open pass, starts one on glBindFramebuffer's target
-void endRenderEncoder(void);                                        // framebuffer.mm
-void applyViewportAndScissor(void);                                 // framebuffer.mm
-void releaseShaderIfUnused(GLuint shader);                          // shaders.mm: erases a deleted shader once no program uses it
-void copyGLString(const std::string &src, GLsizei bufSize, GLsizei *length, GLchar *dst); // shaders.mm
-void flushCommandBuffer(bool waitUntilCompleted);                   // sync.mm: commits the open command buffer
-
-#include "exports.h"
+MTLCompareFunction getMetalCompareFunc(GLenum func);

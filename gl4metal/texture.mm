@@ -87,6 +87,11 @@ static NSUInteger mipLevelCount(const TextureObject &t, GLsizei w, GLsizei h) {
 	return usesMipmaps(t.min_filter) ? full : 1;
 }
 
+// GL_TEXTURE_CUBE_MAP_POSITIVE_X ... NEGATIVE_Z -> slice 0...5 of the cube texture, -1 for any other target.
+static int cubeFace(GLenum target) {
+	return (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) ? (int)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : -1;
+}
+
 static TextureObject *boundTexture(GLenum target) {
 	GLuint id = ctx.bound_textures[ctx.active_texture_unit][target];
 	if (id == 0) {
@@ -139,7 +144,7 @@ static bool destLayout(MTLPixelFormat f, int &comps, int &compSize) {
 }
 
 static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
-						 GLenum format, GLenum type, const void *pixels, const char *caller) {
+						 GLenum format, GLenum type, const void *pixels, const char *caller, NSUInteger slice = 0) {
 	GLsizei lw = std::max(1, t.width >> level), lh = std::max(1, t.height >> level);
 	if (level < 0 || (NSUInteger)level >= t.texture.mipmapLevelCount || x < 0 || y < 0 || w < 0 || h < 0 || x + w > lw || y + h > lh) {
 		GL4METAL_LOG("%s: region %d,%d %dx%d does not fit level %d (%dx%d)", caller, x, y, w, h, level, lw, lh);
@@ -177,7 +182,7 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		identical = (idx[c] == c);
 	}
 	if (identical && srcRowBytes % dstBpp == 0) {
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:srcRowBytes];
+		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
 		return;
 	}
 
@@ -201,7 +206,7 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 			}
 		}
 	}
-	[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:(size_t)w * dstBpp];
+	[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:(size_t)w * dstBpp bytesPerImage:0];
 }
 
 // MARK: - Texture objects
@@ -329,13 +334,18 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		ctx.proxy_texture_2d.internalformat = valid ? (GLenum)internalformat : 0;
 		return;
 	}
-	if (target != GL_TEXTURE_2D) {
+	int face = cubeFace(target); // -1: a plain 2D texture
+	if (target != GL_TEXTURE_2D && face < 0) {
 		GL4METAL_LOG("glTexImage2D: unsupported target 0x%X", target);
 		return;
 	}
-	TextureObject *t = boundTexture(target);
+	TextureObject *t = boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D);
 	if (!t) {
-		GL4METAL_LOG("glTexImage2D: no texture bound to GL_TEXTURE_2D");
+		GL4METAL_LOG("glTexImage2D: no texture bound to target 0x%X", face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D);
+		return;
+	}
+	if (face >= 0 && width != height) {
+		GL4METAL_LOG("glTexImage2D: cube map faces must be square (%dx%d)", width, height);
 		return;
 	}
 	if (!valid) {
@@ -346,10 +356,12 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	if (level == 0) {
 		if (!t->texture || t->width != width || t->height != height || t->texture.pixelFormat != mtlFormat) {
 			NSUInteger levels = mipLevelCount(*t, width, height);
-			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtlFormat
-																						  width:(NSUInteger)width
-																						 height:(NSUInteger)height
-																					  mipmapped:levels > 1];
+			MTLTextureDescriptor *d = face >= 0
+				? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:mtlFormat size:(NSUInteger)width mipmapped:levels > 1]
+				: [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtlFormat
+																	  width:(NSUInteger)width
+																	 height:(NSUInteger)height
+																  mipmapped:levels > 1];
 			d.mipmapLevelCount = levels;
 			d.usage = MTLTextureUsageShaderRead;
 			if (mtlFormat != MTLPixelFormatRGB9E5Float) {
@@ -373,7 +385,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	}
 
 	if (pixels || boundBuffer(GL_PIXEL_UNPACK_BUFFER)) {
-		uploadPixels(*t, level, 0, 0, width, height, format, type, pixels, "glTexImage2D");
+		uploadPixels(*t, level, 0, 0, width, height, format, type, pixels, "glTexImage2D", face >= 0 ? (NSUInteger)face : 0);
 	}
 }
 
@@ -394,12 +406,13 @@ void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, G
 }
 
 void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
-	TextureObject *t = (target == GL_TEXTURE_2D) ? boundTexture(target) : nullptr;
+	int face = cubeFace(target);
+	TextureObject *t = (target == GL_TEXTURE_2D || face >= 0) ? boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D) : nullptr;
 	if (!t || !t->texture) {
-		GL4METAL_LOG("glTexSubImage2D: no allocated GL_TEXTURE_2D bound (target 0x%X)", target);
+		GL4METAL_LOG("glTexSubImage2D: no allocated texture bound (target 0x%X)", target);
 		return;
 	}
-	uploadPixels(*t, level, xoffset, yoffset, width, height, format, type, pixels, "glTexSubImage2D");
+	uploadPixels(*t, level, xoffset, yoffset, width, height, format, type, pixels, "glTexSubImage2D", face >= 0 ? (NSUInteger)face : 0);
 }
 
 void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels) {
@@ -554,7 +567,7 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 		h = ctx.proxy_texture_2d.h;
 		internalformat = ctx.proxy_texture_2d.internalformat;
 	} else {
-		TextureObject *t = boundTexture(target);
+		TextureObject *t = boundTexture(cubeFace(target) >= 0 ? GL_TEXTURE_CUBE_MAP : target);
 		if (t && t->texture && level >= 0 && (NSUInteger)level < t->texture.mipmapLevelCount) {
 			w = std::max(1, t->width >> level);
 			h = std::max(1, t->height >> level);

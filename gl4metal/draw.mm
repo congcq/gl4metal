@@ -172,16 +172,46 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint samplerName
 }
 
 // What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1).
-static id<MTLTexture> fallbackTexture() {
-	if (!ctx.fallback_texture) {
-		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+static GLenum targetForDim(TranslatedUniform::Dim dim) {
+	switch (dim) {
+		case TranslatedUniform::DimCube:    return GL_TEXTURE_CUBE_MAP;
+		case TranslatedUniform::Dim3D:      return GL_TEXTURE_3D;
+		case TranslatedUniform::Dim2DArray: return GL_TEXTURE_2D_ARRAY;
+		default:                            return GL_TEXTURE_2D;
+	}
+}
+
+static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
+	switch (dim) {
+		case TranslatedUniform::DimCube:    return MTLTextureTypeCube;
+		case TranslatedUniform::Dim3D:      return MTLTextureType3D;
+		case TranslatedUniform::Dim2DArray: return MTLTextureType2DArray;
+		default:                            return MTLTextureType2D;
+	}
+}
+
+// What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1). The shader decides the texture type,
+// and Metal wants exactly that type bound, so there is one fallback per sampler dimensionality.
+static id<MTLTexture> fallbackTexture(TranslatedUniform::Dim dim) {
+	static id<MTLTexture> textures[4] = { nil, nil, nil, nil };
+	__strong id<MTLTexture> &slot = textures[(int)dim];
+	if (!slot) {
+		MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
+		d.textureType = typeForDim(dim);
+		d.pixelFormat = MTLPixelFormatRGBA8Unorm;
+		d.width = d.height = 1;
+		d.depth = 1;
+		d.arrayLength = 1;
 		d.usage = MTLTextureUsageShaderRead;
 		d.storageMode = MTLStorageModeShared;
-		ctx.fallback_texture = [ctx.device newTextureWithDescriptor:d];
+		slot = [ctx.device newTextureWithDescriptor:d];
 		const uint8_t black[4] = { 0, 0, 0, 255 };
-		[ctx.fallback_texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:black bytesPerRow:4];
+		NSUInteger slices = dim == TranslatedUniform::DimCube ? 6 : 1;
+		for (NSUInteger s = 0; s < slices; s++) {
+			[slot replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:s withBytes:black bytesPerRow:4 bytesPerImage:4];
+		}
 	}
-	return ctx.fallback_texture;
+	return slot;
 }
 
 static id<MTLSamplerState> fallbackSampler() {
@@ -474,17 +504,17 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			id<MTLTexture> texture = nil;
 			id<MTLSamplerState> sampler = nil;
 			if (unit >= 0 && unit < GL4METAL_MAX_TEXTURE_UNITS) {
-				auto bound = ctx.bound_textures[unit].find(GL_TEXTURE_2D);
+				auto bound = ctx.bound_textures[unit].find(targetForDim(u.info.dim));
 				if (bound != ctx.bound_textures[unit].end() && bound->second != 0) {
 					auto to = ctx.texture_objects.find(bound->second);
-					if (to != ctx.texture_objects.end() && to->second.texture) {
+					if (to != ctx.texture_objects.end() && to->second.texture && to->second.texture.textureType == typeForDim(u.info.dim)) {
 						texture = to->second.texture;
 						sampler = samplerFor(to->second, ctx.bound_samplers[unit]);
 					}
 				}
 			}
 			if (!texture) {
-				texture = fallbackTexture();
+				texture = fallbackTexture(u.info.dim);
 				sampler = fallbackSampler();
 			}
 			if (u.info.stage[0].present) {

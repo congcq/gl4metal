@@ -15,12 +15,14 @@
 
 struct TranslatedUniform {
 	enum Kind { Float, Int, UInt, Bool, Sampler };
+	enum Dim { Dim2D, DimCube, Dim3D, Dim2DArray }; // samplers: what the shader samples
 
 	std::string name;
 	Kind kind = Float;
 	int vecsize = 1;     // components of a vector / rows of a matrix
 	int columns = 1;     // > 1 for matrices
 	int array_size = 1;
+	Dim dim = Dim2D;     // samplers only
 
 	struct Stage {
 		bool present = false;

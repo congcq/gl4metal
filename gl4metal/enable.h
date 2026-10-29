@@ -9,5 +9,6 @@
 #define ENABLE_H
 
 #import "gl4metal.h"
+#import "framebuffer.h"
 
 #endif /* ENABLE_H */

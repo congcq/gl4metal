@@ -9,6 +9,8 @@
 #define CONTEXT_H
 
 #import "gl4metal.h"
+#import "framebuffer.h"
+#import "sync.h"
 
 #ifdef __cplusplus
 extern "C" {

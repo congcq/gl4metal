@@ -361,16 +361,33 @@ void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLe
 
 // MARK: - Draw / read buffers
 
-void glDrawBuffer(GLenum buf) {
-	GL4METAL_LOG("glDrawBuffer: Unimplemented");
+void glDrawBuffers(GLsizei n, const GLenum *bufs) {
+	if (ctx.draw_fbo == 0) {
+		return; // the default framebuffer has one colour buffer
+	}
+	auto it = ctx.fbo_objects.find(ctx.draw_fbo);
+	if (it == ctx.fbo_objects.end()) {
+		return;
+	}
+	// Draw buffer i writes to the colour attachment named by bufs[i] (GL_NONE: not written).
+	for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
+		it->second.draw_buffers[i] = (i < n) ? bufs[i] : GL_NONE;
+	}
+	endRenderEncoder(); // the open pass was built from the old draw buffers
 }
 
-void glDrawBuffers(GLsizei n, const GLenum *bufs) {
-	GL4METAL_LOG("glDrawBuffers: Unimplemented");
+void glDrawBuffer(GLenum buf) {
+	glDrawBuffers(1, &buf);
 }
 
 void glReadBuffer(GLenum src) {
-	GL4METAL_LOG("glReadBuffer: Unimplemented");
+	if (ctx.read_fbo == 0) {
+		return;
+	}
+	auto it = ctx.fbo_objects.find(ctx.read_fbo);
+	if (it != ctx.fbo_objects.end()) {
+		it->second.read_buffer = src;
+	}
 }
 
 // MARK: - Clear
@@ -500,7 +517,7 @@ static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
 
 static id<MTLSamplerState> blitSampler(bool linear) {
 	static id<MTLSamplerState> samplers[2] = { nil, nil };
-	id<MTLSamplerState> s = samplers[linear ? 1 : 0];
+	__strong id<MTLSamplerState> &s = samplers[linear ? 1 : 0];
 	if (!s) {
 		MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
 		d.minFilter = d.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;

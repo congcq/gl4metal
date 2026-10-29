@@ -1,6 +1,6 @@
 #import "gl4metal.h"
 
-MTLContext ctx; // Context for Metal device
+MTLContext ctx; // context for Metal device
 
 void initDevice() {
 	id<MTLDevice> device = MTLCreateSystemDefaultDevice();

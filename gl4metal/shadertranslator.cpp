@@ -20,7 +20,29 @@ void initGlslang() {
 	}
 }
 
-// The only rewrite done on the GLSL: Minecraft ships #version 150, glslang's SPIR-V rules want 330.
+// glslang's Vulkan dialect reserves `sampler` (separate samplers), GLSL 330 doesn't: Minecraft's shaders use it as the
+// name of a parameter (sampleNearest(sampler2D sampler, ...)). Whole-word occurrences only, sampler2D & co. stay.
+std::string renameSamplerIdentifier(const std::string &source) {
+	auto isIdentifier = [](char ch) { return ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); };
+	const std::string word = "sampler";
+	std::string out;
+	out.reserve(source.size() + 16);
+	size_t i = 0;
+	while (i < source.size()) {
+		bool match = source.compare(i, word.size(), word) == 0 &&
+					 (i == 0 || !isIdentifier(source[i - 1])) &&
+					 (i + word.size() >= source.size() || !isIdentifier(source[i + word.size()]));
+		if (match) {
+			out += "sampler_";
+			i += word.size();
+		} else {
+			out += source[i++];
+		}
+	}
+	return out;
+}
+
+// Rewrites done on the GLSL: Minecraft ships #version 150, glslang's SPIR-V rules want 330, plus the identifier above.
 std::string patchVersion(const std::string &source) {
 	std::string out = source;
 	const std::string from = "#version 150";
@@ -28,7 +50,7 @@ std::string patchVersion(const std::string &source) {
 	if (pos != std::string::npos) {
 		out.replace(pos, from.size(), "#version 330");
 	}
-	return out;
+	return renameSamplerIdentifier(out);
 }
 
 void setupShader(glslang::TShader &shader, EShLanguage stage, const char *const *source) {
@@ -180,6 +202,16 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 			TranslatedUniform &u = findOrAdd(out, r.name);
 			u.kind = TranslatedUniform::Sampler;
+			const spirv_cross::SPIRType &samplerType = msl.get_type(r.type_id);
+			if (samplerType.image.dim == spv::DimCube) {
+				u.dim = TranslatedUniform::DimCube;
+			} else if (samplerType.image.dim == spv::Dim3D) {
+				u.dim = TranslatedUniform::Dim3D;
+			} else if (samplerType.image.arrayed) {
+				u.dim = TranslatedUniform::Dim2DArray;
+			} else {
+				u.dim = TranslatedUniform::Dim2D;
+			}
 			u.vecsize = 1;
 			u.columns = 1;
 			u.array_size = count;

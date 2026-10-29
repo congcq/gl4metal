@@ -10,8 +10,8 @@
 extern "C" void *objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void *pool);
 
-// The render thread is a plain JVM thread: nothing drains an autorelease pool on it, so every autoreleased Metal object
-// (command buffers, encoders, descriptors, drawables) would live forever together with the buffers and textures those
+// the render thread is a plain JVM thread: nothing drains an autorelease pool on it, so every autoreleased Metal object
+// command buffers, encoders, descriptors, drawables would live forever together with the buffers and textures those
 // command buffers retain. One pool per frame, drained when glSwapBuffers returns, fixes that.
 static void cycleFramePool() {
 	static void *pool = nullptr;
@@ -59,8 +59,8 @@ void glSwapBuffers(void) {
 }
 
 void glSwapInterval(GLint interval) {
-    if (!ctx.metalLayer) return;
-    ctx.metalLayer.maximumDrawableCount = interval == 0 ? 2 : 3;
+	if (!ctx.metalLayer) return;
+	// nothing to be implement
 }
 
 void glFlush(void) {
