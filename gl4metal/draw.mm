@@ -495,13 +495,15 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	put(capOn(GL_SAMPLE_ALPHA_TO_COVERAGE) ? 1 : 0);
 	put(capOn(GL_SAMPLE_ALPHA_TO_ONE) ? 1 : 0);
 	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		const BlendBufferState &blendState = ctx.blend_buffers[attachment];
 		put(ctx.blend_enabled[attachment] ? 1 : 0);
 		put((uint64_t)ctx.color_masks[attachment][0] | ((uint64_t)ctx.color_masks[attachment][1] << 1) |
 			((uint64_t)ctx.color_masks[attachment][2] << 2) | ((uint64_t)ctx.color_masks[attachment][3] << 3));
-	}
-	if (blend) {
-		put(ctx.blend_src_rgb); put(ctx.blend_dst_rgb); put(ctx.blend_src_alpha); put(ctx.blend_dst_alpha);
-		put(ctx.blend_eq_rgb); put(ctx.blend_eq_alpha);
+		if (ctx.blend_enabled[attachment]) {
+			put(blendState.src_rgb); put(blendState.dst_rgb);
+			put(blendState.src_alpha); put(blendState.dst_alpha);
+			put(blendState.equation_rgb); put(blendState.equation_alpha);
+		}
 	}
 	for (const ActiveAttrib &aa : attribs) {
 		put(aa.pa->msl_location);
@@ -561,13 +563,14 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		ca.pixelFormat = ctx.pass_color_format[i];
 		ca.writeMask = mask;
 		if (ctx.blend_enabled[i]) {
+			const BlendBufferState &blendState = ctx.blend_buffers[i];
 			ca.blendingEnabled = YES;
-			ca.sourceRGBBlendFactor = blendFactor(ctx.blend_src_rgb);
-			ca.destinationRGBBlendFactor = blendFactor(ctx.blend_dst_rgb);
-			ca.sourceAlphaBlendFactor = blendFactor(ctx.blend_src_alpha);
-			ca.destinationAlphaBlendFactor = blendFactor(ctx.blend_dst_alpha);
-			ca.rgbBlendOperation = blendOperation(ctx.blend_eq_rgb);
-			ca.alphaBlendOperation = blendOperation(ctx.blend_eq_alpha);
+			ca.sourceRGBBlendFactor = blendFactor(blendState.src_rgb);
+			ca.destinationRGBBlendFactor = blendFactor(blendState.dst_rgb);
+			ca.sourceAlphaBlendFactor = blendFactor(blendState.src_alpha);
+			ca.destinationAlphaBlendFactor = blendFactor(blendState.dst_alpha);
+			ca.rgbBlendOperation = blendOperation(blendState.equation_rgb);
+			ca.alphaBlendOperation = blendOperation(blendState.equation_alpha);
 		}
 	}
 	d.depthAttachmentPixelFormat = ctx.pass_depth_format;
@@ -906,12 +909,12 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	auto markActiveDrawBuffers = [&](GLuint elementBuffer) {
 		std::array<GLuint, 48> names{}; // 16 vertex streams + 28 combined-stage UBOs + one EBO
 		size_t count = 0;
-		auto appendUnique = [&](GLuint objectName) {
-			if (objectName == 0) return;
+		auto appendUnique = [&](GLuint draw_id) {
+			if (draw_id == 0) return;
 			for (size_t index = 0; index < count; ++index) {
-				if (names[index] == objectName) return;
+				if (names[index] == draw_id) return;
 			}
-			if (count < names.size()) names[count++] = objectName;
+			if (count < names.size()) names[count++] = draw_id;
 		};
 		for (const ActiveAttrib &aa : attribs) {
 			if (aa.constant || !aa.pa || aa.pa->gl_index < 0 || aa.pa->gl_index >= 16) continue;
@@ -1012,10 +1015,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 		const NSUInteger available = length - offset;
 		const NSUInteger boundSize = binding.size == 0 ? available : (binding.size < 0 ? 0 : (NSUInteger)binding.size);
-		if (binding.size < 0 || boundSize > available || boundSize < block.info.size) {
+		if (binding.size < 0 || boundSize > available || boundSize < block.info.required_size) {
 			gl4metalSetError(GL_INVALID_OPERATION);
-			GL4METAL_LOG("%s: uniform block '%s' needs %u bytes but binding %u provides %llu bytes (buffer=%u offset=%llu length=%llu); draw skipped",
-				caller, block.info.name.c_str(), block.info.size, block.binding_point,
+			GL4METAL_LOG("%s: uniform block '%s' needs %u bytes of member data (std140 block size %u) but binding %u provides %llu bytes (buffer=%u offset=%llu length=%llu); draw skipped",
+				caller, block.info.name.c_str(), block.info.required_size, block.info.size, block.binding_point,
 				(unsigned long long)boundSize, binding.buffer, (unsigned long long)offset, (unsigned long long)length);
 			return;
 		}

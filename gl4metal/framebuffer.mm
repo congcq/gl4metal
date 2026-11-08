@@ -307,26 +307,26 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 
 void glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = ++ctx.next_fbo_id;
-		ctx.fbo_objects[objectName] = FBO();
-		framebuffers[i] = objectName;
+		GLuint buf_id = ++ctx.next_fbo_id;
+		ctx.fbo_objects[buf_id] = FBO();
+		framebuffers[i] = buf_id;
 	}
 }
 
 void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = framebuffers[i];
-		if (objectName == 0) {
+		GLuint buf_id = framebuffers[i];
+		if (buf_id == 0) {
 			continue;
 		}
-		if (ctx.draw_fbo == objectName) {
+		if (ctx.draw_fbo == buf_id) {
 			endRenderEncoder();
 			ctx.draw_fbo = 0; // GL falls back to the default framebuffer
 		}
-		if (ctx.read_fbo == objectName) {
+		if (ctx.read_fbo == buf_id) {
 			ctx.read_fbo = 0;
 		}
-		ctx.fbo_objects.erase(objectName);
+		ctx.fbo_objects.erase(buf_id);
 	}
 }
 
@@ -368,11 +368,11 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 		GL4METAL_LOG("glCheckFramebufferStatus: invalid target 0x%X", target);
 		return 0;
 	}
-	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (objectName == 0) {
+	GLuint buf_id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (buf_id == 0) {
 		return GL_FRAMEBUFFER_COMPLETE; // the layer drawable is always complete
 	}
-	auto it = ctx.fbo_objects.find(objectName);
+	auto it = ctx.fbo_objects.find(buf_id);
 	if (it == ctx.fbo_objects.end()) return GL_FRAMEBUFFER_UNDEFINED;
 	const FBO &fbo = it->second;
 	bool any = false;
@@ -436,8 +436,8 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		GL4METAL_LOG("glFramebufferTexture2D: negative mip level %d", level);
 		return;
 	}
-	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (objectName == 0) {
+	GLuint buf_id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (buf_id == 0) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glFramebufferTexture2D: the default framebuffer is bound (GL_INVALID_OPERATION)");
 		return;
@@ -455,7 +455,7 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 			return;
 		}
 	}
-	FBO &fbo = ctx.fbo_objects[objectName];
+	FBO &fbo = ctx.fbo_objects[buf_id];
 	FBOAttachment a;
 	a.texture = texture;
 	a.renderbuffer = 0;
@@ -475,7 +475,7 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		GL4METAL_LOG("glFramebufferTexture2D: invalid attachment 0x%X", attachment);
 		return;
 	}
-	if (objectName == ctx.draw_fbo) {
+	if (buf_id == ctx.draw_fbo) {
 		endRenderEncoder(); // the open render pass was built from the old attachments
 	}
 }
@@ -535,12 +535,12 @@ void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLe
 		gl4metalSetError(!params ? GL_INVALID_VALUE : GL_INVALID_ENUM);
 		return;
 	}
-	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (objectName == 0) { // default framebuffer
+	GLuint buf_id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (buf_id == 0) { // default framebuffer
 		*params = (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) ? GL_FRAMEBUFFER_DEFAULT : 0;
 		return;
 	}
-	auto it = ctx.fbo_objects.find(objectName);
+	auto it = ctx.fbo_objects.find(buf_id);
 	if (it == ctx.fbo_objects.end()) {
 		*params = 0;
 		return;

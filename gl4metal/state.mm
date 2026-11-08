@@ -13,25 +13,122 @@ static void notSupported(const char *name) {
 
 // MARK: - Blending
 
+static bool validBlendFactor(GLenum factor) {
+	switch (factor) {
+		case GL_ZERO: case GL_ONE:
+		case GL_SRC_COLOR: case GL_ONE_MINUS_SRC_COLOR:
+		case GL_DST_COLOR: case GL_ONE_MINUS_DST_COLOR:
+		case GL_SRC_ALPHA: case GL_ONE_MINUS_SRC_ALPHA:
+		case GL_DST_ALPHA: case GL_ONE_MINUS_DST_ALPHA:
+		case GL_CONSTANT_COLOR: case GL_ONE_MINUS_CONSTANT_COLOR:
+		case GL_CONSTANT_ALPHA: case GL_ONE_MINUS_CONSTANT_ALPHA:
+		case GL_SRC_ALPHA_SATURATE:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool validBlendEquation(GLenum equation) {
+	switch (equation) {
+		case GL_FUNC_ADD: case GL_FUNC_SUBTRACT: case GL_FUNC_REVERSE_SUBTRACT:
+		case GL_MIN: case GL_MAX:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool validBlendBufferIndex(GLuint bufferIndex) {
+	if (bufferIndex >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return false;
+	}
+	return true;
+}
+
+static void mirrorBlendBufferZero() {
+	const BlendBufferState &state = ctx.blend_buffers[0];
+	ctx.blend_src_rgb = state.src_rgb;
+	ctx.blend_dst_rgb = state.dst_rgb;
+	ctx.blend_src_alpha = state.src_alpha;
+	ctx.blend_dst_alpha = state.dst_alpha;
+	ctx.blend_eq_rgb = state.equation_rgb;
+	ctx.blend_eq_alpha = state.equation_alpha;
+}
+
+static bool validBlendFunction(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
+	// GL_SRC_ALPHA_SATURATE is legal for source RGB and source alpha (where its
+	// alpha component is defined as one), but never as a destination factor.
+	if (validBlendFactor(srcRGB) && validBlendFactor(dstRGB) &&
+		validBlendFactor(srcAlpha) && validBlendFactor(dstAlpha) &&
+		dstRGB != GL_SRC_ALPHA_SATURATE && dstAlpha != GL_SRC_ALPHA_SATURATE) {
+		return true;
+	}
+	gl4metalSetError(GL_INVALID_ENUM);
+	return false;
+}
+
 void glBlendFunc(GLenum sfactor, GLenum dfactor) {
-	ctx.blend_src_rgb = ctx.blend_src_alpha = sfactor;
-	ctx.blend_dst_rgb = ctx.blend_dst_alpha = dfactor;
+	glBlendFuncSeparate(sfactor, dfactor, sfactor, dfactor);
 }
 
 void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
-	ctx.blend_src_rgb = srcRGB;
-	ctx.blend_dst_rgb = dstRGB;
-	ctx.blend_src_alpha = srcAlpha;
-	ctx.blend_dst_alpha = dstAlpha;
+	if (!validBlendFunction(srcRGB, dstRGB, srcAlpha, dstAlpha)) return;
+	for (int bufferIndex = 0; bufferIndex < GL4METAL_MAX_COLOR_ATTACHMENTS; ++bufferIndex) {
+		BlendBufferState &state = ctx.blend_buffers[bufferIndex];
+		state.src_rgb = srcRGB;
+		state.dst_rgb = dstRGB;
+		state.src_alpha = srcAlpha;
+		state.dst_alpha = dstAlpha;
+	}
+	mirrorBlendBufferZero();
+}
+
+void glBlendFunci(GLuint bufferIndex, GLenum src, GLenum dst) {
+	glBlendFuncSeparatei(bufferIndex, src, dst, src, dst);
+}
+
+void glBlendFuncSeparatei(GLuint bufferIndex, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
+	if (!validBlendBufferIndex(bufferIndex) || !validBlendFunction(srcRGB, dstRGB, srcAlpha, dstAlpha)) return;
+	BlendBufferState &state = ctx.blend_buffers[bufferIndex];
+	state.src_rgb = srcRGB;
+	state.dst_rgb = dstRGB;
+	state.src_alpha = srcAlpha;
+	state.dst_alpha = dstAlpha;
+	if (bufferIndex == 0) mirrorBlendBufferZero();
 }
 
 void glBlendEquation(GLenum mode) {
-	ctx.blend_eq_rgb = ctx.blend_eq_alpha = mode;
+	glBlendEquationSeparate(mode, mode);
 }
 
 void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {
-	ctx.blend_eq_rgb = modeRGB;
-	ctx.blend_eq_alpha = modeAlpha;
+	if (!validBlendEquation(modeRGB) || !validBlendEquation(modeAlpha)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	for (int bufferIndex = 0; bufferIndex < GL4METAL_MAX_COLOR_ATTACHMENTS; ++bufferIndex) {
+		ctx.blend_buffers[bufferIndex].equation_rgb = modeRGB;
+		ctx.blend_buffers[bufferIndex].equation_alpha = modeAlpha;
+	}
+	mirrorBlendBufferZero();
+}
+
+void glBlendEquationi(GLuint bufferIndex, GLenum mode) {
+	glBlendEquationSeparatei(bufferIndex, mode, mode);
+}
+
+void glBlendEquationSeparatei(GLuint bufferIndex, GLenum modeRGB, GLenum modeAlpha) {
+	if (!validBlendBufferIndex(bufferIndex)) return;
+	if (!validBlendEquation(modeRGB) || !validBlendEquation(modeAlpha)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	BlendBufferState &state = ctx.blend_buffers[bufferIndex];
+	state.equation_rgb = modeRGB;
+	state.equation_alpha = modeAlpha;
+	if (bufferIndex == 0) mirrorBlendBufferZero();
 }
 
 void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {

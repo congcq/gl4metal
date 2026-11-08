@@ -6,6 +6,10 @@
 // that dlsym()/glfwGetProcAddress can't find; LWJGL then calls a NULL pointer. With this header such a mismatch is a
 // compile error instead.
 
+#include <GL/gl.h>
+#include <GL/glcorearb.h>
+#include <GL/glext.h>
+
 #define GL4METAL_EXPORT extern "C" __attribute__((visibility("default")))
 
 GL4METAL_EXPORT void gl4metalCheckExports(void); // exports.mm, runs with GL4METAL_CHECK_EXPORTS=1
@@ -107,16 +111,16 @@ GL4METAL_EXPORT GLint glGetFragDataLocation(GLuint program, const GLchar *name);
 GL4METAL_EXPORT GLint glGetFragDataIndex(GLuint program, const GLchar *name);
 GL4METAL_EXPORT void glGenQueries(GLsizei n, GLuint *ids);
 GL4METAL_EXPORT void glDeleteQueries(GLsizei n, const GLuint *ids);
-GL4METAL_EXPORT GLboolean glIsQuery(GLuint objectName);
-GL4METAL_EXPORT void glBeginQuery(GLenum target, GLuint objectName);
+GL4METAL_EXPORT GLboolean glIsQuery(GLuint id);
+GL4METAL_EXPORT void glBeginQuery(GLenum target, GLuint id);
 GL4METAL_EXPORT void glEndQuery(GLenum target);
-GL4METAL_EXPORT void glQueryCounter(GLuint objectName, GLenum target);
+GL4METAL_EXPORT void glQueryCounter(GLuint id, GLenum target);
 GL4METAL_EXPORT void glGetQueryiv(GLenum target, GLenum pname, GLint *params);
-GL4METAL_EXPORT void glGetQueryObjectiv(GLuint objectName, GLenum pname, GLint *params);
-GL4METAL_EXPORT void glGetQueryObjectuiv(GLuint objectName, GLenum pname, GLuint *params);
-GL4METAL_EXPORT void glGetQueryObjecti64v(GLuint objectName, GLenum pname, GLint64 *params);
-GL4METAL_EXPORT void glGetQueryObjectui64v(GLuint objectName, GLenum pname, GLuint64 *params);
-GL4METAL_EXPORT void glBeginConditionalRender(GLuint objectName, GLenum mode);
+GL4METAL_EXPORT void glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params);
+GL4METAL_EXPORT void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params);
+GL4METAL_EXPORT void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params);
+GL4METAL_EXPORT void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params);
+GL4METAL_EXPORT void glBeginConditionalRender(GLuint id, GLenum mode);
 GL4METAL_EXPORT void glEndConditionalRender(void);
 GL4METAL_EXPORT void glGenRenderbuffers(GLsizei n, GLuint *renderbuffers);
 GL4METAL_EXPORT void glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers);
@@ -149,8 +153,16 @@ GL4METAL_EXPORT void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei 
 GL4METAL_EXPORT void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *source);
 GL4METAL_EXPORT void glBlendFunc(GLenum sfactor, GLenum dfactor);
 GL4METAL_EXPORT void glBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+GL4METAL_EXPORT void glBlendFunci(GLuint bufferIndex, GLenum src, GLenum dst);
+GL4METAL_EXPORT void glBlendFuncSeparatei(GLuint bufferIndex, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
 GL4METAL_EXPORT void glBlendEquation(GLenum mode);
 GL4METAL_EXPORT void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
+GL4METAL_EXPORT void glBlendEquationi(GLuint bufferIndex, GLenum mode);
+GL4METAL_EXPORT void glBlendEquationSeparatei(GLuint bufferIndex, GLenum modeRGB, GLenum modeAlpha);
+GL4METAL_EXPORT void glBlendFunciARB(GLuint bufferIndex, GLenum src, GLenum dst);
+GL4METAL_EXPORT void glBlendFuncSeparateiARB(GLuint bufferIndex, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+GL4METAL_EXPORT void glBlendEquationiARB(GLuint bufferIndex, GLenum mode);
+GL4METAL_EXPORT void glBlendEquationSeparateiARB(GLuint bufferIndex, GLenum modeRGB, GLenum modeAlpha);
 GL4METAL_EXPORT void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
 GL4METAL_EXPORT void glLogicOp(GLenum opcode);
 GL4METAL_EXPORT void glDepthFunc(GLenum func);

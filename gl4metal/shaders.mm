@@ -7,7 +7,7 @@ GLuint glCreateShader(GLenum type) {
 		GL4METAL_LOG("glCreateShader: unsupported shader type 0x%X (Metal has no geometry/tessellation stage in this layer)", type);
 		return 0;
 	}
-	GLuint shader = ++ctx.next_shader_id; // not named `objectName`: that shadows the Objective-C type
+	GLuint shader = ++ctx.next_shader_id;
 	ctx.shader_objects[shader].type = type;
 	return shader;
 }

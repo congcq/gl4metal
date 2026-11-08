@@ -36,12 +36,13 @@ struct TranslatedUniform {
 
 struct TranslatedBlock { // a real (named) uniform block, e.g. Sodium's ubo_CameraMatrices
 	std::string name;
-	uint32_t size = 0;      // bytes, 16 byte aligned
+	uint32_t size = 0;      // GL_UNIFORM_BLOCK_DATA_SIZE, including std140 tail padding
 	struct Stage {
 		bool present = false;
 		uint32_t slot = 0;  // Metal buffer index in that stage
 	} stage[2];             // 0 = vertex, 1 = fragment
 	std::vector<TranslatedUniform> members; // active members of this named uniform block
+	uint32_t required_size = 0; // end of the last declared member; Metal reads no std140 tail padding
 };
 
 struct TranslatedAttrib {

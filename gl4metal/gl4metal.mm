@@ -54,6 +54,7 @@ GLboolean gl4metalInit() {
 	}
 	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
 		ctx.blend_enabled[attachment] = GL_FALSE;
+		ctx.blend_buffers[attachment] = BlendBufferState();
 		for (int component = 0; component < 4; ++component)
 			ctx.color_masks[attachment][component] = GL_TRUE;
 	}

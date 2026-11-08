@@ -57,9 +57,9 @@ static float normalizeSigned(double v, double max) { return (float)std::max(v / 
 
 void glGenVertexArrays(GLsizei n, GLuint *arrays) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = ++ctx.next_vao_id;
-		ctx.vao_objects[objectName] = VertexArray(); // zero initialized: all attributes disabled
-		arrays[i] = objectName;
+		GLuint va_id = ++ctx.next_vao_id;
+		ctx.vao_objects[va_id] = VertexArray(); // zero initialized: all attributes disabled
+		arrays[i] = va_id;
 	}
 }
 

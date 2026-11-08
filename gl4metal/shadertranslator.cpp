@@ -406,7 +406,17 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 					block->name = blockName;
 				}
 				size_t blockSize = msl.get_declared_struct_size(type);
-				block->size = std::max(block->size, (uint32_t)((blockSize + 15) & ~(size_t)15));
+				// GL_UNIFORM_BLOCK_DATA_SIZE includes the std140 structure's tail padding.
+				// Keep that spec-visible size for glGetActiveUniformBlockiv, but also
+				// retain the last-member extent. Some Minecraft 1.21.11 UBO writers bind
+				// ranges ending exactly at the final field (140/40/12 bytes) rather than
+				// including the trailing std140 padding (144/48/16). Metal binds the
+				// backing MTLBuffer at an offset, so allowing that padding-only shortfall
+				// is safe as long as the complete member extent remains in the allocation.
+				const uint32_t memberExtent = (uint32_t)blockSize;
+				const uint32_t std140Size = (uint32_t)((blockSize + 15) & ~(size_t)15);
+				block->size = std::max(block->size, std140Size);
+				block->required_size = std::max(block->required_size, memberExtent);
 				block->stage[stage].present = true;
 				block->stage[stage].slot = b.msl_buffer;
 

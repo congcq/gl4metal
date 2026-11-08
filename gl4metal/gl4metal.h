@@ -127,6 +127,16 @@ struct UniformBufferBinding {
 	GLsizeiptr size = 0; // 0 = the whole buffer
 };
 
+// GL_ARB_draw_buffers_blend / GL 4.0: parameters are independent per draw buffer.
+struct BlendBufferState {
+	GLenum src_rgb = GL_ONE;
+	GLenum dst_rgb = GL_ZERO;
+	GLenum src_alpha = GL_ONE;
+	GLenum dst_alpha = GL_ZERO;
+	GLenum equation_rgb = GL_FUNC_ADD;
+	GLenum equation_alpha = GL_FUNC_ADD;
+};
+
 // MARK: - Programs
 
 struct ProgramAttrib {
@@ -302,6 +312,10 @@ struct MTLContext {
 	// Last command buffer that encoded a draw using each GL buffer object. This lets
 	// CPU updates rename storage instead of stalling the entire render thread.
 	std::unordered_map<GLuint, id<MTLCommandBuffer>> buffer_last_use;
+
+	// Independent blend factors/equations for GL draw-buffer indices 0...7.
+	// Appended to keep the offsets of older MTLContext members stable.
+	BlendBufferState blend_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS];
 };
 
 extern MTLContext ctx;

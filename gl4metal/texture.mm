@@ -106,11 +106,11 @@ static int cubeFace(GLenum target) {
 }
 
 static TextureObject *boundTexture(GLenum target) {
-	GLuint objectName = ctx.bound_textures[ctx.active_texture_unit][target];
-	if (objectName == 0) {
+	GLuint tex_id = ctx.bound_textures[ctx.active_texture_unit][target];
+	if (tex_id == 0) {
 		return nullptr;
 	}
-	auto it = ctx.texture_objects.find(objectName);
+	auto it = ctx.texture_objects.find(tex_id);
 	return it == ctx.texture_objects.end() ? nullptr : &it->second;
 }
 
@@ -475,21 +475,21 @@ static id<MTLTexture> readAttachment(GLint &level, bool depth) {
 
 void glGenTextures(GLsizei n, GLuint *textures) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = ++ctx.next_texture_id;
-		ctx.texture_objects[objectName] = TextureObject();
-		textures[i] = objectName;
+		GLuint tex_id = ++ctx.next_texture_id;
+		ctx.texture_objects[tex_id] = TextureObject();
+		textures[i] = tex_id;
 	}
 }
 
 void glDeleteTextures(GLsizei n, const GLuint *textures) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = textures[i];
-		if (objectName == 0) {
+		GLuint tex_id = textures[i];
+		if (tex_id == 0) {
 			continue;
 		}
 		for (auto &unit : ctx.bound_textures) {
 			for (auto &binding : unit) {
-				if (binding.second == objectName) {
+				if (binding.second == tex_id) {
 					binding.second = 0;
 				}
 			}
@@ -497,7 +497,7 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		// GL detaches a deleted texture from the framebuffers it is attached to.
 		bool detached = false;
 		auto detach = [&](FBOAttachment &a) {
-			if (a.texture == objectName) {
+			if (a.texture == tex_id) {
 				a.texture = 0;
 				detached = true;
 			}
@@ -512,7 +512,7 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		if (detached) {
 			endRenderEncoder();
 		}
-		ctx.texture_objects.erase(objectName);
+		ctx.texture_objects.erase(tex_id);
 	}
 }
 

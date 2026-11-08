@@ -22,10 +22,11 @@ set(CMAKE_C_FLAGS_DEBUG "-funwind-tables -g")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fobjc-arc -fPIC -stdlib=libc++")
 
 include_directories(
-    "."
     "include"
     "external"
     "external/SPIRV-Cross"
+    "gl4metal"
+    "gl4metal/extensions"
 )
 
 add_compile_options(-flto=thin)
@@ -56,6 +57,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl4metal/vertexarray.mm
 
     gl4metal/shadertranslator.cpp
+
+    gl4metal/extensions/ARB/GL_ARB_draw_buffers_blend.mm
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE

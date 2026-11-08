@@ -33,16 +33,16 @@ static bool commandBufferPending(id<MTLCommandBuffer> commandBuffer) {
 	return status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError;
 }
 
-void markBuffersUsed(const GLuint *objectNames, size_t objectCount) {
+void markBuffersUsed(const GLuint *buf_ids, size_t objectCount) {
 	id<MTLCommandBuffer> activeBuffer = ctx.currentCommandBuffer;
-	if (!activeBuffer || !objectNames || objectCount == 0) return;
+	if (!activeBuffer || !buf_ids || objectCount == 0) return;
 	const void *bufferToken = (__bridge const void *)activeBuffer;
 	bool installCleanup = false;
 	{
 		std::lock_guard<std::mutex> lock(bufferUseMutex);
 		for (size_t index = 0; index < objectCount; ++index) {
-			const GLuint objectName = objectNames[index];
-			if (objectName != 0) ctx.buffer_last_use[objectName] = activeBuffer;
+			const GLuint buf_id = buf_ids[index];
+			if (buf_id != 0) ctx.buffer_last_use[buf_id] = activeBuffer;
 		}
 		installCleanup = bufferCleanupRegistered.insert(bufferToken).second;
 	}
@@ -59,21 +59,21 @@ void markBuffersUsed(const GLuint *objectNames, size_t objectCount) {
 	}
 }
 
-void markBufferUsed(GLuint objectName) {
-	markBuffersUsed(&objectName, 1);
+void markBufferUsed(GLuint buf_id) {
+	markBuffersUsed(&buf_id, 1);
 }
 
-static bool bufferHasPendingGPUUse(GLuint objectName) {
+static bool bufferHasPendingGPUUse(GLuint buf_id) {
 	std::lock_guard<std::mutex> lock(bufferUseMutex);
-	auto it = ctx.buffer_last_use.find(objectName);
+	auto it = ctx.buffer_last_use.find(buf_id);
 	if (it == ctx.buffer_last_use.end()) return false;
 	if (commandBufferPending(it->second)) return true;
 	ctx.buffer_last_use.erase(it);
 	return false;
 }
 
-static bool makeBufferWritableWithoutStall(GLuint objectName, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
-	if (!bufferHasPendingGPUUse(objectName)) return true;
+static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
+	if (!bufferHasPendingGPUUse(buf_id)) return true;
 	if (!ctx.device || !buffer || buffer.length > ctx.device.maxBufferLength) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		return false;
@@ -83,26 +83,26 @@ static bool makeBufferWritableWithoutStall(GLuint objectName, __strong id<MTLBuf
 	if (!replacement) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("buffer update: failed to rename in-flight buffer %u (%llu bytes)",
-			objectName, (unsigned long long)buffer.length);
+			buf_id, (unsigned long long)buffer.length);
 		return false;
 	}
 	if (preserveContents && buffer.length != 0) {
 		memcpy(replacement.contents, buffer.contents, (size_t)buffer.length);
 	}
-	ctx.buffer_objects[objectName] = replacement;
+	ctx.buffer_objects[buf_id] = replacement;
 	{
 		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		ctx.buffer_last_use.erase(objectName);
+		ctx.buffer_last_use.erase(buf_id);
 	}
 	buffer = replacement;
 	return true;
 }
 
-static void waitForBufferGPUUse(GLuint objectName) {
+static void waitForBufferGPUUse(GLuint buf_id) {
 	id<MTLCommandBuffer> lastUse = nil;
 	{
 		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		auto it = ctx.buffer_last_use.find(objectName);
+		auto it = ctx.buffer_last_use.find(buf_id);
 		if (it == ctx.buffer_last_use.end()) return;
 		lastUse = it->second;
 		if (!commandBufferPending(lastUse)) {
@@ -118,36 +118,36 @@ static void waitForBufferGPUUse(GLuint objectName) {
 	[lastUse waitUntilCompleted];
 	{
 		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		auto it = ctx.buffer_last_use.find(objectName);
+		auto it = ctx.buffer_last_use.find(buf_id);
 		if (it != ctx.buffer_last_use.end() && it->second == lastUse) ctx.buffer_last_use.erase(it);
 	}
 }
 
 void glGenBuffers(GLsizei n, GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
-		ctx.buffer_objects[objectName] = nil;     // name exists, storage comes with glBufferData
-		buffers[i] = objectName;
+		GLuint buf_id = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
+		ctx.buffer_objects[buf_id] = nil;     // name exists, storage comes with glBufferData
+		buffers[i] = buf_id;
 	}
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint objectName = buffers[i];
-		if (objectName == 0) {
+		GLuint buf_id = buffers[i];
+		if (buf_id == 0) {
 			continue;
 		}
 		for (auto &binding : ctx.bound_buffers) {
-			if (binding.second == objectName) {
+			if (binding.second == buf_id) {
 				binding.second = 0;
 			}
 		}
 		for (auto &vao : ctx.vao_objects) {
-			if (vao.second.element_array_buffer_id == objectName) {
+			if (vao.second.element_array_buffer_id == buf_id) {
 				vao.second.element_array_buffer_id = 0;
 			}
 			for (VertexAttrib &attrib : vao.second.attribs) {
-				if (attrib.bound_vbo == objectName) {
+				if (attrib.bound_vbo == buf_id) {
 					attrib.bound_vbo = 0;
 					attrib.pointer = nullptr;
 					attrib.enabled = false;
@@ -155,16 +155,16 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 			}
 		}
 		for (UniformBufferBinding &binding : ctx.uniform_buffer_bindings) {
-			if (binding.buffer == objectName) {
+			if (binding.buffer == buf_id) {
 				binding = UniformBufferBinding();
 			}
 		}
-		invalidateConvertedVertexBuffers(objectName);
+		invalidateConvertedVertexBuffers(buf_id);
 		{
 			std::lock_guard<std::mutex> lock(bufferUseMutex);
-			ctx.buffer_last_use.erase(objectName);
+			ctx.buffer_last_use.erase(buf_id);
 		}
-		ctx.buffer_objects.erase(objectName); // ARC releases the MTLBuffer once in-flight command buffers are done with it
+		ctx.buffer_objects.erase(buf_id); // ARC releases the MTLBuffer once in-flight command buffers are done with it
 	}
 }
 
@@ -465,21 +465,21 @@ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
-	GLuint objectName = boundBuffer(target);
-	auto it = ctx.buffer_objects.find(objectName);
-	if (objectName == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	GLuint buf_id = boundBuffer(target);
+	auto it = ctx.buffer_objects.find(buf_id);
+	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
 	if (offset < 0 || length < 0 || (NSUInteger)offset > it->second.length || (NSUInteger)length > it->second.length - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE); return;
 	}
 	// Shared storage is coherent on Apple GPUs; invalidate cached repacks after CPU writes.
-	invalidateConvertedVertexBuffers(objectName);
+	invalidateConvertedVertexBuffers(buf_id);
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return GL_FALSE; }
-	GLuint objectName = boundBuffer(target);
-	if (objectName == 0 || ctx.buffer_objects.find(objectName) == ctx.buffer_objects.end() || !ctx.buffer_objects[objectName]) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
-	invalidateConvertedVertexBuffers(objectName);
+	GLuint buf_id = boundBuffer(target);
+	if (buf_id == 0 || ctx.buffer_objects.find(buf_id) == ctx.buffer_objects.end() || !ctx.buffer_objects[buf_id]) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
+	invalidateConvertedVertexBuffers(buf_id);
 	return GL_TRUE;
 }
 

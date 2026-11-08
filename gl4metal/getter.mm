@@ -137,7 +137,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 3;
 			break;
 		case GL_NUM_EXTENSIONS:
-			*data = 0; // does not implement extensions yet
+			*data = 1; // GL_ARB_draw_buffers_blend
 			break;
 		case GL_CONTEXT_FLAGS:
 			*data = GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT;
@@ -147,7 +147,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			break;
 		case GL_MAX_DRAW_BUFFERS:
 		case GL_MAX_COLOR_ATTACHMENTS:
-			*data = 8;
+			*data = GL4METAL_MAX_COLOR_ATTACHMENTS;
 			break;
 		case GL_MAX_TEXTURE_IMAGE_UNITS:
 		case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
@@ -286,6 +286,12 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_SAMPLER_BINDING:
 			*data = (GLint)ctx.bound_samplers[ctx.active_texture_unit];
 			break;
+		case GL_BLEND_SRC_RGB:      *data = (GLint)ctx.blend_buffers[0].src_rgb; break;
+		case GL_BLEND_DST_RGB:      *data = (GLint)ctx.blend_buffers[0].dst_rgb; break;
+		case GL_BLEND_SRC_ALPHA:    *data = (GLint)ctx.blend_buffers[0].src_alpha; break;
+		case GL_BLEND_DST_ALPHA:    *data = (GLint)ctx.blend_buffers[0].dst_alpha; break;
+		case GL_BLEND_EQUATION_RGB: *data = (GLint)ctx.blend_buffers[0].equation_rgb; break;
+		case GL_BLEND_EQUATION_ALPHA: *data = (GLint)ctx.blend_buffers[0].equation_alpha; break;
 		case GL_UNPACK_ALIGNMENT:   *data = ctx.unpack_alignment; break;
 		case GL_UNPACK_ROW_LENGTH:  *data = ctx.unpack_row_length; break;
 		case GL_UNPACK_SKIP_PIXELS: *data = ctx.unpack_skip_pixels; break;
@@ -334,6 +340,21 @@ void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
 }
 
 void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (target == GL_BLEND_SRC_RGB || target == GL_BLEND_DST_RGB || target == GL_BLEND_SRC_ALPHA ||
+		target == GL_BLEND_DST_ALPHA || target == GL_BLEND_EQUATION_RGB || target == GL_BLEND_EQUATION_ALPHA) {
+		if (index >= GL4METAL_MAX_COLOR_ATTACHMENTS) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		const BlendBufferState &blendState = ctx.blend_buffers[index];
+		switch (target) {
+			case GL_BLEND_SRC_RGB: *data = (GLint)blendState.src_rgb; break;
+			case GL_BLEND_DST_RGB: *data = (GLint)blendState.dst_rgb; break;
+			case GL_BLEND_SRC_ALPHA: *data = (GLint)blendState.src_alpha; break;
+			case GL_BLEND_DST_ALPHA: *data = (GLint)blendState.dst_alpha; break;
+			case GL_BLEND_EQUATION_RGB: *data = (GLint)blendState.equation_rgb; break;
+			case GL_BLEND_EQUATION_ALPHA: *data = (GLint)blendState.equation_alpha; break;
+		}
+		return;
+	}
 	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS && (target == GL_UNIFORM_BUFFER_BINDING || target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE)) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetIntegeri_v: binding point %u is out of range (GL_INVALID_VALUE)", index);
@@ -415,7 +436,7 @@ void glGetPointerv(GLenum pname, void **params) {
 }
 
 NSString *detectDeviceName(utsname si) {
-	NSString *objectName = [NSString stringWithUTF8String:si.machine];
+	NSString *device_id = [NSString stringWithUTF8String:si.machine];
 	static NSDictionary *name;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
@@ -552,7 +573,7 @@ NSString *detectDeviceName(utsname si) {
             @"iPad16,6"  : @"iPad Pro M4"
 		};
 	});
-	return name[objectName] ?: objectName;
+	return name[device_id] ?: device_id;
 }
 
 const GLubyte *glGetString(GLenum name) {
@@ -570,7 +591,7 @@ const GLubyte *glGetString(GLenum name) {
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:
-			return (const GLubyte *)""; // does not implement extensions yet
+			return (const GLubyte *)"GL_ARB_draw_buffers_blend";
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetString: missing 0x%X", name);
@@ -579,11 +600,14 @@ const GLubyte *glGetString(GLenum name) {
 }
 
 const GLubyte *glGetStringi(GLenum name, GLuint index) {
-	switch(name) {
-		case GL_EXTENSIONS:
-			return (const GLubyte *)"";
-		default:
-			GL4METAL_LOG("glGetStringi: unhandled 0x%X", name);
-			return NULL;
+	if (name != GL_EXTENSIONS) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glGetStringi: unhandled 0x%X", name);
+		return NULL;
 	}
+	if (index != 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return NULL;
+	}
+	return (const GLubyte *)"GL_ARB_draw_buffers_blend";
 }
