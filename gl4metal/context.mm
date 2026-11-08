@@ -60,6 +60,7 @@ void glSwapBuffers(void) {
 	}
 	installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 	[ctx.currentCommandBuffer commit];
+	resetTextureUploadArena(ctx.currentCommandBuffer);
 	ctx.last_committed_buffer = ctx.currentCommandBuffer;
 	ctx.currentCommandBuffer = nil;
 	ctx.currentDrawable = nil; // next frame acquires a new drawable

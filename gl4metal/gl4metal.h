@@ -56,8 +56,18 @@ struct TextureObject {
 // MARK: - Framebuffers
 
 struct FBOAttachment {
-	GLuint texture = 0; // 0 = nothing attached
+	GLuint texture = 0;       // GL_TEXTURE object, 0 when not a texture attachment
+	GLuint renderbuffer = 0;  // GL_RENDERBUFFER object, 0 when not a renderbuffer attachment
 	GLint level = 0;
+};
+
+struct RenderbufferObject {
+	id<MTLTexture> texture = nil;
+	GLenum internalformat = 0;
+	GLsizei width = 0;
+	GLsizei height = 0;
+	GLsizei samples = 0;
+	bool initialized = false;
 };
 
 struct FBO {
@@ -137,6 +147,18 @@ struct ProgramUniform {
 struct ProgramBlock {
 	TranslatedBlock info;
 	GLuint binding_point = 0; // glUniformBlockBinding: GL_UNIFORM_BUFFER binding point the block reads from
+	std::vector<GLuint> active_uniform_indices;
+};
+
+struct ActiveUniformInfo {
+	std::string name;
+	GLenum type = GL_FLOAT;
+	GLint size = 1;
+	GLint block_index = -1;
+	GLint offset = -1;
+	GLint array_stride = 0;
+	GLint matrix_stride = 0;
+	GLboolean row_major = GL_FALSE;
 };
 
 struct ProgramObject {
@@ -150,7 +172,8 @@ struct ProgramObject {
 	id<MTLFunction> fragment_function = nil;
 	id<MTLFunction> vertex_function_flipped = nil; // vertex_function with gl_Position.y negated (texture targets)
 	std::vector<ProgramAttrib> attribs;
-	std::vector<ProgramUniform> uniforms;
+	std::vector<ProgramUniform> uniforms; // default-block uniforms with glUniform locations
+	std::vector<ActiveUniformInfo> active_uniforms; // GL_ACTIVE_UNIFORMS includes named-block members too
 	std::vector<std::pair<GLint, GLint>> locations; // GL uniform location -> (index in uniforms, array element)
 	std::vector<uint8_t> uniform_data[2];           // CPU copy of the default uniform block, [0] vertex, [1] fragment
 	std::unordered_map<std::string, GLint> frag_outputs;
@@ -250,6 +273,35 @@ struct MTLContext {
 	std::unordered_set<const void *> sync_objects;
 	id<MTLCommandBuffer> last_committed_buffer;
 	GLboolean pack_swap_bytes = GL_FALSE; // GL_PACK_SWAP_BYTES; appended to preserve existing member offsets
+
+	// Renderbuffer state is appended to keep offsets of older members stable across the ObjC++ translation units.
+	GLuint next_renderbuffer_id = 0;
+	GLuint bound_renderbuffer = 0;
+	std::unordered_map<GLuint, RenderbufferObject> renderbuffer_objects;
+	NSUInteger pass_sample_count = 1;
+
+	// GL stencil state is stored per face; appended to preserve all older member offsets.
+	struct StencilFaceState {
+		GLenum func = GL_ALWAYS;
+		GLint ref = 0;
+		GLuint value_mask = 0xFFFFFFFFu;
+		GLuint write_mask = 0xFFFFFFFFu;
+		GLenum fail = GL_KEEP;
+		GLenum depth_fail = GL_KEEP;
+		GLenum depth_pass = GL_KEEP;
+	};
+	StencilFaceState stencil_front;
+	StencilFaceState stencil_back;
+	GLuint primitive_restart_index = 0xFFFFFFFFu;
+
+	// Per-draw-buffer state from GL 3.0+. Metal stores write masks and blend enable
+	// in each render-pipeline color attachment descriptor. Appended to preserve layout.
+	GLboolean color_masks[GL4METAL_MAX_COLOR_ATTACHMENTS][4] = {};
+	GLboolean blend_enabled[GL4METAL_MAX_COLOR_ATTACHMENTS] = {};
+
+	// Last command buffer that encoded a draw using each GL buffer object. This lets
+	// CPU updates rename storage instead of stalling the entire render thread.
+	std::unordered_map<GLuint, id<MTLCommandBuffer>> buffer_last_use;
 };
 
 extern MTLContext ctx;
@@ -277,5 +329,7 @@ MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.
 void gl4metalSetError(GLenum error);                                // getter.mm: what the next glGetError returns
 void genericAttribValue(GLuint index, bool integer, void *out16);   // vertexarray.mm: glVertexAttrib* current value
 void invalidateConvertedVertexBuffers(GLuint buffer);               // draw.mm: invalidate cached integer attribute repacks
+void markBufferUsed(GLuint buffer);                                 // buffers.mm: record one GPU buffer use
+void markBuffersUsed(const GLuint *buffers, size_t count);          // buffers.mm: batch GPU buffer-use tracking per draw
 
 #include "exports.h"

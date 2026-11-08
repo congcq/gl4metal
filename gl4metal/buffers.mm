@@ -9,6 +9,9 @@
 
 #import "sync.h"
 
+#include <mutex>
+#include <unordered_set>
+
 // MARK: - Buffer objects
 
 static bool isBufferTarget(GLenum target) {
@@ -18,42 +21,133 @@ static bool isBufferTarget(GLenum target) {
 		target == GL_PIXEL_UNPACK_BUFFER;
 }
 
-// Shared MTLBuffer contents are CPU-visible, but the CPU must not mutate bytes while a
-// previously encoded GPU command may still read them. Conservative barrier for map/subdata
-// APIs: only waits when work is pending; glBufferData uses storage renaming and needs no wait.
-static void waitForPriorGPUBufferUse(void) {
-	if (ctx.currentEncoder || ctx.currentCommandBuffer ||
-		(ctx.last_committed_buffer && ctx.last_committed_buffer.status != MTLCommandBufferStatusCompleted &&
-		 ctx.last_committed_buffer.status != MTLCommandBufferStatusError)) {
-		flushCommandBuffer(true);
+// A buffer used by an encoded draw cannot be mutated in place while its command buffer
+// is pending. Track the last command buffer per GL object and rename only that object's
+// Metal storage when a CPU write overlaps in-flight GPU work.
+static std::mutex bufferUseMutex;
+static std::unordered_set<const void *> bufferCleanupRegistered;
+
+static bool commandBufferPending(id<MTLCommandBuffer> commandBuffer) {
+	if (!commandBuffer) return false;
+	const MTLCommandBufferStatus status = commandBuffer.status;
+	return status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError;
+}
+
+void markBuffersUsed(const GLuint *objectNames, size_t objectCount) {
+	id<MTLCommandBuffer> activeBuffer = ctx.currentCommandBuffer;
+	if (!activeBuffer || !objectNames || objectCount == 0) return;
+	const void *bufferToken = (__bridge const void *)activeBuffer;
+	bool installCleanup = false;
+	{
+		std::lock_guard<std::mutex> lock(bufferUseMutex);
+		for (size_t index = 0; index < objectCount; ++index) {
+			const GLuint objectName = objectNames[index];
+			if (objectName != 0) ctx.buffer_last_use[objectName] = activeBuffer;
+		}
+		installCleanup = bufferCleanupRegistered.insert(bufferToken).second;
+	}
+	if (installCleanup) {
+		[activeBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+			const void *completedToken = (__bridge const void *)completed;
+			std::lock_guard<std::mutex> lock(bufferUseMutex);
+			for (auto it = ctx.buffer_last_use.begin(); it != ctx.buffer_last_use.end();) {
+				if (it->second == completed) it = ctx.buffer_last_use.erase(it);
+				else ++it;
+			}
+			bufferCleanupRegistered.erase(completedToken);
+		}];
+	}
+}
+
+void markBufferUsed(GLuint objectName) {
+	markBuffersUsed(&objectName, 1);
+}
+
+static bool bufferHasPendingGPUUse(GLuint objectName) {
+	std::lock_guard<std::mutex> lock(bufferUseMutex);
+	auto it = ctx.buffer_last_use.find(objectName);
+	if (it == ctx.buffer_last_use.end()) return false;
+	if (commandBufferPending(it->second)) return true;
+	ctx.buffer_last_use.erase(it);
+	return false;
+}
+
+static bool makeBufferWritableWithoutStall(GLuint objectName, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
+	if (!bufferHasPendingGPUUse(objectName)) return true;
+	if (!ctx.device || !buffer || buffer.length > ctx.device.maxBufferLength) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return false;
+	}
+	id<MTLBuffer> replacement = [ctx.device newBufferWithLength:std::max<NSUInteger>(buffer.length, 1)
+		options:MTLResourceStorageModeShared];
+	if (!replacement) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("buffer update: failed to rename in-flight buffer %u (%llu bytes)",
+			objectName, (unsigned long long)buffer.length);
+		return false;
+	}
+	if (preserveContents && buffer.length != 0) {
+		memcpy(replacement.contents, buffer.contents, (size_t)buffer.length);
+	}
+	ctx.buffer_objects[objectName] = replacement;
+	{
+		std::lock_guard<std::mutex> lock(bufferUseMutex);
+		ctx.buffer_last_use.erase(objectName);
+	}
+	buffer = replacement;
+	return true;
+}
+
+static void waitForBufferGPUUse(GLuint objectName) {
+	id<MTLCommandBuffer> lastUse = nil;
+	{
+		std::lock_guard<std::mutex> lock(bufferUseMutex);
+		auto it = ctx.buffer_last_use.find(objectName);
+		if (it == ctx.buffer_last_use.end()) return;
+		lastUse = it->second;
+		if (!commandBufferPending(lastUse)) {
+			ctx.buffer_last_use.erase(it);
+			return;
+		}
+	}
+	// If this is the still-open command buffer, submit it before waiting. Do not flush
+	// unrelated work when the buffer was last used by an already committed command buffer.
+	if (lastUse == ctx.currentCommandBuffer) {
+		flushCommandBuffer(false);
+	}
+	[lastUse waitUntilCompleted];
+	{
+		std::lock_guard<std::mutex> lock(bufferUseMutex);
+		auto it = ctx.buffer_last_use.find(objectName);
+		if (it != ctx.buffer_last_use.end() && it->second == lastUse) ctx.buffer_last_use.erase(it);
 	}
 }
 
 void glGenBuffers(GLsizei n, GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
-		ctx.buffer_objects[id] = nil;     // name exists, storage comes with glBufferData
-		buffers[i] = id;
+		GLuint objectName = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
+		ctx.buffer_objects[objectName] = nil;     // name exists, storage comes with glBufferData
+		buffers[i] = objectName;
 	}
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = buffers[i];
-		if (id == 0) {
+		GLuint objectName = buffers[i];
+		if (objectName == 0) {
 			continue;
 		}
 		for (auto &binding : ctx.bound_buffers) {
-			if (binding.second == id) {
+			if (binding.second == objectName) {
 				binding.second = 0;
 			}
 		}
 		for (auto &vao : ctx.vao_objects) {
-			if (vao.second.element_array_buffer_id == id) {
+			if (vao.second.element_array_buffer_id == objectName) {
 				vao.second.element_array_buffer_id = 0;
 			}
 			for (VertexAttrib &attrib : vao.second.attribs) {
-				if (attrib.bound_vbo == id) {
+				if (attrib.bound_vbo == objectName) {
 					attrib.bound_vbo = 0;
 					attrib.pointer = nullptr;
 					attrib.enabled = false;
@@ -61,12 +155,16 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 			}
 		}
 		for (UniformBufferBinding &binding : ctx.uniform_buffer_bindings) {
-			if (binding.buffer == id) {
+			if (binding.buffer == objectName) {
 				binding = UniformBufferBinding();
 			}
 		}
-		invalidateConvertedVertexBuffers(id);
-		ctx.buffer_objects.erase(id); // ARC releases the MTLBuffer once in-flight command buffers are done with it
+		invalidateConvertedVertexBuffers(objectName);
+		{
+			std::lock_guard<std::mutex> lock(bufferUseMutex);
+			ctx.buffer_last_use.erase(objectName);
+		}
+		ctx.buffer_objects.erase(objectName); // ARC releases the MTLBuffer once in-flight command buffers are done with it
 	}
 }
 
@@ -205,6 +303,10 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		return;
 	}
 	invalidateConvertedVertexBuffers(buf_id);
+	{
+		std::lock_guard<std::mutex> lock(bufferUseMutex);
+		ctx.buffer_last_use.erase(buf_id);
+	}
 	ctx.buffer_objects[buf_id] = buffer;
 }
 
@@ -233,7 +335,8 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 			GL4METAL_LOG("glBufferSubData: data is null for a non-empty update");
 			return;
 		}
-		waitForPriorGPUBufferUse();
+		const bool replacesWholeStore = offset == 0 && (NSUInteger)size == buffer.length;
+		if (!makeBufferWritableWithoutStall(buf_id, buffer, !replacesWholeStore)) return;
 		invalidateConvertedVertexBuffers(buf_id);
 		memcpy((uint8_t *)buffer.contents + (NSUInteger)offset, data, (size_t)size);
 	}
@@ -263,7 +366,11 @@ void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *d
 		GL4METAL_LOG("glGetBufferSubData: data is null for a non-empty read");
 		return;
 	}
-	if (size > 0) memcpy(data, (const uint8_t *)buffer.contents + (NSUInteger)offset, (size_t)size);
+	if (size > 0) {
+		waitForBufferGPUUse(buf_id);
+		buffer = ctx.buffer_objects[buf_id];
+		memcpy(data, (const uint8_t *)buffer.contents + (NSUInteger)offset, (size_t)size);
+	}
 }
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
@@ -293,10 +400,13 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 			return;
 		}
 	}
-	// Shared storage: a CPU copy. memmove is safe for disjoint ranges in the same object.
+	// Shared storage: a CPU copy. If the destination is still referenced by GPU work,
+	// rename it instead of serializing the full command queue. `from` remains the prior
+	// version when readTarget and writeTarget name the same object.
 	if (size > 0) {
-		waitForPriorGPUBufferUse();
-		invalidateConvertedVertexBuffers(boundBuffer(writeTarget));
+		GLuint destinationName = boundBuffer(writeTarget);
+		if (!makeBufferWritableWithoutStall(destinationName, to)) return;
+		invalidateConvertedVertexBuffers(destinationName);
 		memmove((uint8_t *)to.contents + (NSUInteger)writeOffset, (const uint8_t *)from.contents + (NSUInteger)readOffset, (size_t)size);
 	}
 }
@@ -313,9 +423,14 @@ void *glMapBuffer(GLenum target, GLenum access) {
 		GL4METAL_LOG("glMapBuffer: no buffer storage bound to target 0x%X", target);
 		return NULL;
 	}
-	waitForPriorGPUBufferUse();
+	id<MTLBuffer> buffer = it->second;
+	if (access == GL_READ_ONLY || access == GL_READ_WRITE) {
+		waitForBufferGPUUse(buf_id);
+	} else if (!makeBufferWritableWithoutStall(buf_id, buffer)) {
+		return NULL;
+	}
 	invalidateConvertedVertexBuffers(buf_id);
-	return it->second.contents; // shared storage: the buffer is the CPU pointer itself
+	return buffer.contents; // shared storage: the buffer is the CPU pointer itself
 }
 
 void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
@@ -337,28 +452,34 @@ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 		GL4METAL_LOG("glMapBufferRange: range %ld+%ld outside %lu-byte buffer", (long)offset, (long)length, (unsigned long)buffer.length);
 		return NULL;
 	}
-	waitForPriorGPUBufferUse();
+	if (access & GL_MAP_READ_BIT) {
+		waitForBufferGPUUse(buf_id);
+		buffer = ctx.buffer_objects[buf_id];
+	} else if (!makeBufferWritableWithoutStall(buf_id, buffer,
+		(access & GL_MAP_INVALIDATE_BUFFER_BIT) == 0)) {
+		return NULL;
+	}
 	invalidateConvertedVertexBuffers(buf_id);
 	return (uint8_t *)buffer.contents + offset;
 }
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
-	GLuint id = boundBuffer(target);
-	auto it = ctx.buffer_objects.find(id);
-	if (id == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	GLuint objectName = boundBuffer(target);
+	auto it = ctx.buffer_objects.find(objectName);
+	if (objectName == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
 	if (offset < 0 || length < 0 || (NSUInteger)offset > it->second.length || (NSUInteger)length > it->second.length - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE); return;
 	}
 	// Shared storage is coherent on Apple GPUs; invalidate cached repacks after CPU writes.
-	invalidateConvertedVertexBuffers(id);
+	invalidateConvertedVertexBuffers(objectName);
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
 	if (!isBufferTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return GL_FALSE; }
-	GLuint id = boundBuffer(target);
-	if (id == 0 || ctx.buffer_objects.find(id) == ctx.buffer_objects.end() || !ctx.buffer_objects[id]) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
-	invalidateConvertedVertexBuffers(id);
+	GLuint objectName = boundBuffer(target);
+	if (objectName == 0 || ctx.buffer_objects.find(objectName) == ctx.buffer_objects.end() || !ctx.buffer_objects[objectName]) { gl4metalSetError(GL_INVALID_OPERATION); return GL_FALSE; }
+	invalidateConvertedVertexBuffers(objectName);
 	return GL_TRUE;
 }
 

@@ -3,6 +3,25 @@
 
 #include <sys/utsname.h>
 
+// Apple2 devices support 8192; Apple3 and
+// later Apple GPU families support at least 16384. GL4Metal intentionally
+// caps its advertised 2D limit at GL4METAL_MAX_TEXTURE_SIZE.
+static GLint maxMetalTextureDimension2D(id<MTLDevice> metalDevice) {
+	if (!metalDevice) {
+		return GL4METAL_MAX_TEXTURE_SIZE;
+	}
+
+	NSUInteger deviceLimit = 8192;
+	if (@available(iOS 13.0, *)) {
+		if ([metalDevice supportsFamily:MTLGPUFamilyApple3]) {
+			deviceLimit = 16384;
+		}
+	}
+
+	return (GLint)std::min<NSUInteger>(
+		(NSUInteger)GL4METAL_MAX_TEXTURE_SIZE, deviceLimit);
+}
+
 // MARK: - State queries
 
 // GL keeps the first error until glGetError reads (and clears) it.
@@ -89,7 +108,7 @@ void glGetFloatv(GLenum pname, GLfloat *data) {
 			data[0] = 1.0f; data[1] = 1.0f;
 			break;
 		case GL_POINT_SIZE_RANGE:
-			data[0] = 1.0f; data[1] = 64.0f;
+			data[0] = 1.0f; data[1] = 1.0f;
 			break;
 		case GL_MAX_TEXTURE_LOD_BIAS:
 			*data = 15.0f;
@@ -141,18 +160,25 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_MAX_TEXTURE_SIZE:
 		case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
 		case GL_MAX_RENDERBUFFER_SIZE:
-			*data = 16384;
+			*data = maxMetalTextureDimension2D(ctx.device);
 			break;
 		case GL_MAX_3D_TEXTURE_SIZE:
+			*data = 0; // GL_TEXTURE_3D storage/upload is not implemented yet.
+			break;
 		case GL_MAX_ARRAY_TEXTURE_LAYERS:
-			*data = 2048;
+			*data = 0; // GL_TEXTURE_2D_ARRAY storage/upload is not implemented yet.
 			break;
 		case GL_MAX_TEXTURE_BUFFER_SIZE:
-			*data = 65536;
+			*data = 0; // glTexBuffer is not implemented yet.
 			break;
-		case GL_MAX_SAMPLES:
-			*data = 1; // no multisampling yet
+		case GL_MAX_SAMPLES: {
+			GLint maxSamples = 1;
+			for (GLint candidate = 2; candidate <= 16; candidate *= 2) {
+				if ([ctx.device supportsTextureSampleCount:(NSUInteger)candidate]) maxSamples = candidate;
+			}
+			*data = maxSamples;
 			break;
+		}
 		case GL_MAX_ELEMENTS_VERTICES:
 		case GL_MAX_ELEMENTS_INDICES:
 			*data = 1048576;
@@ -199,15 +225,35 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_SCISSOR_BOX:
 			data[0] = ctx.scissor.x; data[1] = ctx.scissor.y; data[2] = ctx.scissor.w; data[3] = ctx.scissor.h;
 			break;
-		case GL_MAX_VIEWPORT_DIMS:
-			data[0] = 16384; data[1] = 16384;
+		case GL_MAX_VIEWPORT_DIMS: {
+			GLint maxDim = maxMetalTextureDimension2D(ctx.device);
+			data[0] = maxDim; data[1] = maxDim;
 			break;
+		}
 		case GL_DRAW_FRAMEBUFFER_BINDING: // = GL_FRAMEBUFFER_BINDING
 			*data = (GLint)ctx.draw_fbo;
 			break;
 		case GL_READ_FRAMEBUFFER_BINDING:
 			*data = (GLint)ctx.read_fbo;
 			break;
+		case GL_RENDERBUFFER_BINDING:
+			*data = (GLint)ctx.bound_renderbuffer;
+			break;
+		case GL_STENCIL_FUNC: *data = (GLint)ctx.stencil_front.func; break;
+		case GL_STENCIL_REF: *data = ctx.stencil_front.ref; break;
+		case GL_STENCIL_VALUE_MASK: *data = (GLint)ctx.stencil_front.value_mask; break;
+		case GL_STENCIL_WRITEMASK: *data = (GLint)ctx.stencil_front.write_mask; break;
+		case GL_STENCIL_FAIL: *data = (GLint)ctx.stencil_front.fail; break;
+		case GL_STENCIL_PASS_DEPTH_FAIL: *data = (GLint)ctx.stencil_front.depth_fail; break;
+		case GL_STENCIL_PASS_DEPTH_PASS: *data = (GLint)ctx.stencil_front.depth_pass; break;
+		case GL_STENCIL_BACK_FUNC: *data = (GLint)ctx.stencil_back.func; break;
+		case GL_STENCIL_BACK_REF: *data = ctx.stencil_back.ref; break;
+		case GL_STENCIL_BACK_VALUE_MASK: *data = (GLint)ctx.stencil_back.value_mask; break;
+		case GL_STENCIL_BACK_WRITEMASK: *data = (GLint)ctx.stencil_back.write_mask; break;
+		case GL_STENCIL_BACK_FAIL: *data = (GLint)ctx.stencil_back.fail; break;
+		case GL_STENCIL_BACK_PASS_DEPTH_FAIL: *data = (GLint)ctx.stencil_back.depth_fail; break;
+		case GL_STENCIL_BACK_PASS_DEPTH_PASS: *data = (GLint)ctx.stencil_back.depth_pass; break;
+		case GL_PRIMITIVE_RESTART_INDEX: *data = (GLint)ctx.primitive_restart_index; break;
 		case GL_ARRAY_BUFFER_BINDING:
 			*data = (GLint)boundBuffer(GL_ARRAY_BUFFER);
 			break;
@@ -266,10 +312,21 @@ void glGetInteger64v(GLenum pname, GLint64 *data) {
 }
 
 void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
-	if (target == GL_COLOR_WRITEMASK) { // one mask for all draw buffers for now
-		for (int i = 0; i < 4; i++) {
-			data[i] = ctx.color_mask[i];
-		}
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (target == GL_BLEND) {
+		if (index >= GL4METAL_MAX_COLOR_ATTACHMENTS) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		*data = ctx.blend_enabled[index];
+		return;
+	}
+	if (target == GL_SCISSOR_TEST) {
+		if (index != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		*data = ctx.scissor_test_enabled;
+		return;
+	}
+	if (target == GL_COLOR_WRITEMASK) {
+		if (index >= GL4METAL_MAX_COLOR_ATTACHMENTS) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		for (int component = 0; component < 4; ++component)
+			data[component] = ctx.color_masks[index][component];
 		return;
 	}
 	gl4metalSetError(GL_INVALID_ENUM);
@@ -309,8 +366,48 @@ void glGetInteger64i_v(GLenum target, GLuint index, GLint64 *data) {
 	*data = value;
 }
 
+static NSUInteger currentDrawFramebufferSampleCount() {
+	if (ctx.draw_fbo == 0) return 1;
+	auto fbo = ctx.fbo_objects.find(ctx.draw_fbo);
+	if (fbo == ctx.fbo_objects.end()) return 1;
+	auto sampleCountForAttachment = [](const FBOAttachment &attachment) -> NSUInteger {
+		if (attachment.renderbuffer != 0) {
+			auto renderbuffer = ctx.renderbuffer_objects.find(attachment.renderbuffer);
+			return renderbuffer != ctx.renderbuffer_objects.end() && renderbuffer->second.texture
+				? renderbuffer->second.texture.sampleCount : 1;
+		}
+		if (attachment.texture != 0) {
+			auto texture = ctx.texture_objects.find(attachment.texture);
+			return texture != ctx.texture_objects.end() && texture->second.texture ? texture->second.texture.sampleCount : 1;
+		}
+		return 1;
+	};
+	for (const FBOAttachment &attachment : fbo->second.color) {
+		if (attachment.texture != 0 || attachment.renderbuffer != 0) return sampleCountForAttachment(attachment);
+	}
+	if (fbo->second.depth.texture || fbo->second.depth.renderbuffer) return sampleCountForAttachment(fbo->second.depth);
+	if (fbo->second.stencil.texture || fbo->second.stencil.renderbuffer) return sampleCountForAttachment(fbo->second.stencil);
+	return 1;
+}
+
 void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
-	GL4METAL_LOG("glGetMultisamplefv: Unimplemented");
+	if (!val) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (pname != GL_SAMPLE_POSITION) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	const NSUInteger sampleCount = currentDrawFramebufferSampleCount();
+	if ((NSUInteger)index >= sampleCount) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (sampleCount == 1) { val[0] = 0.5f; val[1] = 0.5f; return; }
+	// Metal only exposes the default sample pattern on devices with programmable sample positions.
+	// On fixed-pattern GPUs the exact locations are implementation-defined and cannot be queried.
+	if (!ctx.device || !ctx.device.programmableSamplePositionsSupported) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetMultisamplefv: this iOS GPU has fixed sample locations that Metal does not expose");
+		return;
+	}
+	MTLSamplePosition positions[16] = {};
+	if (sampleCount > 16) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	[ctx.device getDefaultSamplePositions:positions count:sampleCount];
+	val[0] = positions[index].x;
+	val[1] = 1.0f - positions[index].y; // Metal's origin is top-left; GL's window origin is bottom-left.
 }
 
 void glGetPointerv(GLenum pname, void **params) {
@@ -318,7 +415,7 @@ void glGetPointerv(GLenum pname, void **params) {
 }
 
 NSString *detectDeviceName(utsname si) {
-	NSString *id = [NSString stringWithUTF8String:si.machine];
+	NSString *objectName = [NSString stringWithUTF8String:si.machine];
 	static NSDictionary *name;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
@@ -383,79 +480,79 @@ NSString *detectDeviceName(utsname si) {
             @"iPad7,6"   : @"iPad 6th gen",
             @"iPad7,11"  : @"iPad 7th gen",
             @"iPad7,12"  : @"iPad 7th gen",
-            @"iPad11,6"  : @"iPad (8th gen, Wi-Fi)",
-            @"iPad11,7"  : @"iPad (8th gen, Cellular)",
-            @"iPad12,1"  : @"iPad (9th gen, Wi-Fi)",
-            @"iPad12,2"  : @"iPad (9th gen, Cellular)",
-            @"iPad13,18" : @"iPad (10th gen, Wi-Fi)",
-            @"iPad13,19" : @"iPad (10th gen, Cellular)",
-            @"iPad15,7"  : @"iPad (A16, Wi-Fi)",
-            @"iPad15,8"  : @"iPad (A16, Cellular)",
+            @"iPad11,6"  : @"iPad 8th gen",
+            @"iPad11,7"  : @"iPad 8th gen",
+            @"iPad12,1"  : @"iPad 9th gen",
+            @"iPad12,2"  : @"iPad 9th gen",
+            @"iPad13,18" : @"iPad 10th gen",
+            @"iPad13,19" : @"iPad 10th gen",
+            @"iPad15,7"  : @"iPad A16",
+            @"iPad15,8"  : @"iPad A16",
 
             // iPad mini
-            @"iPad5,1"   : @"iPad mini 4 (Wi-Fi)",
-            @"iPad5,2"   : @"iPad mini 4 (Cellular)",
-            @"iPad11,1"  : @"iPad mini (5th gen, Wi-Fi)",
-            @"iPad11,2"  : @"iPad mini (5th gen, Cellular)",
-            @"iPad14,1"  : @"iPad mini (6th gen, Wi-Fi)",
-            @"iPad14,2"  : @"iPad mini (6th gen, Cellular)",
-            @"iPad16,1"  : @"iPad mini (A17 Pro, Wi-Fi)",
-            @"iPad16,2"  : @"iPad mini (A17 Pro, Cellular)",
+            @"iPad5,1"   : @"iPad mini 4",
+            @"iPad5,2"   : @"iPad mini 4",
+            @"iPad11,1"  : @"iPad mini 5th gen",
+            @"iPad11,2"  : @"iPad mini 5th gen",
+            @"iPad14,1"  : @"iPad mini 6th gen",
+            @"iPad14,2"  : @"iPad mini 6th gen",
+            @"iPad16,1"  : @"iPad mini A17 Pro",
+            @"iPad16,2"  : @"iPad mini A17 Pro",
 
             // iPad Air
-            @"iPad5,3"   : @"iPad Air 2 (Wi-Fi)",
-            @"iPad5,4"   : @"iPad Air 2 (Cellular)",
-            @"iPad11,3"  : @"iPad Air (3rd gen, Wi-Fi)",
-            @"iPad11,4"  : @"iPad Air (3rd gen, Cellular)",
-            @"iPad13,1"  : @"iPad Air (4th gen, Wi-Fi)",
-            @"iPad13,2"  : @"iPad Air (4th gen, Cellular)",
-            @"iPad13,16" : @"iPad Air (5th gen, Wi-Fi)",
-            @"iPad13,17" : @"iPad Air (5th gen, Cellular)",
-            @"iPad14,8"  : @"iPad Air 11-inch (M2, Wi-Fi)",
-            @"iPad14,9"  : @"iPad Air 11-inch (M2, Cellular)",
-            @"iPad14,10" : @"iPad Air 13-inch (M2, Wi-Fi)",
-            @"iPad14,11" : @"iPad Air 13-inch (M2, Cellular)",
+            @"iPad5,3"   : @"iPad Air 2",
+            @"iPad5,4"   : @"iPad Air 2",
+            @"iPad11,3"  : @"iPad Air 3rd gen",
+            @"iPad11,4"  : @"iPad Air 3rd gen",
+            @"iPad13,1"  : @"iPad Air 4th gen",
+            @"iPad13,2"  : @"iPad Air 4th gen",
+            @"iPad13,16" : @"iPad Air 5th gen",
+            @"iPad13,17" : @"iPad Air 5th gen",
+            @"iPad14,8"  : @"iPad Air M2",
+            @"iPad14,9"  : @"iPad Air M2",
+            @"iPad14,10" : @"iPad Air M2",
+            @"iPad14,11" : @"iPad Air M2",
 
             // iPad Pro
-            @"iPad6,3"   : @"iPad Pro 9.7-inch (Wi-Fi)",
-            @"iPad6,4"   : @"iPad Pro 9.7-inch (Cellular)",
-            @"iPad7,3"   : @"iPad Pro 10.5-inch (Wi-Fi)",
-            @"iPad7,4"   : @"iPad Pro 10.5-inch (Cellular)",
-            @"iPad8,1"   : @"iPad Pro 11-inch (1st gen, Wi-Fi)",
-            @"iPad8,2"   : @"iPad Pro 11-inch (1st gen, Wi-Fi)",
-            @"iPad8,3"   : @"iPad Pro 11-inch (1st gen, Cellular)",
-            @"iPad8,4"   : @"iPad Pro 11-inch (1st gen, Cellular)",
-            @"iPad8,9"   : @"iPad Pro 11-inch (2nd gen, Wi-Fi)",
-            @"iPad8,10"  : @"iPad Pro 11-inch (2nd gen, Cellular)",
-            @"iPad13,4"  : @"iPad Pro 11-inch (3rd gen, Wi-Fi)",
-            @"iPad13,5"  : @"iPad Pro 11-inch (3rd gen, Wi-Fi)",
-            @"iPad13,6"  : @"iPad Pro 11-inch (3rd gen, Cellular)",
-            @"iPad13,7"  : @"iPad Pro 11-inch (3rd gen, Cellular)",
-            @"iPad14,3"  : @"iPad Pro 11-inch (4th gen, Wi-Fi)",
-            @"iPad14,4"  : @"iPad Pro 11-inch (4th gen, Cellular)",
-            @"iPad16,3"  : @"iPad Pro 11-inch (M4, Wi-Fi)",
-            @"iPad16,4"  : @"iPad Pro 11-inch (M4, Cellular)",
-            @"iPad6,7"   : @"iPad Pro 12.9-inch (1st gen, Wi-Fi)",
-            @"iPad6,8"   : @"iPad Pro 12.9-inch (1st gen, Cellular)",
-            @"iPad7,1"   : @"iPad Pro 12.9-inch (2nd gen, Wi-Fi)",
-            @"iPad7,2"   : @"iPad Pro 12.9-inch (2nd gen, Cellular)",
-            @"iPad8,5"   : @"iPad Pro 12.9-inch (3rd gen, Wi-Fi)",
-            @"iPad8,6"   : @"iPad Pro 12.9-inch (3rd gen, Wi-Fi)",
-            @"iPad8,7"   : @"iPad Pro 12.9-inch (3rd gen, Cellular)",
-            @"iPad8,8"   : @"iPad Pro 12.9-inch (3rd gen, Cellular)",
-            @"iPad8,11"  : @"iPad Pro 12.9-inch (4th gen, Wi-Fi)",
-            @"iPad8,12"  : @"iPad Pro 12.9-inch (4th gen, Cellular)",
-            @"iPad13,8"  : @"iPad Pro 12.9-inch (5th gen, Wi-Fi)",
-            @"iPad13,9"  : @"iPad Pro 12.9-inch (5th gen, Wi-Fi)",
-            @"iPad13,10" : @"iPad Pro 12.9-inch (5th gen, Cellular)",
-            @"iPad13,11" : @"iPad Pro 12.9-inch (5th gen, Cellular)",
-            @"iPad14,5"  : @"iPad Pro 12.9-inch (6th gen, Wi-Fi)",
-            @"iPad14,6"  : @"iPad Pro 12.9-inch (6th gen, Cellular)",
-            @"iPad16,5"  : @"iPad Pro 13-inch (M4, Wi-Fi)",
-            @"iPad16,6"  : @"iPad Pro 13-inch (M4, Cellular)"
+            @"iPad6,3"   : @"iPad Pro",
+            @"iPad6,4"   : @"iPad Pro",
+            @"iPad7,3"   : @"iPad Pro",
+            @"iPad7,4"   : @"iPad Pro",
+            @"iPad8,1"   : @"iPad Pro 1st gen",
+            @"iPad8,2"   : @"iPad Pro 1st gen",
+            @"iPad8,3"   : @"iPad Pro 1st gen",
+            @"iPad8,4"   : @"iPad Pro 1st gen",
+            @"iPad8,9"   : @"iPad Pro 2nd gen",
+            @"iPad8,10"  : @"iPad Pro 2nd gen",
+            @"iPad13,4"  : @"iPad Pro 3rd gen",
+            @"iPad13,5"  : @"iPad Pro 3rd gen",
+            @"iPad13,6"  : @"iPad Pro 3rd gen",
+            @"iPad13,7"  : @"iPad Pro 3rd gen",
+            @"iPad14,3"  : @"iPad Pro 4th gen",
+            @"iPad14,4"  : @"iPad Pro 4th gen",
+            @"iPad16,3"  : @"iPad Pro M4",
+            @"iPad16,4"  : @"iPad Pro M4",
+            @"iPad6,7"   : @"iPad Pro 1st gen",
+            @"iPad6,8"   : @"iPad Pro 1st gen",
+            @"iPad7,1"   : @"iPad Pro 2nd gen",
+            @"iPad7,2"   : @"iPad Pro 2nd gen",
+            @"iPad8,5"   : @"iPad Pro 3rd gen",
+            @"iPad8,6"   : @"iPad Pro 3rd gen",
+            @"iPad8,7"   : @"iPad Pro 3rd gen",
+            @"iPad8,8"   : @"iPad Pro 3rd gen",
+            @"iPad8,11"  : @"iPad Pro 4th gen",
+            @"iPad8,12"  : @"iPad Pro 4th gen",
+            @"iPad13,8"  : @"iPad Pro 5th gen",
+            @"iPad13,9"  : @"iPad Pro 5th gen",
+            @"iPad13,10" : @"iPad Pro 5th gen",
+            @"iPad13,11" : @"iPad Pro 5th gen",
+            @"iPad14,5"  : @"iPad Pro 6th gen",
+            @"iPad14,6"  : @"iPad Pro 6th gen",
+            @"iPad16,5"  : @"iPad Pro M4",
+            @"iPad16,6"  : @"iPad Pro M4"
 		};
 	});
-	return name[id] ?: id;
+	return name[objectName] ?: objectName;
 }
 
 const GLubyte *glGetString(GLenum name) {
@@ -469,6 +566,7 @@ const GLubyte *glGetString(GLenum name) {
 			return (const GLubyte *)s.UTF8String;
 		}
 		case GL_VERSION:
+			return (const GLubyte *)"3.3 MetalGL";
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:

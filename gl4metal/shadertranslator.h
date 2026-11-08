@@ -29,6 +29,7 @@ struct TranslatedUniform {
 		uint32_t offset = 0;        // byte offset inside the default uniform block of that stage
 		uint32_t array_stride = 0;
 		uint32_t matrix_stride = 0;
+		bool row_major = false;
 		uint32_t slot = 0;          // samplers: [[texture(slot)]] and [[sampler(slot)]]
 	} stage[2];                     // 0 = vertex, 1 = fragment
 };
@@ -40,6 +41,7 @@ struct TranslatedBlock { // a real (named) uniform block, e.g. Sodium's ubo_Came
 		bool present = false;
 		uint32_t slot = 0;  // Metal buffer index in that stage
 	} stage[2];             // 0 = vertex, 1 = fragment
+	std::vector<TranslatedUniform> members; // active members of this named uniform block
 };
 
 struct TranslatedAttrib {

@@ -3,10 +3,11 @@
 
 GLuint glCreateShader(GLenum type) {
 	if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glCreateShader: unsupported shader type 0x%X (Metal has no geometry/tessellation stage in this layer)", type);
 		return 0;
 	}
-	GLuint shader = ++ctx.next_shader_id; // not named `id`: that shadows the Objective-C type
+	GLuint shader = ++ctx.next_shader_id; // not named `objectName`: that shadows the Objective-C type
 	ctx.shader_objects[shader].type = type;
 	return shader;
 }

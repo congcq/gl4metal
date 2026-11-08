@@ -9,5 +9,6 @@
 #include <GL/glext.h>
 
 MTLPixelFormat metalPixelFormat(GLenum internalformat);
+void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer);
 
 #endif /* TEXTURE_H */

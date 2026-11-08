@@ -69,13 +69,16 @@ MTLPixelFormat metalPixelFormat(GLenum internalformat) {
 		case GL_DEPTH24_STENCIL8:
 		case GL_DEPTH32F_STENCIL8:
 			return MTLPixelFormatDepth32Float_Stencil8;
+		case GL_STENCIL_INDEX8:
+			return MTLPixelFormatStencil8;
 		default:
 			return MTLPixelFormatInvalid;
 	}
 }
 
 static bool isDepthStencilFormat(MTLPixelFormat f) {
-	return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8;
+	return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float ||
+		f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8;
 }
 
 
@@ -103,11 +106,11 @@ static int cubeFace(GLenum target) {
 }
 
 static TextureObject *boundTexture(GLenum target) {
-	GLuint id = ctx.bound_textures[ctx.active_texture_unit][target];
-	if (id == 0) {
+	GLuint objectName = ctx.bound_textures[ctx.active_texture_unit][target];
+	if (objectName == 0) {
 		return nullptr;
 	}
-	auto it = ctx.texture_objects.find(id);
+	auto it = ctx.texture_objects.find(objectName);
 	return it == ctx.texture_objects.end() ? nullptr : &it->second;
 }
 
@@ -167,6 +170,101 @@ static const uint8_t *resolveUnpackPointer(const void *pixels, size_t byteOffset
 	return (const uint8_t *)it->second.contents + baseOffset + byteOffset;
 }
 
+// Small/medium texture updates share one staging arena per command buffer. Each
+// encoded blit gets a distinct range, so the CPU never overwrites bytes that the GPU
+// may still be reading. The command buffer retains the arena until completion.
+struct TextureUploadArena {
+	id<MTLCommandBuffer> commandBuffer = nil;
+	id<MTLBuffer> buffer = nil;
+	NSUInteger used = 0;
+};
+
+static TextureUploadArena textureUploadArena;
+static std::mutex textureUploadArenaMutex;
+
+void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer) {
+	if (!commandBuffer) return;
+	std::lock_guard<std::mutex> lock(textureUploadArenaMutex);
+	if (textureUploadArena.commandBuffer == commandBuffer) {
+		textureUploadArena.commandBuffer = nil;
+		textureUploadArena.buffer = nil;
+		textureUploadArena.used = 0;
+	}
+}
+
+// Queue texture uploads through a shared staging buffer and a blit encoder. This keeps
+// GL command ordering (earlier render work -> upload -> later render work) without
+// blocking the CPU on waitUntilCompleted for every glTexSubImage2D call.
+static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger slice,
+		GLint x, GLint y, GLsizei width, GLsizei height,
+		const uint8_t *source, size_t sourceRowBytes, size_t copyRowBytes) {
+	if (!texture || !source || !ctx.device || !ctx.commandQueue || width <= 0 || height <= 0) return false;
+	size_t stagingRowBytes = 0, stagingBytes = 0;
+	if (!checkedAlignSize(copyRowBytes, 256, stagingRowBytes) ||
+		!checkedSizeMul(stagingRowBytes, (size_t)height, stagingBytes) ||
+		stagingBytes == 0 || stagingBytes > ctx.device.maxBufferLength) {
+		return false;
+	}
+
+	// The upload must follow any render pass that has already sampled or rendered to
+	// this texture. Encoders in one command buffer execute in order on the same queue.
+	endRenderEncoder();
+	if (!ctx.currentCommandBuffer) {
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	}
+	id<MTLCommandBuffer> targetCommandBuffer = ctx.currentCommandBuffer;
+	if (!targetCommandBuffer) return false;
+
+	id<MTLBuffer> staging = nil;
+	NSUInteger stagingOffset = 0;
+	{
+		std::lock_guard<std::mutex> lock(textureUploadArenaMutex);
+		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
+			textureUploadArena.commandBuffer = targetCommandBuffer;
+			textureUploadArena.buffer = nil;
+			textureUploadArena.used = 0;
+		}
+		NSUInteger requiredEnd = 0;
+		if ((NSUInteger)stagingBytes <= std::numeric_limits<NSUInteger>::max() - textureUploadArena.used) {
+			requiredEnd = textureUploadArena.used + (NSUInteger)stagingBytes;
+		} else {
+			return false;
+		}
+		if (!textureUploadArena.buffer || requiredEnd > textureUploadArena.buffer.length) {
+			NSUInteger capacity = std::max<NSUInteger>(256 * 1024, (NSUInteger)stagingBytes);
+			if (textureUploadArena.buffer && textureUploadArena.buffer.length <= ctx.device.maxBufferLength / 2) {
+				capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
+			}
+			capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
+			id<MTLBuffer> newArena = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+			if (!newArena) return false;
+			// Previous arena allocations remain valid: the command buffer retains the old
+			// MTLBuffer even after this context points at the larger replacement.
+			textureUploadArena.buffer = newArena;
+			textureUploadArena.used = 0;
+			requiredEnd = (NSUInteger)stagingBytes;
+		}
+		staging = textureUploadArena.buffer;
+		stagingOffset = textureUploadArena.used;
+		uint8_t *destination = (uint8_t *)staging.contents + stagingOffset;
+		for (GLsizei row = 0; row < height; ++row) {
+			memcpy(destination + (size_t)row * stagingRowBytes,
+				source + (size_t)row * sourceRowBytes, copyRowBytes);
+		}
+		textureUploadArena.used = requiredEnd;
+	}
+
+	id<MTLBlitCommandEncoder> blit = [targetCommandBuffer blitCommandEncoder];
+	if (!blit) return false;
+	// For 2D and cube-slice copies, sourceBytesPerImage must be zero (there is one image).
+	[blit copyFromBuffer:staging sourceOffset:stagingOffset sourceBytesPerRow:(NSUInteger)stagingRowBytes
+		sourceBytesPerImage:0 sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+		toTexture:texture destinationSlice:slice destinationLevel:(NSUInteger)level
+		destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)];
+	[blit endEncoding];
+	return true;
+}
+
 // Position of the R,G,B,A channels inside one source pixel (-1 = channel not present).
 static bool sourceLayout(GLenum format, int &comps, int idx[4]) {
 	idx[0] = idx[1] = idx[2] = idx[3] = -1;
@@ -203,7 +301,8 @@ static bool destLayout(MTLPixelFormat f, int &comps, int &compSize) {
 }
 
 static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
-						 GLenum format, GLenum type, const void *pixels, const char *caller, NSUInteger slice = 0) {
+						 GLenum format, GLenum type, const void *pixels, const char *caller,
+						 NSUInteger slice = 0, bool freshTextureStorage = false) {
 	if (!t.texture || level < 0 || (NSUInteger)level >= t.texture.mipmapLevelCount) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: invalid or unallocated mip level %d", caller, level);
@@ -284,8 +383,15 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		return;
 	}
 	if (identical && srcRowBytes % dstBpp == 0) {
-		flushCommandBuffer(true); // CPU writes to Shared textures must follow earlier GPU reads.
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
+		if (freshTextureStorage) {
+			// A just-allocated texture has no earlier GPU readers, so avoid a staging blit
+			// for the common initial texture upload.
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
+		} else if (!enqueueTextureUpload(t.texture, level, slice, x, y, w, h, src, srcRowBytes, copyRowBytes)) {
+			// Oversized staging uploads or encoder allocation failure use the conservative path.
+			flushCommandBuffer(true);
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
+		}
 		return;
 	}
 
@@ -319,8 +425,13 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 			}
 		}
 	}
-	flushCommandBuffer(true); // preserve GL ordering before mutating a Shared texture used by earlier draws.
-	[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+	if (freshTextureStorage) {
+		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+	} else if (!enqueueTextureUpload(t.texture, level, slice, x, y, w, h, tmp.data(), tmpRowBytes, tmpRowBytes)) {
+		// Keep a correct synchronous fallback when the staging blit cannot be allocated.
+		flushCommandBuffer(true);
+		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+	}
 }
 
 // glCopyTexSubImage2D reads the attachment matching the destination base format:
@@ -339,13 +450,24 @@ static id<MTLTexture> readAttachment(GLint &level, bool depth) {
 		if (readBuffer < GL_COLOR_ATTACHMENT0 || readBuffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) return nil;
 		attachment = &it->second.color[readBuffer - GL_COLOR_ATTACHMENT0];
 	}
-	if (!attachment || attachment->texture == 0) return nil;
-	auto texture = ctx.texture_objects.find(attachment->texture);
-	if (texture == ctx.texture_objects.end() || !texture->second.texture) return nil;
-	id<MTLTexture> mtlTexture = texture->second.texture;
-	if (attachment->level < 0 || (NSUInteger)attachment->level >= mtlTexture.mipmapLevelCount ||
-		mtlTexture.textureType != MTLTextureType2D || (mtlTexture.usage & MTLTextureUsageRenderTarget) == 0) return nil;
-	level = attachment->level;
+	if (!attachment || (attachment->texture == 0 && attachment->renderbuffer == 0) ||
+		(attachment->texture != 0 && attachment->renderbuffer != 0)) return nil;
+	id<MTLTexture> mtlTexture = nil;
+	if (attachment->renderbuffer != 0) {
+		auto renderbuffer = ctx.renderbuffer_objects.find(attachment->renderbuffer);
+		if (renderbuffer == ctx.renderbuffer_objects.end() || !renderbuffer->second.texture) return nil;
+		mtlTexture = renderbuffer->second.texture;
+		if (attachment->level != 0 || mtlTexture.sampleCount != 1) return nil;
+		level = 0;
+	} else {
+		auto texture = ctx.texture_objects.find(attachment->texture);
+		if (texture == ctx.texture_objects.end() || !texture->second.texture) return nil;
+		mtlTexture = texture->second.texture;
+		if (attachment->level < 0 || (NSUInteger)attachment->level >= mtlTexture.mipmapLevelCount ||
+			mtlTexture.sampleCount != 1) return nil;
+		level = attachment->level;
+	}
+	if (mtlTexture.textureType != MTLTextureType2D || (mtlTexture.usage & MTLTextureUsageRenderTarget) == 0) return nil;
 	return mtlTexture;
 }
 
@@ -353,21 +475,21 @@ static id<MTLTexture> readAttachment(GLint &level, bool depth) {
 
 void glGenTextures(GLsizei n, GLuint *textures) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = ++ctx.next_texture_id;
-		ctx.texture_objects[id] = TextureObject();
-		textures[i] = id;
+		GLuint objectName = ++ctx.next_texture_id;
+		ctx.texture_objects[objectName] = TextureObject();
+		textures[i] = objectName;
 	}
 }
 
 void glDeleteTextures(GLsizei n, const GLuint *textures) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = textures[i];
-		if (id == 0) {
+		GLuint objectName = textures[i];
+		if (objectName == 0) {
 			continue;
 		}
 		for (auto &unit : ctx.bound_textures) {
 			for (auto &binding : unit) {
-				if (binding.second == id) {
+				if (binding.second == objectName) {
 					binding.second = 0;
 				}
 			}
@@ -375,7 +497,7 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		// GL detaches a deleted texture from the framebuffers it is attached to.
 		bool detached = false;
 		auto detach = [&](FBOAttachment &a) {
-			if (a.texture == id) {
+			if (a.texture == objectName) {
 				a.texture = 0;
 				detached = true;
 			}
@@ -390,7 +512,7 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		if (detached) {
 			endRenderEncoder();
 		}
-		ctx.texture_objects.erase(id);
+		ctx.texture_objects.erase(objectName);
 	}
 }
 
@@ -422,6 +544,7 @@ void glBindTexture(GLenum target, GLuint texture) {
 }
 
 void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexBuffer: Unimplemented");
 }
 
@@ -509,6 +632,7 @@ void glPixelStorei(GLenum pname, GLint param) {
 // MARK: - Texture images
 
 void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexImage1D: Unimplemented");
 }
 
@@ -560,6 +684,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		return;
 	}
 
+	bool freshTextureStorage = false;
 	if (level == 0) {
 		if (!t->texture || t->width != width || t->height != height || t->texture.pixelFormat != mtlFormat) {
 			NSUInteger levels = mipLevelCount(*t, width, height);
@@ -581,11 +706,12 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 				GL4METAL_LOG("glTexImage2D: failed to allocate a %dx%d MTLPixelFormat %d texture; previous storage preserved", width, height, (int)mtlFormat);
 				return;
 			}
-			endRenderEncoder(); // a pass that renders to the old texture must not outlive it
-			flushCommandBuffer(true); // the old image may still be sampled by committed work before name replacement
+			endRenderEncoder(); // close a pass targeting the old texture before replacing its GL storage
+			// In-flight command buffers retain the old MTLTexture until their work completes.
 			t->texture = newTexture;
 			t->width = width;
 			t->height = height;
+			freshTextureStorage = true;
 		}
 		t->internalformat = (GLenum)internalformat;
 	} else if (!t->texture || (NSUInteger)level >= t->texture.mipmapLevelCount ||
@@ -596,23 +722,28 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	}
 
 	if (pixels || boundBuffer(GL_PIXEL_UNPACK_BUFFER)) {
-		uploadPixels(*t, level, 0, 0, width, height, format, type, pixels, "glTexImage2D", face >= 0 ? (NSUInteger)face : 0);
+		uploadPixels(*t, level, 0, 0, width, height, format, type, pixels, "glTexImage2D",
+			face >= 0 ? (NSUInteger)face : 0, freshTextureStorage);
 	}
 }
 
 void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexImage3D: Unimplemented");
 }
 
 void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexImage2DMultisample: Unimplemented");
 }
 
 void glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexImage3DMultisample: Unimplemented");
 }
 
 void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexSubImage1D: Unimplemented");
 }
 
@@ -628,10 +759,12 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
 }
 
 void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glTexSubImage3D: Unimplemented");
 }
 
 void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCopyTexImage1D: Unimplemented");
 }
 
@@ -641,6 +774,7 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
 }
 
 void glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCopyTexSubImage1D: Unimplemented");
 }
 
@@ -717,32 +851,39 @@ void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 }
 
 void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCopyTexSubImage3D: Unimplemented");
 }
 
 // MARK: - Compressed texture images
 
 void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexImage1D: Unimplemented");
 }
 
 void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexImage2D: Unimplemented");
 }
 
 void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexImage3D: Unimplemented");
 }
 
 void glCompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexSubImage1D: Unimplemented");
 }
 
 void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexSubImage2D: Unimplemented");
 }
 
 void glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glCompressedTexSubImage3D: Unimplemented");
 }
 
@@ -1357,6 +1498,7 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 }
 
 void glGetCompressedTexImage(GLenum target, GLint level, void *img) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glGetCompressedTexImage: Unimplemented");
 }
 

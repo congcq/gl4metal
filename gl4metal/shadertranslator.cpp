@@ -362,8 +362,10 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
 		msl.set_enabled_interface_variables(std::move(activeVariables));
 
-		// Uniform blocks: the default block goes to a fixed high buffer index (see GL4METAL_UNIFORM_BUFFER_INDEX),
-		// real uniform blocks (not supported yet) are parked at 16 + binding so they never collide with vertex buffers.
+		// Uniform blocks: GL binding points are an independent namespace (36 on this backend).
+		// Metal buffer indices are per-stage slots: 16...29 for up to 14 active UBOs, and 30
+		// for GL's default uniform block. Do not derive the MSL slot from the GL binding point.
+		uint32_t nextUniformBlockBufferSlot = 16;
 		for (const spirv_cross::Resource &r : resources.uniform_buffers) {
 			const spirv_cross::SPIRType &type = msl.get_type(r.base_type_id);
 			bool isDefault = msl.get_name(r.base_type_id) == "gl_DefaultUniformBlock" || r.name == "gl_DefaultUniformBlock";
@@ -373,7 +375,15 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			b.stage = model;
 			b.desc_set = msl.get_decoration(r.id, spv::DecorationDescriptorSet);
 			b.binding = binding;
-			b.msl_buffer = isDefault ? GL4METAL_UNIFORM_BUFFER_INDEX : 16 + binding;
+			if (isDefault) {
+				b.msl_buffer = GL4METAL_UNIFORM_BUFFER_INDEX;
+			} else {
+				if (nextUniformBlockBufferSlot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
+					out.log += "shader stage uses more than 14 active uniform blocks; Metal buffer slots are exhausted\n";
+					return false;
+				}
+				b.msl_buffer = nextUniformBlockBufferSlot++;
+			}
 			msl.add_msl_resource_binding(b);
 
 			if (flipY) {
@@ -399,6 +409,36 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 				block->size = std::max(block->size, (uint32_t)((blockSize + 15) & ~(size_t)15));
 				block->stage[stage].present = true;
 				block->stage[stage].slot = b.msl_buffer;
+
+				// Reflect active members of named blocks for the GL 3.3 introspection API.
+				const std::string memberPrefix = r.name.empty() ? blockName : r.name;
+				for (uint32_t memberIndex = 0; memberIndex < type.member_types.size(); ++memberIndex) {
+					const spirv_cross::SPIRType &memberType = msl.get_type(type.member_types[memberIndex]);
+					const std::string memberLeaf = msl.get_member_name(r.base_type_id, memberIndex);
+					if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+						out.log += "uniform-block member '" + memberLeaf + "' is a nested struct; nested member reflection is not supported\n";
+						continue;
+					}
+					const std::string memberName = memberPrefix + "." + memberLeaf;
+					auto memberIt = std::find_if(block->members.begin(), block->members.end(), [&](const TranslatedUniform &candidate) {
+						return candidate.name == memberName;
+					});
+					if (memberIt == block->members.end()) {
+						block->members.emplace_back();
+						memberIt = block->members.end() - 1;
+						memberIt->name = memberName;
+					}
+					memberIt->kind = kindOf(memberType.basetype);
+					memberIt->vecsize = (int)memberType.vecsize;
+					memberIt->columns = (int)memberType.columns;
+					memberIt->array_size = arraySizeOf(memberType);
+					TranslatedUniform::Stage &memberStage = memberIt->stage[stage];
+					memberStage.present = true;
+					memberStage.offset = msl.type_struct_member_offset(type, memberIndex);
+					memberStage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(type, memberIndex);
+					memberStage.matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(type, memberIndex) : 0;
+					memberStage.row_major = msl.has_member_decoration(r.base_type_id, memberIndex, spv::DecorationRowMajor);
+				}
 				continue;
 			}
 
@@ -424,6 +464,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 				st.offset = msl.type_struct_member_offset(type, i);
 				st.array_stride = member.array.empty() ? 0 : msl.type_struct_member_array_stride(type, i);
 				st.matrix_stride = member.columns > 1 ? msl.type_struct_member_matrix_stride(type, i) : 0;
+				st.row_major = msl.has_member_decoration(r.base_type_id, i, spv::DecorationRowMajor);
 			}
 		}
 

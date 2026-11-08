@@ -52,6 +52,11 @@ GLboolean gl4metalInit() {
 		ctx.blend_color[i] = 0.0f;
 		ctx.color_mask[i] = GL_TRUE;
 	}
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		ctx.blend_enabled[attachment] = GL_FALSE;
+		for (int component = 0; component < 4; ++component)
+			ctx.color_masks[attachment][component] = GL_TRUE;
+	}
 	ctx.cull_face_mode = GL_BACK;
 	ctx.front_face = GL_CCW;
 	ctx.polygon_mode = GL_FILL;
@@ -118,34 +123,74 @@ MTLCompareFunction getMetalCompareFunc(GLenum func) {
 	}
 }
 
+static MTLStencilOperation getMetalStencilOperation(GLenum operation) {
+	switch (operation) {
+		case GL_KEEP: return MTLStencilOperationKeep;
+		case GL_ZERO: return MTLStencilOperationZero;
+		case GL_REPLACE: return MTLStencilOperationReplace;
+		case GL_INCR: return MTLStencilOperationIncrementClamp;
+		case GL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
+		case GL_DECR: return MTLStencilOperationDecrementClamp;
+		case GL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
+		case GL_INVERT: return MTLStencilOperationInvert;
+		default: return MTLStencilOperationKeep;
+	}
+}
+
+static MTLStencilDescriptor *makeStencilDescriptor(const MTLContext::StencilFaceState &state) {
+	MTLStencilDescriptor *descriptor = [[MTLStencilDescriptor alloc] init];
+	descriptor.stencilCompareFunction = getMetalCompareFunc(state.func);
+	descriptor.stencilFailureOperation = getMetalStencilOperation(state.fail);
+	descriptor.depthFailureOperation = getMetalStencilOperation(state.depth_fail);
+	descriptor.depthStencilPassOperation = getMetalStencilOperation(state.depth_pass);
+	descriptor.readMask = state.value_mask;
+	descriptor.writeMask = state.write_mask;
+	return descriptor;
+}
+
 void updateDepthStencilState() {
-	// Depth-stencil states are immutable Metal objects, so cache one per (test, write, func) combination.
-	static std::unordered_map<uint32_t, id<MTLDepthStencilState>> cache;
+	static std::unordered_map<std::string, id<MTLDepthStencilState>> cache;
 	static std::mutex cacheMutex;
 	std::lock_guard<std::mutex> lock(cacheMutex);
 
-	uint32_t key = 0; // depth test disabled: always pass, never write
-	if (ctx.depth_test_enabled) {
-		key = 1u | (ctx.depth_write_enabled ? 2u : 0u) | ((uint32_t)(ctx.depth_func & 7u) << 2);
-	}
+	const bool depthEnabled = ctx.depth_test_enabled != GL_FALSE;
+	const bool stencilEnabled = ctx.caps[GL_STENCIL_TEST] != GL_FALSE;
+	const auto &front = ctx.stencil_front;
+	const auto &back = ctx.stencil_back;
+	std::string key;
+	auto append = [&key](uint64_t value) {
+		key.append(reinterpret_cast<const char *>(&value), sizeof(value));
+	};
+	append(depthEnabled); append(ctx.depth_write_enabled); append(ctx.depth_func);
+	append(stencilEnabled);
+	append(front.func); append((uint32_t)front.ref); append(front.value_mask); append(front.write_mask);
+	append(front.fail); append(front.depth_fail); append(front.depth_pass);
+	append(back.func); append((uint32_t)back.ref); append(back.value_mask); append(back.write_mask);
+	append(back.fail); append(back.depth_fail); append(back.depth_pass);
 
 	auto it = cache.find(key);
 	if (it == cache.end() || !it->second) {
-		MTLDepthStencilDescriptor *dc = [[MTLDepthStencilDescriptor alloc] init];
-		if (ctx.depth_test_enabled) {
-			dc.depthCompareFunction = getMetalCompareFunc(ctx.depth_func);
-			dc.depthWriteEnabled = ctx.depth_write_enabled;
+		MTLDepthStencilDescriptor *descriptor = [[MTLDepthStencilDescriptor alloc] init];
+		descriptor.depthCompareFunction = depthEnabled ? getMetalCompareFunc(ctx.depth_func) : MTLCompareFunctionAlways;
+		descriptor.depthWriteEnabled = depthEnabled && ctx.depth_write_enabled;
+		if (stencilEnabled) {
+			descriptor.frontFaceStencil = makeStencilDescriptor(front);
+			descriptor.backFaceStencil = makeStencilDescriptor(back);
 		} else {
-			dc.depthCompareFunction = MTLCompareFunctionAlways;
-			dc.depthWriteEnabled = NO;
+			// A disabled stencil test must not mutate the stencil attachment.
+			MTLStencilDescriptor *disabled = [[MTLStencilDescriptor alloc] init];
+			disabled.stencilCompareFunction = MTLCompareFunctionAlways;
+			disabled.stencilFailureOperation = MTLStencilOperationKeep;
+			disabled.depthFailureOperation = MTLStencilOperationKeep;
+			disabled.depthStencilPassOperation = MTLStencilOperationKeep;
+			disabled.readMask = 0xFFFFFFFFu;
+			disabled.writeMask = 0;
+			descriptor.frontFaceStencil = disabled;
+			descriptor.backFaceStencil = disabled;
 		}
-		id<MTLDepthStencilState> created = [ctx.device newDepthStencilStateWithDescriptor:dc];
-		if (it == cache.end()) {
-			it = cache.emplace(key, created).first;
-		} else {
-			it->second = created; // allow retry after a transient Metal allocation failure
-		}
+		id<MTLDepthStencilState> created = [ctx.device newDepthStencilStateWithDescriptor:descriptor];
+		if (it == cache.end()) it = cache.emplace(key, created).first;
+		else it->second = created;
 	}
-
 	ctx.depthStencilState = it->second;
 }

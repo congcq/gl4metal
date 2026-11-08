@@ -57,9 +57,9 @@ static float normalizeSigned(double v, double max) { return (float)std::max(v / 
 
 void glGenVertexArrays(GLsizei n, GLuint *arrays) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = ++ctx.next_vao_id;
-		ctx.vao_objects[id] = VertexArray(); // zero initialized: all attributes disabled
-		arrays[i] = id;
+		GLuint objectName = ++ctx.next_vao_id;
+		ctx.vao_objects[objectName] = VertexArray(); // zero initialized: all attributes disabled
+		arrays[i] = objectName;
 	}
 }
 
@@ -640,36 +640,43 @@ void glVertexAttribI4usv(GLuint index, const GLushort *v) {
 	setGenericInt(index, 4, values);
 }
 
-// MARK: - Packed (2_10_10_10) vertex attributes
+// MARK: - Packed (2_10_10_10) current generic vertex attributes
 
-void glVertexAttribP1ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) {
-	GL4METAL_LOG("glVertexAttribP1ui: Unimplemented");
+static int32_t signExtendPacked(uint32_t field, unsigned bits) {
+	const uint32_t signBit = 1u << (bits - 1);
+	return (int32_t)((field ^ signBit) - signBit);
 }
 
-void glVertexAttribP1uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) {
-	GL4METAL_LOG("glVertexAttribP1uiv: Unimplemented");
+static void setPackedGenericAttrib(GLuint index, int componentCount, GLenum type, GLboolean normalized, GLuint packed) {
+	if (index >= 16) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (type != GL_INT_2_10_10_10_REV && type != GL_UNSIGNED_INT_2_10_10_10_REV) {
+		gl4metalSetError(GL_INVALID_ENUM); return;
+	}
+	if (componentCount < 1 || componentCount > 4) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	const bool isSigned = type == GL_INT_2_10_10_10_REV;
+	const unsigned shifts[4] = { 0, 10, 20, 30 };
+	const unsigned widths[4] = { 10, 10, 10, 2 };
+	float values[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	for (int component = 0; component < componentCount; ++component) {
+		const uint32_t mask = (1u << widths[component]) - 1u;
+		const uint32_t field = (packed >> shifts[component]) & mask;
+		if (isSigned) {
+			const int32_t signedValue = signExtendPacked(field, widths[component]);
+			const int32_t maxPositive = (1 << (widths[component] - 1)) - 1;
+			values[component] = normalized ? (maxPositive > 0 ? std::max((float)signedValue / (float)maxPositive, -1.0f) : 0.0f) : (float)signedValue;
+		} else {
+			const uint32_t maxValue = mask;
+			values[component] = normalized ? (float)field / (float)maxValue : (float)field;
+		}
+	}
+	setGenericFloat(index, componentCount, values);
 }
 
-void glVertexAttribP2ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) {
-	GL4METAL_LOG("glVertexAttribP2ui: Unimplemented");
-}
-
-void glVertexAttribP2uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) {
-	GL4METAL_LOG("glVertexAttribP2uiv: Unimplemented");
-}
-
-void glVertexAttribP3ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) {
-	GL4METAL_LOG("glVertexAttribP3ui: Unimplemented");
-}
-
-void glVertexAttribP3uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) {
-	GL4METAL_LOG("glVertexAttribP3uiv: Unimplemented");
-}
-
-void glVertexAttribP4ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) {
-	GL4METAL_LOG("glVertexAttribP4ui: Unimplemented");
-}
-
-void glVertexAttribP4uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) {
-	GL4METAL_LOG("glVertexAttribP4uiv: Unimplemented");
-}
+void glVertexAttribP1ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) { setPackedGenericAttrib(index, 1, type, normalized, value); }
+void glVertexAttribP1uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) { if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; } setPackedGenericAttrib(index, 1, type, normalized, value[0]); }
+void glVertexAttribP2ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) { setPackedGenericAttrib(index, 2, type, normalized, value); }
+void glVertexAttribP2uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) { if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; } setPackedGenericAttrib(index, 2, type, normalized, value[0]); }
+void glVertexAttribP3ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) { setPackedGenericAttrib(index, 3, type, normalized, value); }
+void glVertexAttribP3uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) { if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; } setPackedGenericAttrib(index, 3, type, normalized, value[0]); }
+void glVertexAttribP4ui(GLuint index, GLenum type, GLboolean normalized, GLuint value) { setPackedGenericAttrib(index, 4, type, normalized, value); }
+void glVertexAttribP4uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint *value) { if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; } setPackedGenericAttrib(index, 4, type, normalized, value[0]); }

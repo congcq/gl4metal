@@ -25,6 +25,49 @@ static bool dumpEnabled() {
 	return dump && dump[0] == '1';
 }
 
+// Active-uniform type mapping for GL reflection. The runtime uniform-location table
+// remains limited to default-block uniforms; named-block members are introspection-only.
+static GLenum activeUniformGLType(const TranslatedUniform &u) {
+	if (u.kind == TranslatedUniform::Sampler) {
+		switch (u.dim) {
+			case TranslatedUniform::DimCube: return GL_SAMPLER_CUBE;
+			case TranslatedUniform::Dim3D: return GL_SAMPLER_3D;
+			case TranslatedUniform::Dim2DArray: return GL_SAMPLER_2D_ARRAY;
+			default: return GL_SAMPLER_2D;
+		}
+	}
+	const int rows = std::max(1, std::min(u.vecsize, 4));
+	if (u.columns > 1) {
+		if (u.columns == rows) {
+			static const GLenum squareTypes[] = { GL_FLOAT_MAT2, GL_FLOAT_MAT3, GL_FLOAT_MAT4 };
+			return (u.columns >= 2 && u.columns <= 4) ? squareTypes[u.columns - 2] : GL_FLOAT_MAT4;
+		}
+		static const GLenum matrixTypes[4][4] = {
+			{ 0, 0, 0, 0 },
+			{ 0, 0, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4 },
+			{ 0, GL_FLOAT_MAT3x2, 0, GL_FLOAT_MAT3x4 },
+			{ 0, GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, 0 }
+		};
+		if (u.columns >= 2 && u.columns <= 4 && rows >= 2 && rows <= 4)
+			return matrixTypes[u.columns][rows];
+	}
+	static const GLenum floatTypes[] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
+	static const GLenum intTypes[] = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
+	static const GLenum uintTypes[] = { GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4 };
+	static const GLenum boolTypes[] = { GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4 };
+	const size_t componentIndex = (size_t)rows - 1;
+	switch (u.kind) {
+		case TranslatedUniform::Int: return intTypes[componentIndex];
+		case TranslatedUniform::UInt: return uintTypes[componentIndex];
+		case TranslatedUniform::Bool: return boolTypes[componentIndex];
+		default: return floatTypes[componentIndex];
+	}
+}
+
+static std::string activeUniformName(const TranslatedUniform &u) {
+	return u.array_size > 1 ? u.name + "[0]" : u.name;
+}
+
 // MARK: - Program objects
 
 GLuint glCreateProgram(void) {
@@ -112,6 +155,7 @@ void glLinkProgram(GLuint program) {
 	p.vertex_function_flipped = nil;
 	p.attribs.clear();
 	p.uniforms.clear();
+	p.active_uniforms.clear();
 	p.locations.clear();
 	p.uniform_data[0].clear();
 	p.uniform_data[1].clear();
@@ -236,6 +280,39 @@ void glLinkProgram(GLuint program) {
 		p.blocks.push_back(pb);
 	}
 
+	// GL_ACTIVE_UNIFORMS includes both default-block uniforms and named-block members.
+	// Only the former have locations and can be modified through glUniform*.
+	for (const ProgramUniform &uniform : p.uniforms) {
+		ActiveUniformInfo active;
+		active.name = activeUniformName(uniform.info);
+		active.type = activeUniformGLType(uniform.info);
+		active.size = uniform.info.array_size;
+		active.block_index = -1;
+		const TranslatedUniform::Stage &stage = uniform.info.stage[uniform.info.stage[0].present ? 0 : 1];
+		active.offset = (GLint)stage.offset;
+		active.array_stride = (GLint)stage.array_stride;
+		active.matrix_stride = (GLint)stage.matrix_stride;
+		active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+		p.active_uniforms.push_back(std::move(active));
+	}
+	for (size_t blockIndex = 0; blockIndex < p.blocks.size(); ++blockIndex) {
+		ProgramBlock &block = p.blocks[blockIndex];
+		for (const TranslatedUniform &member : block.info.members) {
+			ActiveUniformInfo active;
+			active.name = activeUniformName(member);
+			active.type = activeUniformGLType(member);
+			active.size = member.array_size;
+			active.block_index = (GLint)blockIndex;
+			const TranslatedUniform::Stage &stage = member.stage[member.stage[0].present ? 0 : 1];
+			active.offset = (GLint)stage.offset;
+			active.array_stride = (GLint)stage.array_stride;
+			active.matrix_stride = (GLint)stage.matrix_stride;
+			active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+			block.active_uniform_indices.push_back((GLuint)p.active_uniforms.size());
+			p.active_uniforms.push_back(std::move(active));
+		}
+	}
+
 	p.vertex_function = vertexFunction;
 	p.fragment_function = fragmentFunction;
 	p.vertex_function_flipped = flippedFunction;
@@ -315,12 +392,12 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 			break;
 		}
 		case GL_ACTIVE_UNIFORMS:
-			*params = (GLint)p->uniforms.size();
+			*params = (GLint)p->active_uniforms.size();
 			break;
 		case GL_ACTIVE_UNIFORM_MAX_LENGTH: {
 			size_t longest = 0;
-			for (const ProgramUniform &u : p->uniforms) {
-				longest = std::max(longest, u.info.name.size() + 1);
+			for (const ActiveUniformInfo &uniform : p->active_uniforms) {
+				longest = std::max(longest, uniform.name.size() + 1);
 			}
 			*params = (GLint)longest;
 			break;

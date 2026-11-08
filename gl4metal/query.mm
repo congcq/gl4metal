@@ -5,8 +5,8 @@
 static std::unordered_map<GLuint, GLenum> sQueries; // name -> target of the last glBeginQuery (0 = never used)
 static GLuint sNextQuery = 0;
 
-static GLuint64 queryResult(GLuint id) {
-	auto it = sQueries.find(id);
+static GLuint64 queryResult(GLuint objectName) {
+	auto it = sQueries.find(objectName);
 	if (it == sQueries.end()) {
 		return 0;
 	}
@@ -26,12 +26,12 @@ void glDeleteQueries(GLsizei n, const GLuint *ids) {
 	}
 }
 
-GLboolean glIsQuery(GLuint id) {
-	return sQueries.find(id) != sQueries.end();
+GLboolean glIsQuery(GLuint objectName) {
+	return sQueries.find(objectName) != sQueries.end();
 }
 
-void glBeginQuery(GLenum target, GLuint id) {
-	auto it = sQueries.find(id);
+void glBeginQuery(GLenum target, GLuint objectName) {
+	auto it = sQueries.find(objectName);
 	if (it != sQueries.end()) {
 		it->second = target;
 	}
@@ -40,8 +40,8 @@ void glBeginQuery(GLenum target, GLuint id) {
 void glEndQuery(GLenum target) {
 }
 
-void glQueryCounter(GLuint id, GLenum target) {
-	auto it = sQueries.find(id);
+void glQueryCounter(GLuint objectName, GLenum target) {
+	auto it = sQueries.find(objectName);
 	if (it != sQueries.end()) {
 		it->second = target;
 	}
@@ -51,25 +51,25 @@ void glGetQueryiv(GLenum target, GLenum pname, GLint *params) {
 	*params = (pname == GL_QUERY_COUNTER_BITS) ? 64 : 0; // GL_CURRENT_QUERY: no query is ever active
 }
 
-void glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params) {
-	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLint)queryResult(id);
+void glGetQueryObjectiv(GLuint objectName, GLenum pname, GLint *params) {
+	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLint)queryResult(objectName);
 }
 
-void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) {
-	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLuint)queryResult(id);
+void glGetQueryObjectuiv(GLuint objectName, GLenum pname, GLuint *params) {
+	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLuint)queryResult(objectName);
 }
 
-void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params) {
-	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLint64)queryResult(id);
+void glGetQueryObjecti64v(GLuint objectName, GLenum pname, GLint64 *params) {
+	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : (GLint64)queryResult(objectName);
 }
 
-void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params) {
-	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : queryResult(id);
+void glGetQueryObjectui64v(GLuint objectName, GLenum pname, GLuint64 *params) {
+	*params = (pname == GL_QUERY_RESULT_AVAILABLE) ? GL_TRUE : queryResult(objectName);
 }
 
 // MARK: - Conditional rendering
 
-void glBeginConditionalRender(GLuint id, GLenum mode) {
+void glBeginConditionalRender(GLuint objectName, GLenum mode) {
 	// everything is drawn
 }
 

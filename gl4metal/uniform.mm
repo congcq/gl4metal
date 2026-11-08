@@ -282,37 +282,41 @@ void glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
 
 void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
 	auto it = ctx.program_objects.find(program);
-	if (it == ctx.program_objects.end() || index >= it->second.uniforms.size()) {
+	if (it == ctx.program_objects.end() || index >= it->second.active_uniforms.size()) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetActiveUniform: invalid program %u or uniform index %u (GL_INVALID_VALUE)", program, index);
-		if (length) {
-			*length = 0;
-		}
+		if (length) *length = 0;
 		return;
 	}
-	const TranslatedUniform &u = it->second.uniforms[index].info;
-	if (size) {
-		*size = u.array_size;
-	}
-	if (type) {
-		*type = glTypeOf(u);
-	}
-	copyGLString(activeName(u), bufSize, length, name);
+	const ActiveUniformInfo &uniform = it->second.active_uniforms[index];
+	if (size) *size = uniform.size;
+	if (type) *type = uniform.type;
+	copyGLString(uniform.name, bufSize, length, name);
 }
 
 void glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices) {
+	if (uniformCount < 0 || (uniformCount > 0 && (!uniformNames || !uniformIndices))) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || !it->second.linked) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		for (GLsizei i = 0; i < uniformCount; ++i) uniformIndices[i] = GL_INVALID_INDEX;
+		return;
+	}
 	for (GLsizei i = 0; i < uniformCount; i++) {
 		uniformIndices[i] = GL_INVALID_INDEX;
-		if (it == ctx.program_objects.end()) {
-			continue;
-		}
+		if (!uniformNames[i]) continue;
 		std::string wanted(uniformNames[i]);
-		if (wanted.size() > 3 && wanted.compare(wanted.size() - 3, 3, "[0]") == 0) {
-			wanted.resize(wanted.size() - 3);
-		}
-		for (size_t k = 0; k < it->second.uniforms.size(); k++) {
-			if (it->second.uniforms[k].info.name == wanted) {
+		const size_t bracket = wanted.find('[');
+		if (bracket != std::string::npos && wanted.back() == ']') wanted.resize(bracket);
+		for (size_t k = 0; k < it->second.active_uniforms.size(); k++) {
+			const ActiveUniformInfo &active = it->second.active_uniforms[k];
+			std::string activeBase = active.name;
+			const size_t activeBracket = activeBase.find('[');
+			if (activeBracket != std::string::npos) activeBase.resize(activeBracket);
+			if (activeBase == wanted) {
 				uniformIndices[i] = (GLuint)k;
 				break;
 			}
@@ -321,26 +325,36 @@ void glGetUniformIndices(GLuint program, GLsizei uniformCount, const GLchar *con
 }
 
 void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params) {
+	if (uniformCount < 0 || (uniformCount > 0 && (!uniformIndices || !params))) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
+	if (it == ctx.program_objects.end() || !it->second.linked) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (params) for (GLsizei i = 0; i < uniformCount; ++i) params[i] = 0;
+		return;
+	}
 	for (GLsizei i = 0; i < uniformCount; i++) {
-		params[i] = 0;
-		if (it == ctx.program_objects.end() || uniformIndices[i] >= it->second.uniforms.size()) {
+		if (uniformIndices[i] >= it->second.active_uniforms.size()) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			params[i] = 0;
 			continue;
 		}
-		const TranslatedUniform &u = it->second.uniforms[uniformIndices[i]].info;
-		const TranslatedUniform::Stage &st = u.stage[u.stage[0].present ? 0 : 1];
+		const ActiveUniformInfo &uniform = it->second.active_uniforms[uniformIndices[i]];
 		switch (pname) {
-			case GL_UNIFORM_TYPE:          params[i] = (GLint)glTypeOf(u); break;
-			case GL_UNIFORM_SIZE:          params[i] = u.array_size; break;
-			case GL_UNIFORM_NAME_LENGTH:   params[i] = (GLint)activeName(u).size() + 1; break;
-			case GL_UNIFORM_BLOCK_INDEX:   params[i] = -1; break; // members of the default block
-			case GL_UNIFORM_OFFSET:        params[i] = (GLint)st.offset; break;
-			case GL_UNIFORM_ARRAY_STRIDE:  params[i] = (GLint)st.array_stride; break;
-			case GL_UNIFORM_MATRIX_STRIDE: params[i] = (GLint)st.matrix_stride; break;
-			case GL_UNIFORM_IS_ROW_MAJOR:  params[i] = 0; break;
+			case GL_UNIFORM_TYPE: params[i] = (GLint)uniform.type; break;
+			case GL_UNIFORM_SIZE: params[i] = uniform.size; break;
+			case GL_UNIFORM_NAME_LENGTH: params[i] = (GLint)uniform.name.size() + 1; break;
+			case GL_UNIFORM_BLOCK_INDEX: params[i] = uniform.block_index; break;
+			case GL_UNIFORM_OFFSET: params[i] = uniform.offset; break;
+			case GL_UNIFORM_ARRAY_STRIDE: params[i] = uniform.array_stride; break;
+			case GL_UNIFORM_MATRIX_STRIDE: params[i] = uniform.matrix_stride; break;
+			case GL_UNIFORM_IS_ROW_MAJOR: params[i] = uniform.row_major ? GL_TRUE : GL_FALSE; break;
 			default:
 				gl4metalSetError(GL_INVALID_ENUM);
 				GL4METAL_LOG("glGetActiveUniformsiv: unhandled pname 0x%X", pname);
+				params[i] = 0;
 				break;
 		}
 	}
@@ -348,46 +362,48 @@ void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint *u
 
 void glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformName) {
 	auto it = ctx.program_objects.find(program);
-	if (it == ctx.program_objects.end() || uniformIndex >= it->second.uniforms.size()) {
-		if (length) {
-			*length = 0;
-		}
+	if (it == ctx.program_objects.end() || uniformIndex >= it->second.active_uniforms.size()) {
+		if (length) *length = 0;
 		return;
 	}
-	copyGLString(activeName(it->second.uniforms[uniformIndex].info), bufSize, length, uniformName);
+	copyGLString(it->second.active_uniforms[uniformIndex].name, bufSize, length, uniformName);
 }
 
 // MARK: - Uniform blocks
 
 GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName) {
 	auto it = ctx.program_objects.find(program);
-	if (it == ctx.program_objects.end() || !it->second.linked || !uniformBlockName) {
-		return GL_INVALID_INDEX;
-	}
+	if (it == ctx.program_objects.end() || !it->second.linked || !uniformBlockName) return GL_INVALID_INDEX;
 	for (size_t i = 0; i < it->second.blocks.size(); i++) {
-		if (it->second.blocks[i].info.name == uniformBlockName) {
-			return (GLuint)i;
-		}
+		if (it->second.blocks[i].info.name == uniformBlockName) return (GLuint)i;
 	}
 	return GL_INVALID_INDEX;
 }
 
 void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params) {
 	auto it = ctx.program_objects.find(program);
+	if (!params) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	if (it == ctx.program_objects.end() || uniformBlockIndex >= it->second.blocks.size()) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetActiveUniformBlockiv: invalid program %u or block %u", program, uniformBlockIndex);
 		*params = 0;
 		return;
 	}
-	const ProgramBlock &b = it->second.blocks[uniformBlockIndex];
+	const ProgramBlock &block = it->second.blocks[uniformBlockIndex];
 	switch (pname) {
-		case GL_UNIFORM_BLOCK_BINDING:                     *params = (GLint)b.binding_point; break;
-		case GL_UNIFORM_BLOCK_DATA_SIZE:                   *params = (GLint)b.info.size; break;
-		case GL_UNIFORM_BLOCK_NAME_LENGTH:                 *params = (GLint)b.info.name.size() + 1; break;
-		case GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS:             *params = 0; break; // members are not reflected yet
-		case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:   *params = b.info.stage[0].present; break;
-		case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: *params = b.info.stage[1].present; break;
+		case GL_UNIFORM_BLOCK_BINDING: *params = (GLint)block.binding_point; break;
+		case GL_UNIFORM_BLOCK_DATA_SIZE: *params = (GLint)block.info.size; break;
+		case GL_UNIFORM_BLOCK_NAME_LENGTH: *params = (GLint)block.info.name.size() + 1; break;
+		case GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS: *params = (GLint)block.active_uniform_indices.size(); break;
+		case GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES:
+			for (size_t i = 0; i < block.active_uniform_indices.size(); ++i)
+				params[i] = (GLint)block.active_uniform_indices[i];
+			break;
+		case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER: *params = block.info.stage[0].present; break;
+		case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: *params = block.info.stage[1].present; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetActiveUniformBlockiv: unhandled pname 0x%X", pname);

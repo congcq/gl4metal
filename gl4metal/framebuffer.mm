@@ -35,19 +35,33 @@ static bool isDepthStencilFormatForFBO(MTLPixelFormat format) {
 	return isDepthFormat(format) || isStencilFormat(format);
 }
 
+static bool hasAttachment(const FBOAttachment &a) {
+	return a.texture != 0 || a.renderbuffer != 0;
+}
+
 static id<MTLTexture> attachmentTexture(const FBOAttachment &a) {
-	if (a.texture == 0 || a.level < 0) return nil;
-	auto it = ctx.texture_objects.find(a.texture);
-	if (it == ctx.texture_objects.end() || !it->second.texture) return nil;
-	id<MTLTexture> texture = it->second.texture;
-	if (texture.textureType != MTLTextureType2D || (NSUInteger)a.level >= texture.mipmapLevelCount ||
+	if (!hasAttachment(a) || a.level < 0 || (a.texture != 0 && a.renderbuffer != 0)) return nil;
+	id<MTLTexture> texture = nil;
+	if (a.renderbuffer != 0) {
+		auto object = ctx.renderbuffer_objects.find(a.renderbuffer);
+		if (object == ctx.renderbuffer_objects.end() || !object->second.initialized || !object->second.texture || a.level != 0) return nil;
+		texture = object->second.texture;
+	} else {
+		auto object = ctx.texture_objects.find(a.texture);
+		if (object == ctx.texture_objects.end() || !object->second.texture) return nil;
+		texture = object->second.texture;
+		if ((NSUInteger)a.level >= texture.mipmapLevelCount) return nil;
+	}
+	if ((texture.textureType != MTLTextureType2D && texture.textureType != MTLTextureType2DMultisample) ||
 		(texture.usage & MTLTextureUsageRenderTarget) == 0) return nil;
+	if (texture.textureType == MTLTextureType2DMultisample && a.level != 0) return nil;
 	return texture;
 }
 
-static bool checkFBOAttachment(const FBOAttachment &a, int role, NSUInteger &width, NSUInteger &height, bool &haveExtent) {
+static bool checkFBOAttachment(const FBOAttachment &a, int role, NSUInteger &width, NSUInteger &height,
+	NSUInteger &sampleCount, bool &haveExtent, bool &haveSamples, bool &sampleMismatch) {
 	// role: 0=color, 1=depth, 2=stencil. An unattached point is valid.
-	if (a.texture == 0) return true;
+	if (!hasAttachment(a)) return true;
 	id<MTLTexture> texture = attachmentTexture(a);
 	if (!texture) return false;
 	const MTLPixelFormat format = texture.pixelFormat;
@@ -61,6 +75,13 @@ static bool checkFBOAttachment(const FBOAttachment &a, int role, NSUInteger &wid
 		height = levelHeight;
 		haveExtent = true;
 	} else if (width != levelWidth || height != levelHeight) {
+		return false;
+	}
+	if (!haveSamples) {
+		sampleCount = texture.sampleCount;
+		haveSamples = true;
+	} else if (sampleCount != texture.sampleCount) {
+		sampleMismatch = true;
 		return false;
 	}
 	return true;
@@ -143,6 +164,7 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 	}
 	ctx.pass_depth_format = MTLPixelFormatInvalid;
 	ctx.pass_stencil_format = MTLPixelFormatInvalid;
+	ctx.pass_sample_count = 1;
 	ctx.pass_flipped = (ctx.draw_fbo != 0);
 
 	if (ctx.draw_fbo == 0) {
@@ -223,6 +245,7 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 			if (!any) {
 				rtWidth = std::max<NSUInteger>(tex.width >> a.level, 1);
 				rtHeight = std::max<NSUInteger>(tex.height >> a.level, 1);
+				ctx.pass_sample_count = tex.sampleCount;
 			}
 			any = true;
 		}
@@ -238,6 +261,7 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 			if (!any) {
 				rtWidth = std::max<NSUInteger>(depth.width >> fbo.depth.level, 1);
 				rtHeight = std::max<NSUInteger>(depth.height >> fbo.depth.level, 1);
+				ctx.pass_sample_count = depth.sampleCount;
 			}
 			any = true;
 		}
@@ -283,26 +307,26 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 
 void glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = ++ctx.next_fbo_id;
-		ctx.fbo_objects[id] = FBO();
-		framebuffers[i] = id;
+		GLuint objectName = ++ctx.next_fbo_id;
+		ctx.fbo_objects[objectName] = FBO();
+		framebuffers[i] = objectName;
 	}
 }
 
 void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint id = framebuffers[i];
-		if (id == 0) {
+		GLuint objectName = framebuffers[i];
+		if (objectName == 0) {
 			continue;
 		}
-		if (ctx.draw_fbo == id) {
+		if (ctx.draw_fbo == objectName) {
 			endRenderEncoder();
 			ctx.draw_fbo = 0; // GL falls back to the default framebuffer
 		}
-		if (ctx.read_fbo == id) {
+		if (ctx.read_fbo == objectName) {
 			ctx.read_fbo = 0;
 		}
-		ctx.fbo_objects.erase(id);
+		ctx.fbo_objects.erase(objectName);
 	}
 }
 
@@ -344,24 +368,30 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 		GL4METAL_LOG("glCheckFramebufferStatus: invalid target 0x%X", target);
 		return 0;
 	}
-	GLuint id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (id == 0) {
+	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (objectName == 0) {
 		return GL_FRAMEBUFFER_COMPLETE; // the layer drawable is always complete
 	}
-	auto it = ctx.fbo_objects.find(id);
+	auto it = ctx.fbo_objects.find(objectName);
 	if (it == ctx.fbo_objects.end()) return GL_FRAMEBUFFER_UNDEFINED;
 	const FBO &fbo = it->second;
 	bool any = false;
 	bool haveExtent = false;
-	NSUInteger width = 0, height = 0;
+	bool haveSamples = false;
+	bool sampleMismatch = false;
+	NSUInteger width = 0, height = 0, sampleCount = 1;
 	auto check = [&](const FBOAttachment &a, int role) -> bool {
-		if (a.texture == 0) return true;
+		if (!hasAttachment(a)) return true;
 		any = true;
-		return checkFBOAttachment(a, role, width, height, haveExtent);
+		return checkFBOAttachment(a, role, width, height, sampleCount, haveExtent, haveSamples, sampleMismatch);
 	};
-	if (!check(fbo.depth, 1) || !check(fbo.stencil, 2)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+	if (!check(fbo.depth, 1) || !check(fbo.stencil, 2)) {
+		return sampleMismatch ? GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE : GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+	}
 	for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
-		if (!check(fbo.color[i], 0)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+		if (!check(fbo.color[i], 0)) {
+			return sampleMismatch ? GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE : GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+		}
 	}
 	if (!any) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
 	// Metal cannot render/read into a missing attachment selected by GL's draw/read buffer state.
@@ -370,14 +400,14 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 			const GLenum drawBuffer = fbo.draw_buffers[i];
 			if (drawBuffer == GL_NONE) continue;
 			if (drawBuffer < GL_COLOR_ATTACHMENT0 || drawBuffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS ||
-				fbo.color[drawBuffer - GL_COLOR_ATTACHMENT0].texture == 0) {
+				!hasAttachment(fbo.color[drawBuffer - GL_COLOR_ATTACHMENT0])) {
 				return GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER;
 			}
 		}
 	}
 	if (target == GL_READ_FRAMEBUFFER && fbo.read_buffer != GL_NONE) {
 		if (fbo.read_buffer < GL_COLOR_ATTACHMENT0 || fbo.read_buffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS ||
-			fbo.color[fbo.read_buffer - GL_COLOR_ATTACHMENT0].texture == 0) {
+			!hasAttachment(fbo.color[fbo.read_buffer - GL_COLOR_ATTACHMENT0])) {
 			return GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER;
 		}
 	}
@@ -391,6 +421,7 @@ void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLin
 }
 
 void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glFramebufferTexture1D: Unimplemented");
 }
 
@@ -405,8 +436,8 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		GL4METAL_LOG("glFramebufferTexture2D: negative mip level %d", level);
 		return;
 	}
-	GLuint id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (id == 0) {
+	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (objectName == 0) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glFramebufferTexture2D: the default framebuffer is bound (GL_INVALID_OPERATION)");
 		return;
@@ -424,9 +455,10 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 			return;
 		}
 	}
-	FBO &fbo = ctx.fbo_objects[id];
+	FBO &fbo = ctx.fbo_objects[objectName];
 	FBOAttachment a;
 	a.texture = texture;
+	a.renderbuffer = 0;
 	a.level = level;
 
 	if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
@@ -443,30 +475,72 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		GL4METAL_LOG("glFramebufferTexture2D: invalid attachment 0x%X", attachment);
 		return;
 	}
-	if (id == ctx.draw_fbo) {
+	if (objectName == ctx.draw_fbo) {
 		endRenderEncoder(); // the open render pass was built from the old attachments
 	}
 }
 
 void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glFramebufferTexture3D: Unimplemented");
 }
 
 void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	GL4METAL_LOG("glFramebufferTextureLayer: Unimplemented");
 }
 
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
-	GL4METAL_LOG("glFramebufferRenderbuffer: Unimplemented");
+	if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (renderbuffertarget != GL_RENDERBUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	GLuint framebufferName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (framebufferName == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	if (renderbuffer != 0) {
+		auto object = ctx.renderbuffer_objects.find(renderbuffer);
+		if (object == ctx.renderbuffer_objects.end() || !object->second.initialized) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+	}
+	FBOAttachment newAttachment;
+	newAttachment.renderbuffer = renderbuffer;
+	FBO &fbo = ctx.fbo_objects[framebufferName];
+	if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		fbo.color[attachment - GL_COLOR_ATTACHMENT0] = newAttachment;
+	} else if (attachment == GL_DEPTH_ATTACHMENT) {
+		fbo.depth = newAttachment;
+	} else if (attachment == GL_STENCIL_ATTACHMENT) {
+		fbo.stencil = newAttachment;
+	} else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+		fbo.depth = newAttachment;
+		fbo.stencil = newAttachment;
+	} else {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (framebufferName == ctx.draw_fbo) endRenderEncoder();
 }
 
 void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
-	GLuint id = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
-	if (id == 0) { // default framebuffer
+	if (!params || (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER)) {
+		gl4metalSetError(!params ? GL_INVALID_VALUE : GL_INVALID_ENUM);
+		return;
+	}
+	GLuint objectName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (objectName == 0) { // default framebuffer
 		*params = (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) ? GL_FRAMEBUFFER_DEFAULT : 0;
 		return;
 	}
-	auto it = ctx.fbo_objects.find(id);
+	auto it = ctx.fbo_objects.find(objectName);
 	if (it == ctx.fbo_objects.end()) {
 		*params = 0;
 		return;
@@ -481,9 +555,15 @@ void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLe
 		a = &fbo.stencil;
 	}
 	switch (pname) {
-		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: *params = (a && a->texture) ? GL_TEXTURE : GL_NONE; break;
-		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: *params = a ? (GLint)a->texture : 0; break;
-		case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: *params = a ? a->level : 0; break;
+		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE:
+			*params = !a ? GL_NONE : a->texture ? GL_TEXTURE : a->renderbuffer ? GL_RENDERBUFFER : GL_NONE;
+			break;
+		case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME:
+			*params = !a ? 0 : (GLint)(a->texture ? a->texture : a->renderbuffer);
+			break;
+		case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:
+			*params = (a && a->texture) ? a->level : 0;
+			break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetFramebufferAttachmentParameteriv: unhandled pname 0x%X", pname);

@@ -1,7 +1,10 @@
 #import "state.h"
 
+#include <cmath>
+
 // Fixed-function state Metal has no equivalent for (or that is not wired up yet): accepted, reported once, ignored.
 static void notSupported(const char *name) {
+	gl4metalSetError(GL_INVALID_OPERATION);
 	static std::unordered_set<std::string> reported;
 	if (reported.insert(name).second) {
 		GL4METAL_LOG("%s: not supported by the Metal layer, ignored (reported once)", name);
@@ -70,47 +73,105 @@ void glDepthRange(GLdouble n, GLdouble f) {
 
 // MARK: - Stencil
 
+static bool validStencilFace(GLenum face) {
+	return face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK;
+}
+
+static bool validStencilFunc(GLenum func) {
+	switch (func) {
+		case GL_NEVER: case GL_LESS: case GL_EQUAL: case GL_LEQUAL:
+		case GL_GREATER: case GL_NOTEQUAL: case GL_GEQUAL: case GL_ALWAYS: return true;
+		default: return false;
+	}
+}
+
+static bool validStencilOp(GLenum op) {
+	switch (op) {
+		case GL_KEEP: case GL_ZERO: case GL_REPLACE: case GL_INCR: case GL_INCR_WRAP:
+		case GL_DECR: case GL_DECR_WRAP: case GL_INVERT: return true;
+		default: return false;
+	}
+}
+
+static void setStencilFuncForFace(MTLContext::StencilFaceState &state, GLenum func, GLint ref, GLuint mask) {
+	state.func = func;
+	state.ref = ref;
+	state.value_mask = mask;
+}
+
 void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
-	notSupported("glStencilFunc");
+	glStencilFuncSeparate(GL_FRONT_AND_BACK, func, ref, mask);
 }
 
 void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
-	notSupported("glStencilFuncSeparate");
+	if (!validStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (!validStencilFunc(func)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (face == GL_FRONT || face == GL_FRONT_AND_BACK) setStencilFuncForFace(ctx.stencil_front, func, ref, mask);
+	if (face == GL_BACK || face == GL_FRONT_AND_BACK) setStencilFuncForFace(ctx.stencil_back, func, ref, mask);
+	updateDepthStencilState();
+}
+
+static void setStencilOpsForFace(MTLContext::StencilFaceState &state, GLenum fail, GLenum depthFail, GLenum depthPass) {
+	state.fail = fail; state.depth_fail = depthFail; state.depth_pass = depthPass;
 }
 
 void glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) {
-	notSupported("glStencilOp");
+	glStencilOpSeparate(GL_FRONT_AND_BACK, fail, zfail, zpass);
 }
 
 void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass) {
-	notSupported("glStencilOpSeparate");
+	if (!validStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (!validStencilOp(sfail) || !validStencilOp(dpfail) || !validStencilOp(dppass)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (face == GL_FRONT || face == GL_FRONT_AND_BACK) setStencilOpsForFace(ctx.stencil_front, sfail, dpfail, dppass);
+	if (face == GL_BACK || face == GL_FRONT_AND_BACK) setStencilOpsForFace(ctx.stencil_back, sfail, dpfail, dppass);
+	updateDepthStencilState();
 }
 
 void glStencilMask(GLuint mask) {
-	notSupported("glStencilMask");
+	glStencilMaskSeparate(GL_FRONT_AND_BACK, mask);
 }
 
 void glStencilMaskSeparate(GLenum face, GLuint mask) {
-	notSupported("glStencilMaskSeparate");
+	if (!validStencilFace(face)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (face == GL_FRONT || face == GL_FRONT_AND_BACK) ctx.stencil_front.write_mask = mask;
+	if (face == GL_BACK || face == GL_FRONT_AND_BACK) ctx.stencil_back.write_mask = mask;
+	updateDepthStencilState();
 }
 
 // MARK: - Color write mask
 
 void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
-	ctx.color_mask[0] = red;
-	ctx.color_mask[1] = green;
-	ctx.color_mask[2] = blue;
-	ctx.color_mask[3] = alpha;
+	const GLboolean values[4] = { red, green, blue, alpha };
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment)
+		for (int component = 0; component < 4; ++component)
+			ctx.color_masks[attachment][component] = values[component];
+	for (int component = 0; component < 4; ++component)
+		ctx.color_mask[component] = values[component];
 }
 
 void glColorMaski(GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
-	if (index == 0) { // one mask for all draw buffers for now
-		glColorMask(r, g, b, a);
+	if (index >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	const GLboolean values[4] = { r, g, b, a };
+	for (int component = 0; component < 4; ++component)
+		ctx.color_masks[index][component] = values[component];
+	if (index == 0) {
+		for (int component = 0; component < 4; ++component)
+			ctx.color_mask[component] = values[component];
 	}
 }
 
 void glClampColor(GLenum target, GLenum clamp) {
-	notSupported("glClampColor");
+	if (target != GL_CLAMP_READ_COLOR && target != GL_CLAMP_VERTEX_COLOR && target != GL_CLAMP_FRAGMENT_COLOR) {
+		gl4metalSetError(GL_INVALID_ENUM); return;
+	}
+	if (clamp != GL_TRUE && clamp != GL_FALSE && clamp != GL_FIXED_ONLY) {
+		gl4metalSetError(GL_INVALID_ENUM); return;
+	}
+	// Metal's normalized render-target formats clamp on write; floating-point targets preserve range.
+	// The legacy per-stage clamp controls have no direct Metal fixed-function equivalent.
 }
 
 // MARK: - Rasterization
@@ -142,6 +203,7 @@ void glPolygonMode(GLenum face, GLenum mode) {
 		return;
 	}
 	if (mode == GL_POINT) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glPolygonMode(GL_POINT): point polygon mode is not implemented; state unchanged");
 		return;
 	}
@@ -154,11 +216,15 @@ void glPolygonOffset(GLfloat factor, GLfloat units) {
 }
 
 void glLineWidth(GLfloat width) {
-	notSupported("glLineWidth");
+	if (!(width > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	// Metal exposes line primitives with a fixed 1-pixel width on iOS. Its GL range is [1, 1].
+	if (width != 1.0f) GL4METAL_LOG("glLineWidth: iOS Metal supports width 1 only; requested width is clamped");
 }
 
 void glPointSize(GLfloat size) {
-	notSupported("glPointSize");
+	if (!(size > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	// This backend currently maps GL_POINTS to Metal point primitives at fixed size 1.
+	if (size != 1.0f) GL4METAL_LOG("glPointSize: point-size output is not available in the current MSL vertex interface");
 }
 
 void glPointParameterf(GLenum pname, GLfloat param) {
@@ -182,21 +248,33 @@ void glProvokingVertex(GLenum mode) {
 }
 
 void glPrimitiveRestartIndex(GLuint index) {
-	notSupported("glPrimitiveRestartIndex");
+	ctx.primitive_restart_index = index;
 }
 
 void glHint(GLenum target, GLenum mode) {
-	notSupported("glHint");
+	const bool validTarget = target == GL_PERSPECTIVE_CORRECTION_HINT || target == GL_POINT_SMOOTH_HINT ||
+		target == GL_LINE_SMOOTH_HINT || target == GL_POLYGON_SMOOTH_HINT || target == GL_FOG_HINT ||
+		target == GL_TEXTURE_COMPRESSION_HINT || target == GL_GENERATE_MIPMAP_HINT;
+	if (!validTarget) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (mode != GL_FASTEST && mode != GL_NICEST && mode != GL_DONT_CARE) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	// Performance hints do not change rendered results; Metal owns the corresponding optimization choices.
 }
 
 // MARK: - Multisample
 
 void glSampleCoverage(GLfloat value, GLboolean invert) {
-	notSupported("glSampleCoverage");
+	if (std::isnan(value)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (value < 0.0f || value > 1.0f) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	// Metal iOS has no encoder-level sample-coverage control. Do not claim to apply it.
+	gl4metalSetError(GL_INVALID_OPERATION);
+	GL4METAL_LOG("glSampleCoverage: sample coverage is not currently emulated by this Metal backend");
 }
 
 void glSampleMaski(GLuint maskNumber, GLbitfield mask) {
-	notSupported("glSampleMaski");
+	if (maskNumber != 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	// MSL sample-mask output can emulate this, but the translator does not currently inject it.
+	gl4metalSetError(GL_INVALID_OPERATION);
+	GL4METAL_LOG("glSampleMaski: sample-mask emulation is not available in the current shader translator");
 }
 
 // MARK: - Viewport / scissor

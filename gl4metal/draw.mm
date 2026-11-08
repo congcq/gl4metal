@@ -4,6 +4,7 @@
 #include <atomic>
 #include <limits>
 #include <new>
+#include <array>
 
 // These caches are process-wide / context-wide and may be reached by more than one
 // JVM thread. std::unordered_map and std::unordered_set do not support concurrent
@@ -16,11 +17,21 @@ static std::mutex fallbackTextureMutex;
 static std::mutex fallbackSamplerMutex;
 
 static bool vertexFetchValidationEnabled() {
-	// Always protect GPU vertex fetches by default. Set this to 0 only for a controlled
-	// performance comparison after the driver has been validated on the target device.
+	// Full validation scans all indices on the CPU for every indexed draw. Keep it opt-in
+	// for diagnostics; EBO byte-range validation remains enabled unconditionally.
 	static const bool enabled = [] {
 		const char *value = getenv("GL4METAL_VALIDATE_VERTEX_FETCH");
-		return !(value && value[0] == '0');
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool drawLabelingEnabled() {
+	// Formatting an NSString for every draw adds CPU and autorelease-pool pressure.
+	// Enable only while diagnosing a specific GPU command-buffer fault.
+	static const bool enabled = [] {
+		const char *value = getenv("GL4METAL_TRACE_DRAW_LABELS");
+		return value && value[0] == '1';
 	}();
 	return enabled;
 }
@@ -319,8 +330,12 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 		}
 	}
 	std::lock_guard<std::mutex> cacheLock(samplerCacheMutex);
+	// Reuse thread-local key storage; samplerFor is called for every active sampler on every draw.
+	static thread_local std::string samplerKeyScratch;
+	std::string &key = samplerKeyScratch;
+	key.clear();
+	if (key.capacity() < 128) key.reserve(128);
 	// Parameters of the texture, overridden by the sampler object bound to the unit (glBindSampler) when there is one.
-	std::string key;
 	putBytes(key, &minFilter, sizeof(minFilter));
 	putBytes(key, &magFilter, sizeof(magFilter));
 	putBytes(key, &wrapS, sizeof(wrapS));
@@ -447,7 +462,9 @@ struct ActiveAttrib {
 static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p, std::vector<ActiveAttrib> &attribs, const char *caller) {
 	std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
 	bool flip = ctx.pass_flipped;
-	bool blend = capOn(GL_BLEND);
+	bool blend = false;
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment)
+		blend = blend || ctx.blend_enabled[attachment];
 
 	NSUInteger slot = 0;
 	for (ActiveAttrib &aa : attribs) {
@@ -460,7 +477,11 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		aa.slot = slot++;
 	}
 
-	std::string key;
+	// Reuse key storage across draws. The unordered_map copies keys on insertion.
+	static thread_local std::string pipelineKeyScratch;
+	std::string &key = pipelineKeyScratch;
+	key.clear();
+	if (key.capacity() < 1024) key.reserve(1024);
 	auto put = [&key](uint64_t v) { putBytes(key, &v, sizeof(v)); };
 	put(programId);
 	put(flip ? 1 : 0);
@@ -469,12 +490,19 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	}
 	put((uint64_t)ctx.pass_depth_format);
 	put((uint64_t)ctx.pass_stencil_format);
+	put((uint64_t)ctx.pass_sample_count);
 	put(blend ? 1 : 0);
+	put(capOn(GL_SAMPLE_ALPHA_TO_COVERAGE) ? 1 : 0);
+	put(capOn(GL_SAMPLE_ALPHA_TO_ONE) ? 1 : 0);
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		put(ctx.blend_enabled[attachment] ? 1 : 0);
+		put((uint64_t)ctx.color_masks[attachment][0] | ((uint64_t)ctx.color_masks[attachment][1] << 1) |
+			((uint64_t)ctx.color_masks[attachment][2] << 2) | ((uint64_t)ctx.color_masks[attachment][3] << 3));
+	}
 	if (blend) {
 		put(ctx.blend_src_rgb); put(ctx.blend_dst_rgb); put(ctx.blend_src_alpha); put(ctx.blend_dst_alpha);
 		put(ctx.blend_eq_rgb); put(ctx.blend_eq_alpha);
 	}
-	put((uint64_t)ctx.color_mask[0] | ((uint64_t)ctx.color_mask[1] << 1) | ((uint64_t)ctx.color_mask[2] << 2) | ((uint64_t)ctx.color_mask[3] << 3));
 	for (const ActiveAttrib &aa : attribs) {
 		put(aa.pa->msl_location);
 		put((uint64_t)aa.format);
@@ -517,21 +545,22 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	d.vertexFunction = flip ? p.vertex_function_flipped : p.vertex_function;
 	d.fragmentFunction = p.fragment_function;
 	d.vertexDescriptor = vd;
-
-	MTLColorWriteMask mask = 0;
-	if (ctx.color_mask[0]) mask |= MTLColorWriteMaskRed;
-	if (ctx.color_mask[1]) mask |= MTLColorWriteMaskGreen;
-	if (ctx.color_mask[2]) mask |= MTLColorWriteMaskBlue;
-	if (ctx.color_mask[3]) mask |= MTLColorWriteMaskAlpha;
+	d.alphaToCoverageEnabled = capOn(GL_SAMPLE_ALPHA_TO_COVERAGE);
+	d.alphaToOneEnabled = capOn(GL_SAMPLE_ALPHA_TO_ONE);
 
 	for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
 		if (ctx.pass_color_format[i] == MTLPixelFormatInvalid) {
 			continue;
 		}
+		MTLColorWriteMask mask = 0;
+		if (ctx.color_masks[i][0]) mask |= MTLColorWriteMaskRed;
+		if (ctx.color_masks[i][1]) mask |= MTLColorWriteMaskGreen;
+		if (ctx.color_masks[i][2]) mask |= MTLColorWriteMaskBlue;
+		if (ctx.color_masks[i][3]) mask |= MTLColorWriteMaskAlpha;
 		MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
 		ca.pixelFormat = ctx.pass_color_format[i];
 		ca.writeMask = mask;
-		if (blend) {
+		if (ctx.blend_enabled[i]) {
 			ca.blendingEnabled = YES;
 			ca.sourceRGBBlendFactor = blendFactor(ctx.blend_src_rgb);
 			ca.destinationRGBBlendFactor = blendFactor(ctx.blend_dst_rgb);
@@ -543,6 +572,7 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	}
 	d.depthAttachmentPixelFormat = ctx.pass_depth_format;
 	d.stencilAttachmentPixelFormat = ctx.pass_stencil_format;
+	d.rasterSampleCount = std::max<NSUInteger>(1, ctx.pass_sample_count);
 
 	NSError *error = nil;
 	id<MTLRenderPipelineState> pipeline = [ctx.device newRenderPipelineStateWithDescriptor:d error:&error];
@@ -632,6 +662,10 @@ static bool validateVertexFetchRanges(const DrawCall &dc, const char *caller,
 			} else {
 				index = *entry;
 			}
+			if (capOn(GL_PRIMITIVE_RESTART) && index == (dc.indexType == GL_UNSIGNED_BYTE ? (ctx.primitive_restart_index & 0xFFu) :
+				(dc.indexType == GL_UNSIGNED_SHORT ? (ctx.primitive_restart_index & 0xFFFFu) : ctx.primitive_restart_index))) {
+				continue;
+			}
 			const int64_t effective = (int64_t)index + (int64_t)dc.baseVertex;
 			if (effective < 0) {
 				gl4metalSetError(GL_INVALID_OPERATION);
@@ -684,6 +718,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	if (dc.count == 0 || dc.instances == 0) return;
+	if (capOn(GL_RASTERIZER_DISCARD)) return;
 	if (!dc.indexed && dc.first < 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: negative first vertex %d (GL_INVALID_VALUE)", caller, dc.first);
@@ -727,7 +762,12 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 
 	// Vertex attributes of the current VAO, for the attributes this program reads.
 	VertexArray &vao = ctx.vao_objects[ctx.current_vao];
-	std::vector<ActiveAttrib> attribs;
+	// Reuse the active-attribute vector on the render thread; its capacity is stable for
+	// a linked program and avoids one heap allocation per GL draw call.
+	static thread_local std::vector<ActiveAttrib> attribScratch;
+	std::vector<ActiveAttrib> &attribs = attribScratch;
+	attribs.clear();
+	if (attribs.capacity() < p.attribs.size()) attribs.reserve(p.attribs.size());
 	for (const ProgramAttrib &pa : p.attribs) {
 		if (pa.gl_index < 0 || pa.gl_index >= 16) {
 			continue;
@@ -817,17 +857,21 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// Texture targets are drawn Y-flipped, which reverses the winding as seen by Metal.
 	bool ccw = (ctx.front_face == GL_CCW) != ctx.pass_flipped;
 
-	// The command-buffer label is only a hint: Metal reports the last encoded draw in the buffer,
-	// not necessarily the exact draw that first caused an asynchronous GPU page fault.
-	static std::atomic<uint64_t> drawSequence{0};
-	const uint64_t sequence = drawSequence.fetch_add(1, std::memory_order_relaxed) + 1;
-	NSString *drawLabel = [NSString stringWithFormat:
-		@"GL4Metal last-draw#%llu %s program=%u FBO=%u mode=0x%X indexed=%d count=%d instances=%d first=%d baseVertex=%d indexType=0x%X indexOffset=%lld",
-		(unsigned long long)sequence, caller, ctx.current_program, ctx.draw_fbo, dc.mode,
-		dc.indexed ? 1 : 0, dc.count, dc.instances, dc.first, dc.baseVertex, dc.indexType, (long long)dc.indexOffset];
-	if (ctx.currentCommandBuffer) ctx.currentCommandBuffer.label = drawLabel;
-	enc.label = drawLabel;
-	id<MTLDepthStencilState> activeDepthState = (ctx.pass_depth_format != MTLPixelFormatInvalid ? ctx.depthStencilState : ctx.no_depth_state);
+	// Per-draw NSString formatting and autorelease traffic are disabled in normal builds.
+	// The label remains available as an opt-in diagnostic when investigating GPU faults.
+	if (drawLabelingEnabled()) {
+		static std::atomic<uint64_t> drawSequence{0};
+		const uint64_t sequence = drawSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+		NSString *drawLabel = [NSString stringWithFormat:
+			@"GL4Metal last-draw#%llu %s program=%u FBO=%u mode=0x%X indexed=%d count=%d instances=%d first=%d baseVertex=%d indexType=0x%X indexOffset=%lld",
+			(unsigned long long)sequence, caller, ctx.current_program, ctx.draw_fbo, dc.mode,
+			dc.indexed ? 1 : 0, dc.count, dc.instances, dc.first, dc.baseVertex, dc.indexType, (long long)dc.indexOffset];
+		if (ctx.currentCommandBuffer) ctx.currentCommandBuffer.label = drawLabel;
+		enc.label = drawLabel;
+	}
+	id<MTLDepthStencilState> activeDepthState =
+		((ctx.pass_depth_format != MTLPixelFormatInvalid || ctx.pass_stencil_format != MTLPixelFormatInvalid)
+			? ctx.depthStencilState : ctx.no_depth_state);
 	if (!activeDepthState) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("%s: no valid Metal depth-stencil state; draw skipped", caller);
@@ -835,6 +879,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	}
 	[enc setRenderPipelineState:pipeline];
 	[enc setDepthStencilState:activeDepthState];
+	[enc setStencilFrontReferenceValue:(uint32_t)ctx.stencil_front.ref backReferenceValue:(uint32_t)ctx.stencil_back.ref];
 	[enc setFrontFacingWinding:ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];
 	[enc setCullMode:cull];
 	[enc setTriangleFillMode:ctx.polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
@@ -855,6 +900,31 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			[enc setVertexBuffer:aa.buffer offset:aa.offset atIndex:aa.slot];
 		}
 	}
+
+	// Record all GL buffers consumed by this draw in one locked batch. CPU updates can
+	// rename only in-flight storage without taking a mutex once per vertex attribute/UBO.
+	auto markActiveDrawBuffers = [&](GLuint elementBuffer) {
+		std::array<GLuint, 48> names{}; // 16 vertex streams + 28 combined-stage UBOs + one EBO
+		size_t count = 0;
+		auto appendUnique = [&](GLuint objectName) {
+			if (objectName == 0) return;
+			for (size_t index = 0; index < count; ++index) {
+				if (names[index] == objectName) return;
+			}
+			if (count < names.size()) names[count++] = objectName;
+		};
+		for (const ActiveAttrib &aa : attribs) {
+			if (aa.constant || !aa.pa || aa.pa->gl_index < 0 || aa.pa->gl_index >= 16) continue;
+			appendUnique(vao.attribs[aa.pa->gl_index].bound_vbo);
+		}
+		for (const ProgramBlock &block : p.blocks) {
+			if (block.info.stage[0].present || block.info.stage[1].present) {
+				appendUnique(ctx.uniform_buffer_bindings[block.binding_point].buffer);
+			}
+		}
+		appendUnique(elementBuffer);
+		markBuffersUsed(names.data(), count);
+	};
 
 	// Default uniform block, one CPU copy per stage (see glUniform*).
 	for (int s = 0; s < 2; s++) {
@@ -889,9 +959,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	}
 
 	// Uniform blocks: never leave an active MSL buffer slot unset or reuse a stale binding.
-	// The translator reserves 16...29 for real UBOs and 30 for GL's default uniform block.
-	std::unordered_set<uint32_t> usedVertexBlockSlots;
-	std::unordered_set<uint32_t> usedFragmentBlockSlots;
+	// The translator allocates MSL slots 16...29 per stage independently of GL binding points; slot 30 is the default block.
+	// MSL UBO slots are a small fixed range (16..29); stack bitsets avoid two
+	// unordered_set allocations and hash lookups on every draw.
+	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX - 16> usedVertexBlockSlots{};
+	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX - 16> usedFragmentBlockSlots{};
 	for (const ProgramBlock &block : p.blocks) {
 		if (!block.info.stage[0].present && !block.info.stage[1].present) continue;
 		if (block.binding_point >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
@@ -907,13 +979,15 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				caller, block.info.name.c_str(), block.info.stage[0].slot, block.info.stage[1].slot);
 			return;
 		}
-		if ((block.info.stage[0].present && !usedVertexBlockSlots.insert(block.info.stage[0].slot).second) ||
-			(block.info.stage[1].present && !usedFragmentBlockSlots.insert(block.info.stage[1].slot).second)) {
+		if ((block.info.stage[0].present && usedVertexBlockSlots[block.info.stage[0].slot - 16]) ||
+			(block.info.stage[1].present && usedFragmentBlockSlots[block.info.stage[1].slot - 16])) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("%s: multiple uniform blocks collide on a Metal buffer slot; block '%s' draw skipped",
 				caller, block.info.name.c_str());
 			return;
 		}
+		if (block.info.stage[0].present) usedVertexBlockSlots[block.info.stage[0].slot - 16] = true;
+		if (block.info.stage[1].present) usedFragmentBlockSlots[block.info.stage[1].slot - 16] = true;
 		const UniformBufferBinding &binding = ctx.uniform_buffer_bindings[block.binding_point];
 		auto bound = ctx.buffer_objects.find(binding.buffer);
 		if (binding.buffer == 0 || bound == ctx.buffer_objects.end() || !bound->second) {
@@ -1081,6 +1155,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	if (!dc.indexed) {
 		if (!validateVertexFetchRanges(dc, caller, attribs, nil, 0)) return;
 		if (!fan) {
+			markActiveDrawBuffers(0);
 			[enc drawPrimitives:prim vertexStart:(NSUInteger)dc.first vertexCount:(NSUInteger)dc.count
 				  instanceCount:(NSUInteger)dc.instances baseInstance:0];
 			return;
@@ -1105,6 +1180,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 		id<MTLBuffer> tmp = createTemporaryIndexBuffer(indices, caller);
 		if (!tmp) return;
+		markActiveDrawBuffers(0);
 		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
 					 instanceCount:(NSUInteger)dc.instances baseVertex:0 baseInstance:0];
 		return;
@@ -1136,7 +1212,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	}
 	if (!validateVertexFetchRanges(dc, caller, attribs, ebo, indexSize)) return;
 
-	if (dc.indexType != GL_UNSIGNED_BYTE && !fan) {
+	const bool primitiveRestart = capOn(GL_PRIMITIVE_RESTART);
+	if (dc.indexType != GL_UNSIGNED_BYTE && !fan && !primitiveRestart) {
+		markActiveDrawBuffers(vao.element_array_buffer_id);
 		[enc drawIndexedPrimitives:prim indexCount:(NSUInteger)dc.count
 						 indexType:(dc.indexType == GL_UNSIGNED_INT ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16)
 					   indexBuffer:ebo indexBufferOffset:(NSUInteger)dc.indexOffset
@@ -1160,14 +1238,48 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	std::vector<uint32_t> indices;
+	std::vector<std::pair<size_t, size_t>> segments;
 	try {
 		indices.reserve((size_t)outputIndexCount);
-		if (fan) {
+		if (fan && primitiveRestart) {
+			const uint32_t restartIndex = dc.indexType == GL_UNSIGNED_BYTE ? (ctx.primitive_restart_index & 0xFFu) :
+				(dc.indexType == GL_UNSIGNED_SHORT ? (ctx.primitive_restart_index & 0xFFFFu) : ctx.primitive_restart_index);
+			std::vector<uint32_t> fanSegment;
+			fanSegment.reserve((size_t)dc.count);
+			for (GLsizei i = 0; i <= dc.count; ++i) {
+				const bool atEnd = i == dc.count;
+				const uint32_t currentIndex = atEnd ? restartIndex : indexAt(i);
+				if (atEnd || currentIndex == restartIndex) {
+					for (size_t fanIndex = 1; fanIndex + 1 < fanSegment.size(); ++fanIndex) {
+						indices.push_back(fanSegment[0]);
+						indices.push_back(fanSegment[fanIndex]);
+						indices.push_back(fanSegment[fanIndex + 1]);
+					}
+					fanSegment.clear();
+				} else {
+					fanSegment.push_back(currentIndex);
+				}
+			}
+		} else if (fan) {
 			for (GLsizei i = 1; i + 1 < dc.count; i++) {
 				indices.push_back(indexAt(0));
 				indices.push_back(indexAt(i));
 				indices.push_back(indexAt(i + 1));
 			}
+		} else if (primitiveRestart) {
+			const uint32_t restartIndex = dc.indexType == GL_UNSIGNED_BYTE ? (ctx.primitive_restart_index & 0xFFu) :
+				(dc.indexType == GL_UNSIGNED_SHORT ? (ctx.primitive_restart_index & 0xFFFFu) : ctx.primitive_restart_index);
+			size_t segmentStart = 0;
+			for (GLsizei i = 0; i < dc.count; ++i) {
+				const uint32_t currentIndex = indexAt(i);
+				if (currentIndex == restartIndex) {
+					if (indices.size() > segmentStart) segments.emplace_back(segmentStart, indices.size() - segmentStart);
+					segmentStart = indices.size();
+				} else {
+					indices.push_back(currentIndex);
+				}
+			}
+			if (indices.size() > segmentStart) segments.emplace_back(segmentStart, indices.size() - segmentStart);
 		} else {
 			for (GLsizei i = 0; i < dc.count; i++) indices.push_back(indexAt(i));
 		}
@@ -1178,8 +1290,18 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	if (indices.empty()) return;
 	id<MTLBuffer> tmp = createTemporaryIndexBuffer(indices, caller);
 	if (!tmp) return;
-	[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
+	markActiveDrawBuffers(vao.element_array_buffer_id);
+	if (primitiveRestart && !fan) {
+		for (const auto &segment : segments) {
+			if (segment.second == 0) continue;
+			[enc drawIndexedPrimitives:prim indexCount:segment.second indexType:MTLIndexTypeUInt32 indexBuffer:tmp
+				indexBufferOffset:segment.first * sizeof(uint32_t) instanceCount:(NSUInteger)dc.instances
+				baseVertex:dc.baseVertex baseInstance:0];
+		}
+	} else {
+		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
 				 instanceCount:(NSUInteger)dc.instances baseVertex:dc.baseVertex baseInstance:0];
+	}
 }
 
 
