@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -124,6 +125,7 @@ struct ProgramAttrib {
 	uint32_t msl_location;  // [[attribute(n)]] of the MSL vertex function
 	GLint vecsize;
 	bool is_integer;        // integer vertex format needed
+	bool is_unsigned;       // uint/uvec vertex input
 };
 
 struct ProgramUniform {
@@ -247,9 +249,11 @@ struct MTLContext {
 	UniformBufferBinding uniform_buffer_bindings[GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS];
 	std::unordered_set<const void *> sync_objects;
 	id<MTLCommandBuffer> last_committed_buffer;
+	GLboolean pack_swap_bytes = GL_FALSE; // GL_PACK_SWAP_BYTES; appended to preserve existing member offsets
 };
 
 extern MTLContext ctx;
+extern std::recursive_mutex gl4metalSamplerObjectMutex; // sampler object state shared by GL entry points and draw.mm
 
 static inline GLuint boundBuffer(GLenum target) {
 	auto it = ctx.bound_buffers.find(target);
@@ -272,5 +276,6 @@ void updateDepthStencilState();
 MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.mm
 void gl4metalSetError(GLenum error);                                // getter.mm: what the next glGetError returns
 void genericAttribValue(GLuint index, bool integer, void *out16);   // vertexarray.mm: glVertexAttrib* current value
+void invalidateConvertedVertexBuffers(GLuint buffer);               // draw.mm: invalidate cached integer attribute repacks
 
 #include "exports.h"

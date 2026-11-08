@@ -1,23 +1,34 @@
 #import "gl4metal.h"
 
+#include <mutex>
+
 MTLContext ctx; // context for Metal device
 
+static std::mutex gl4metalInitMutex;
+static bool gl4metalInitialized = false;
+
 void initDevice() {
-	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-
-	if (device) {
-		GL4METAL_LOG("Initialized context on device: %s", device.name.UTF8String);
+	// Keep the device identity stable. Replacing it after resources have been created
+	// would leave textures, buffers and pipeline states belonging to the old device.
+	if (!ctx.device) {
+		ctx.device = MTLCreateSystemDefaultDevice();
+		if (ctx.device) {
+			GL4METAL_LOG("Initialized context on device: %s", ctx.device.name.UTF8String ?: "(unnamed)");
+		}
 	}
-
-	ctx.device = device;
-	ctx.commandQueue = [ctx.device newCommandQueue];
+	if (ctx.device && !ctx.commandQueue) {
+		ctx.commandQueue = [ctx.device newCommandQueue];
+	}
 }
 
 GLboolean gl4metalInit() {
-	if (ctx.device) {
-		return GL_TRUE;
-	}
+	std::lock_guard<std::mutex> initLock(gl4metalInitMutex);
+	if (gl4metalInitialized) return GL_TRUE;
 	initDevice();
+	if (!ctx.device || !ctx.commandQueue) {
+		GL4METAL_LOG("gl4metalInit: Metal device or command queue creation failed");
+		return GL_FALSE;
+	}
 	const char *check = getenv("GL4METAL_CHECK_EXPORTS");
 	if (check && check[0] == '1') {
 		gl4metalCheckExports();
@@ -49,7 +60,14 @@ GLboolean gl4metalInit() {
 	ctx.depth_range_far = 1.0f;
 
 	// Depth-stencil state for passes without a depth attachment: always pass, never write.
-	ctx.no_depth_state = [ctx.device newDepthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]];
+	MTLDepthStencilDescriptor *noDepthDescriptor = [[MTLDepthStencilDescriptor alloc] init];
+	noDepthDescriptor.depthCompareFunction = MTLCompareFunctionAlways;
+	noDepthDescriptor.depthWriteEnabled = NO;
+	ctx.no_depth_state = [ctx.device newDepthStencilStateWithDescriptor:noDepthDescriptor];
+	if (!ctx.no_depth_state) {
+		GL4METAL_LOG("gl4metalInit: failed to create no-depth-stencil state");
+		return GL_FALSE;
+	}
 
 	// GL's default value of a generic vertex attribute that has no array enabled is (0, 0, 0, 1).
 	const float f[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -58,8 +76,17 @@ GLboolean gl4metalInit() {
 	memcpy(bytes, f, 16);
 	memcpy(bytes + 16, n, 16);
 	ctx.constant_attrib_buffer = [ctx.device newBufferWithBytes:bytes length:sizeof(bytes) options:MTLResourceStorageModeShared];
+	if (!ctx.constant_attrib_buffer) {
+		GL4METAL_LOG("gl4metalInit: failed to create constant vertex-attribute buffer");
+		return GL_FALSE;
+	}
 
 	updateDepthStencilState();
+	if (!ctx.depthStencilState) {
+		GL4METAL_LOG("gl4metalInit: failed to create initial depth-stencil state");
+		return GL_FALSE;
+	}
+	gl4metalInitialized = true;
 	return GL_TRUE;
 }
 
@@ -94,6 +121,8 @@ MTLCompareFunction getMetalCompareFunc(GLenum func) {
 void updateDepthStencilState() {
 	// Depth-stencil states are immutable Metal objects, so cache one per (test, write, func) combination.
 	static std::unordered_map<uint32_t, id<MTLDepthStencilState>> cache;
+	static std::mutex cacheMutex;
+	std::lock_guard<std::mutex> lock(cacheMutex);
 
 	uint32_t key = 0; // depth test disabled: always pass, never write
 	if (ctx.depth_test_enabled) {
@@ -101,7 +130,7 @@ void updateDepthStencilState() {
 	}
 
 	auto it = cache.find(key);
-	if (it == cache.end()) {
+	if (it == cache.end() || !it->second) {
 		MTLDepthStencilDescriptor *dc = [[MTLDepthStencilDescriptor alloc] init];
 		if (ctx.depth_test_enabled) {
 			dc.depthCompareFunction = getMetalCompareFunc(ctx.depth_func);
@@ -110,7 +139,12 @@ void updateDepthStencilState() {
 			dc.depthCompareFunction = MTLCompareFunctionAlways;
 			dc.depthWriteEnabled = NO;
 		}
-		it = cache.emplace(key, [ctx.device newDepthStencilStateWithDescriptor:dc]).first;
+		id<MTLDepthStencilState> created = [ctx.device newDepthStencilStateWithDescriptor:dc];
+		if (it == cache.end()) {
+			it = cache.emplace(key, created).first;
+		} else {
+			it->second = created; // allow retry after a transient Metal allocation failure
+		}
 	}
 
 	ctx.depthStencilState = it->second;

@@ -1,6 +1,8 @@
 #import "sync.h"
 
 #include <unistd.h>
+#include <mutex>
+#include <unordered_set>
 
 // A fence completes when the command buffer that holds the commands recorded before it has completed.
 struct SyncObject {
@@ -19,10 +21,37 @@ static bool isSignaled(const SyncObject *s) {
 	return status < MTLCommandBufferStatusCommitted && s->buffer != ctx.currentCommandBuffer;
 }
 
+// Report asynchronous GPU faults in the application log instead of losing the last submitted frame silently.
+void installCommandBufferErrorHandler(id<MTLCommandBuffer> commandBuffer) {
+	if (!commandBuffer) return;
+	[commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+		if (completed.status == MTLCommandBufferStatusError) {
+			NSError *error = completed.error;
+			static std::mutex errorMutex;
+			static std::unordered_set<NSInteger> reportedErrorCodes;
+			bool firstForCode = false;
+			{
+				std::lock_guard<std::mutex> lock(errorMutex);
+				firstForCode = reportedErrorCodes.insert(error.code).second;
+			}
+			if (firstForCode) {
+				GL4METAL_LOG("Metal command buffer failed (status=%ld, error=%ld): %s; label is only the last encoded draw hint, not a guaranteed fault location: '%s'",
+					(long)completed.status, (long)error.code,
+					error.localizedDescription.UTF8String ?: "unknown Metal GPU error",
+					completed.label.UTF8String ?: "(unlabelled)");
+				if (error.userInfo.count > 0) {
+					GL4METAL_LOG("Metal command buffer error details: %s", error.userInfo.description.UTF8String ?: "(none)");
+				}
+			}
+		}
+	}];
+}
+
 // Commits the open command buffer so that fences waiting for it can complete.
 void flushCommandBuffer(bool waitUntilCompleted) {
 	endRenderEncoder();
 	if (ctx.currentCommandBuffer) {
+		installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 		[ctx.currentCommandBuffer commit];
 		ctx.last_committed_buffer = ctx.currentCommandBuffer;
 		ctx.currentCommandBuffer = nil;

@@ -1,5 +1,7 @@
 #import "vertexarray.h"
 
+#include <array>
+
 // MARK: - Generic vertex attributes (the "current value" used when an attribute has no array enabled)
 
 struct GenericAttrib {
@@ -8,15 +10,15 @@ struct GenericAttrib {
 };
 
 static GenericAttrib &genericAt(GLuint index) {
-	static GenericAttrib attribs[16];
-	static bool initialized = false;
-	if (!initialized) {
-		initialized = true;
-		for (GenericAttrib &a : attribs) { // GL's initial value is (0, 0, 0, 1)
+	// Function-local static initialization is thread-safe; a separate mutable flag was not.
+	static std::array<GenericAttrib, 16> attribs = [] {
+		std::array<GenericAttrib, 16> values{};
+		for (GenericAttrib &a : values) { // GL's initial value is (0, 0, 0, 1)
 			a.f[0] = a.f[1] = a.f[2] = 0.0f; a.f[3] = 1.0f;
 			a.i[0] = a.i[1] = a.i[2] = 0; a.i[3] = 1;
 		}
-	}
+		return values;
+	}();
 	return attribs[index & 15];
 }
 
@@ -104,10 +106,37 @@ void glDisableVertexAttribArray(GLuint index) {
 	ctx.vao_objects[ctx.current_vao].attribs[index].enabled = false;
 }
 
+static bool validFloatAttribType(GLenum type) {
+	switch (type) {
+		case GL_BYTE: case GL_UNSIGNED_BYTE:
+		case GL_SHORT: case GL_UNSIGNED_SHORT:
+		case GL_INT: case GL_UNSIGNED_INT:
+		case GL_HALF_FLOAT: case GL_FLOAT:
+		case GL_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_2_10_10_10_REV:
+			return true;
+		default: return false;
+	}
+}
+
+static bool validIntegerAttribType(GLenum type) {
+	return type == GL_BYTE || type == GL_UNSIGNED_BYTE || type == GL_SHORT ||
+		type == GL_UNSIGNED_SHORT || type == GL_INT || type == GL_UNSIGNED_INT;
+}
+
 void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer) {
-	if (index >= 16) {
+	if (index >= 16 || (size < 1 || size > 4) || stride < 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glVertexAttribPointer: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
+		GL4METAL_LOG("glVertexAttribPointer: invalid index=%u size=%d stride=%d", index, size, stride);
+		return;
+	}
+	if (!validFloatAttribType(type)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glVertexAttribPointer: unsupported type 0x%X", type);
+		return;
+	}
+	if (boundBuffer(GL_ARRAY_BUFFER) == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glVertexAttribPointer: no GL_ARRAY_BUFFER bound; client arrays are not supported");
 		return;
 	}
 	VertexAttrib &a = ctx.vao_objects[ctx.current_vao].attribs[index];
@@ -121,9 +150,19 @@ void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm
 }
 
 void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer) {
-	if (index >= 16) {
+	if (index >= 16 || (size < 1 || size > 4) || stride < 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glVertexAttribIPointer: index %u >= GL_MAX_VERTEX_ATTRIBS", index);
+		GL4METAL_LOG("glVertexAttribIPointer: invalid index=%u size=%d stride=%d", index, size, stride);
+		return;
+	}
+	if (!validIntegerAttribType(type)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glVertexAttribIPointer: unsupported integer type 0x%X", type);
+		return;
+	}
+	if (boundBuffer(GL_ARRAY_BUFFER) == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glVertexAttribIPointer: no GL_ARRAY_BUFFER bound; client arrays are not supported");
 		return;
 	}
 	VertexAttrib &a = ctx.vao_objects[ctx.current_vao].attribs[index];

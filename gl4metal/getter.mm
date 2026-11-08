@@ -244,6 +244,11 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_UNPACK_ROW_LENGTH:  *data = ctx.unpack_row_length; break;
 		case GL_UNPACK_SKIP_PIXELS: *data = ctx.unpack_skip_pixels; break;
 		case GL_UNPACK_SKIP_ROWS:   *data = ctx.unpack_skip_rows; break;
+		case GL_PACK_ALIGNMENT:    *data = ctx.pack_alignment; break;
+		case GL_PACK_ROW_LENGTH:   *data = ctx.pack_row_length; break;
+		case GL_PACK_SKIP_PIXELS:  *data = ctx.pack_skip_pixels; break;
+		case GL_PACK_SKIP_ROWS:    *data = ctx.pack_skip_rows; break;
+		case GL_PACK_SWAP_BYTES:   *data = ctx.pack_swap_bytes; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetIntegerv: missing 0x%X", pname);
@@ -280,7 +285,17 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 	switch (target) {
 		case GL_UNIFORM_BUFFER_BINDING: *data = (GLint)ctx.uniform_buffer_bindings[index].buffer; break;
 		case GL_UNIFORM_BUFFER_START:   *data = (GLint)ctx.uniform_buffer_bindings[index].offset; break;
-		case GL_UNIFORM_BUFFER_SIZE:    *data = (GLint)ctx.uniform_buffer_bindings[index].size; break;
+		case GL_UNIFORM_BUFFER_SIZE: {
+			const UniformBufferBinding &binding = ctx.uniform_buffer_bindings[index];
+			if (binding.size != 0) {
+				*data = (GLint)binding.size;
+			} else {
+				auto buffer = ctx.buffer_objects.find(binding.buffer);
+				*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
+					? (GLint)buffer->second.length : 0;
+			}
+			break;
+		}
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetIntegeri_v: unhandled target 0x%X", target);

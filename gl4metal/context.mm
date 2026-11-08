@@ -13,15 +13,20 @@ extern "C" void objc_autoreleasePoolPop(void *pool);
 // the render thread is a plain JVM thread: nothing drains an autorelease pool on it, so every autoreleased Metal object
 // command buffers, encoders, descriptors, drawables would live forever together with the buffers and textures those
 // command buffers retain. One pool per frame, drained when glSwapBuffers returns, fixes that.
+static void *&framePoolForCurrentThread() {
+	static thread_local void *pool = nullptr;
+	return pool;
+}
+
+static void ensureFramePool() {
+	void *&pool = framePoolForCurrentThread();
+	if (!pool) pool = objc_autoreleasePoolPush();
+}
+
 static void cycleFramePool() {
-	static void *pool = nullptr;
-	static pthread_t poolThread;
-	pthread_t self = pthread_self();
-	if (pool && pthread_equal(poolThread, self)) {
-		objc_autoreleasePoolPop(pool);
-	}
+	void *&pool = framePoolForCurrentThread();
+	if (pool) objc_autoreleasePoolPop(pool);
 	pool = objc_autoreleasePoolPush();
-	poolThread = self;
 }
 
 struct FramePoolCycle {
@@ -29,7 +34,8 @@ struct FramePoolCycle {
 };
 
 void glMakeCurrent(void *metalLayerPtr) {
-	if (!ctx.device || !metalLayerPtr) {
+	ensureFramePool();
+	if (!ctx.device || !ctx.commandQueue || !metalLayerPtr) {
 		GL4METAL_LOG("glMakeCurrent: no device or no layer (%p), ignored", metalLayerPtr);
 		return;
 	}
@@ -43,7 +49,7 @@ void glMakeCurrent(void *metalLayerPtr) {
 void glSwapBuffers(void) {
 	FramePoolCycle cycle; // drains the frame's autorelease pool on every return path
 	endRenderEncoder(); // a render pass must be closed before the command buffer is committed
-	if (!ctx.currentCommandBuffer && ctx.currentDrawable) {
+	if (!ctx.currentCommandBuffer && ctx.currentDrawable && ctx.commandQueue) {
 		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer]; // glFlush/fences may have committed this frame's work already
 	}
 	if (!ctx.currentCommandBuffer) {
@@ -52,6 +58,7 @@ void glSwapBuffers(void) {
 	if (ctx.currentDrawable) {
 		[ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
 	}
+	installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 	[ctx.currentCommandBuffer commit];
 	ctx.last_committed_buffer = ctx.currentCommandBuffer;
 	ctx.currentCommandBuffer = nil;

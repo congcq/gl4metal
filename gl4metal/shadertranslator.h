@@ -47,6 +47,7 @@ struct TranslatedAttrib {
 	int vecsize;
 	uint32_t location; // [[attribute(location)]] in the MSL vertex function
 	bool is_integer = false; // ivec/uvec input: needs an integer vertex format
+	bool is_unsigned = false; // uvec input: Metal vertex format must also be unsigned
 };
 
 struct TranslatedProgram {

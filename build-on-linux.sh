@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -e
+export CC=clang
+export CXX=clang++
 SDKPATH="/usr/share/SDKs/iPhoneOS.sdk"
 
 # build

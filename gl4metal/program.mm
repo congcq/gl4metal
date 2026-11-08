@@ -148,6 +148,9 @@ void glLinkProgram(GLuint program) {
 		return;
 	}
 	if (dumpEnabled()) {
+		if (!tp.log.empty()) {
+			GL4METAL_LOG("program %u translation notes:\n%s", program, tp.log.c_str());
+		}
 		GL4METAL_LOG("---- MSL vertex, program %u ----\n%s\n---- MSL fragment, program %u ----\n%s\n---- end MSL ----",
 					 program, tp.msl[0].c_str(), program, tp.msl[1].c_str());
 	}
@@ -188,6 +191,7 @@ void glLinkProgram(GLuint program) {
 		pa.msl_location = a.location;
 		pa.vecsize = a.vecsize;
 		pa.is_integer = a.is_integer;
+		pa.is_unsigned = a.is_unsigned;
 		auto bound = p.attrib_bindings.find(a.name);
 		if (bound != p.attrib_bindings.end() && bound->second < 16) {
 			pa.gl_index = (GLint)bound->second;
@@ -383,12 +387,13 @@ void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *l
 	const ProgramAttrib &a = it->second.attribs[index];
 	static const GLenum floats[4] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
 	static const GLenum ints[4]   = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
+	static const GLenum uints[4]  = { GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4 };
 	int c = std::min(std::max((int)a.vecsize, 1), 4) - 1;
 	if (size) {
 		*size = 1;
 	}
 	if (type) {
-		*type = a.is_integer ? ints[c] : floats[c];
+		*type = a.is_integer ? (a.is_unsigned ? uints[c] : ints[c]) : floats[c];
 	}
 	copyGLString(a.name, bufSize, length, name);
 }

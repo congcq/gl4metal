@@ -45,6 +45,14 @@ void glLogicOp(GLenum opcode) {
 // MARK: - Depth
 
 void glDepthFunc(GLenum func) {
+	switch (func) {
+		case GL_NEVER: case GL_LESS: case GL_EQUAL: case GL_LEQUAL:
+		case GL_GREATER: case GL_NOTEQUAL: case GL_GEQUAL: case GL_ALWAYS:
+			break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			return;
+	}
 	ctx.depth_func = func;
 	updateDepthStencilState();
 }
@@ -108,19 +116,36 @@ void glClampColor(GLenum target, GLenum clamp) {
 // MARK: - Rasterization
 
 void glCullFace(GLenum mode) {
+	if (mode != GL_FRONT && mode != GL_BACK && mode != GL_FRONT_AND_BACK) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
 	ctx.cull_face_mode = mode;
 }
 
 void glFrontFace(GLenum mode) {
+	if (mode != GL_CW && mode != GL_CCW) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
 	ctx.front_face = mode;
 }
 
 void glPolygonMode(GLenum face, GLenum mode) {
-	if (face == GL_FRONT_AND_BACK) { // Metal has a single fill mode for both faces
-		ctx.polygon_mode = mode;
-	} else {
+	if (face != GL_FRONT_AND_BACK) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glPolygonMode: only GL_FRONT_AND_BACK is supported");
+		return;
 	}
+	if (mode != GL_LINE && mode != GL_FILL && mode != GL_POINT) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (mode == GL_POINT) {
+		GL4METAL_LOG("glPolygonMode(GL_POINT): point polygon mode is not implemented; state unchanged");
+		return;
+	}
+	ctx.polygon_mode = mode;
 }
 
 void glPolygonOffset(GLfloat factor, GLfloat units) {
@@ -177,6 +202,10 @@ void glSampleMaski(GLuint maskNumber, GLbitfield mask) {
 // MARK: - Viewport / scissor
 
 void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+	if (width < 0 || height < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	ctx.viewport.x = x;
 	ctx.viewport.y = y;
 	ctx.viewport.w = width;
@@ -185,6 +214,10 @@ void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 }
 
 void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+	if (width < 0 || height < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	ctx.scissor.x = x;
 	ctx.scissor.y = y;
 	ctx.scissor.w = width;

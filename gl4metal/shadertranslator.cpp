@@ -6,18 +6,22 @@
 #include <spirv_msl.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <utility>
+#include <vector>
+#include <regex>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
 enum Stage { VS = 0, FS = 1 };
 
 void initGlslang() {
-	static bool initialized = false;
-	if (!initialized) {
-		glslang::InitializeProcess();
-		initialized = true;
-	}
+	// C++11 function-local static initialization is synchronized across linker threads.
+	static const bool initialized = [] { return glslang::InitializeProcess(); }();
+	(void)initialized;
 }
 
 // glslang's Vulkan dialect reserves `sampler` (separate samplers), GLSL 330 doesn't: Minecraft's shaders use it as the
@@ -42,15 +46,185 @@ std::string renameSamplerIdentifier(const std::string &source) {
 	return out;
 }
 
-// Rewrites done on the GLSL: Minecraft ships #version 150, glslang's SPIR-V rules want 330, plus the identifier above.
+// Convert pre-4.10 desktop GLSL to desktop GLSL 4.10 before glslang parses it.
+// This includes Iris-generated #version 400 core shaders: the varying-alignment pass below inserts
+// layout(location) on stage inputs/outputs, which is core syntax starting with GLSL 4.10.
+// Keep the original profile suffix (for example, "core") and do not rewrite GLSL ES versions.
+// No GL_ARB_separate_shader_objects directive is injected; GL4Metal does not claim to implement it.
 std::string patchVersion(const std::string &source) {
 	std::string out = source;
-	const std::string from = "#version 150";
-	size_t pos = out.find(from);
-	if (pos != std::string::npos) {
-		out.replace(pos, from.size(), "#version 330");
+	size_t lineStart = 0;
+	while (lineStart < out.size()) {
+		size_t lineEnd = out.find('\n', lineStart);
+		if (lineEnd == std::string::npos) lineEnd = out.size();
+
+		size_t directive = lineStart;
+		while (directive < lineEnd && (out[directive] == ' ' || out[directive] == '\t' || out[directive] == '\r')) {
+			++directive;
+		}
+		if (out.compare(directive, 8, "#version") == 0 &&
+			(directive + 8 == lineEnd || out[directive + 8] == ' ' || out[directive + 8] == '\t')) {
+			size_t numberStart = directive + 8;
+			while (numberStart < lineEnd && (out[numberStart] == ' ' || out[numberStart] == '\t')) ++numberStart;
+			size_t numberEnd = numberStart;
+			while (numberEnd < lineEnd && out[numberEnd] >= '0' && out[numberEnd] <= '9') ++numberEnd;
+			if (numberEnd > numberStart) {
+				const int version = std::stoi(out.substr(numberStart, numberEnd - numberStart));
+				size_t profile = numberEnd;
+				while (profile < lineEnd && (out[profile] == ' ' || out[profile] == '\t')) ++profile;
+				const bool isGlslEs = out.compare(profile, 2, "es") == 0 &&
+					(profile + 2 == lineEnd || out[profile + 2] == ' ' || out[profile + 2] == '\t' || out[profile + 2] == '\r');
+				if (!isGlslEs && version < 410) {
+					out.replace(numberStart, numberEnd - numberStart, "410");
+				}
+			}
+			break; // only the real leading #version directive controls the shader language version
+		}
+		lineStart = lineEnd + 1;
 	}
 	return renameSamplerIdentifier(out);
+}
+
+
+// Preserve source offsets while masking comments, so declaration matching never sees fake `in`/`out` tokens in comments.
+std::string maskShaderComments(const std::string &source) {
+	std::string masked = source;
+	bool lineComment = false, blockComment = false;
+	for (size_t i = 0; i < masked.size(); i++) {
+		if (lineComment) {
+			if (masked[i] == '\n') lineComment = false;
+			else masked[i] = ' ';
+			continue;
+		}
+		if (blockComment) {
+			if (masked[i] == '*' && i + 1 < masked.size() && masked[i + 1] == '/') {
+				masked[i] = masked[i + 1] = ' ';
+				i++;
+				blockComment = false;
+			} else if (masked[i] != '\n') {
+				masked[i] = ' ';
+			}
+			continue;
+		}
+		if (masked[i] == '/' && i + 1 < masked.size() && masked[i + 1] == '/') {
+			masked[i] = masked[i + 1] = ' ';
+			i++;
+			lineComment = true;
+		} else if (masked[i] == '/' && i + 1 < masked.size() && masked[i + 1] == '*') {
+			masked[i] = masked[i + 1] = ' ';
+			i++;
+			blockComment = true;
+		}
+	}
+	return masked;
+}
+
+struct SimpleInterfaceVariable {
+	std::string name;
+	std::string type;
+	size_t insertionOffset = 0;
+	uint32_t locationCount = 1;
+};
+
+static uint32_t interfaceLocationCount(const std::string &type, const std::string &arrayLength) {
+	uint32_t count = 1;
+	if (type.size() >= 4 && type.compare(0, 3, "mat") == 0 && type[3] >= '2' && type[3] <= '4') {
+		count = (uint32_t)(type[3] - '0'); // matrix columns each consume one location
+	}
+	if (!arrayLength.empty()) {
+		try { count *= (uint32_t)std::stoul(arrayLength); } catch (...) { return 1; }
+	}
+	return std::max<uint32_t>(count, 1);
+}
+
+static std::vector<SimpleInterfaceVariable> simpleInterfaceVariables(const std::string &masked, const char *storage) {
+	const std::string qualifiers = R"((?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*)";
+	const std::string pattern = R"((^|\n)([ \t]*))" + qualifiers + R"(\b)" + storage +
+		R"([ \t]+(float|int|uint|bool|[biu]?vec[234]|mat[234](?:x[234])?)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?:\[[ \t]*([0-9]+)[ \t]*\])?[ \t]*;)";
+	const std::regex re(pattern);
+	std::vector<SimpleInterfaceVariable> vars;
+	for (std::sregex_iterator it(masked.begin(), masked.end(), re), end; it != end; ++it) {
+		const std::smatch &m = *it;
+		SimpleInterfaceVariable v;
+		v.type = m[3].str();
+		v.name = m[4].str();
+		v.locationCount = interfaceLocationCount(v.type, m[5].str());
+		v.insertionOffset = (size_t)m.position() + m.length(1) + m.length(2);
+		vars.push_back(std::move(v));
+	}
+	return vars;
+}
+
+static size_t countSimpleStorageDeclarations(const std::string &masked, const char *storage) {
+	const std::string qualifiers = R"((?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*)";
+	const std::string pattern = R"((^|[;\n])[ \t]*)" + qualifiers + R"(\b)" + storage + R"(\b[^;\n]*;)";
+	const std::regex re(pattern);
+	return (size_t)std::distance(std::sregex_iterator(masked.begin(), masked.end(), re), std::sregex_iterator());
+}
+
+static bool hasLayoutQualifiedStorage(const std::string &masked, const char *storage) {
+	const std::string pattern = std::string(R"(layout[ \t]*\([^)]*\)[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\b)") + storage + R"(\b)";
+	return std::regex_search(masked, std::regex(pattern));
+}
+
+// SPIR-V locations must match across the stages. Metal matches [[user(locnN)]] by location, so explicitly number simple
+// unqualified interfaces by vertex-output order and assign that same location to the matching fragment input.
+// patchVersion() upgrades desktop GLSL to 410 so these explicit varying locations are core syntax.
+void alignUnqualifiedVaryingLocations(std::string &vertexSource, std::string &fragmentSource) {
+	const std::string vsMasked = maskShaderComments(vertexSource);
+	const std::string fsMasked = maskShaderComments(fragmentSource);
+	if (hasLayoutQualifiedStorage(vsMasked, "out") || hasLayoutQualifiedStorage(fsMasked, "in")) return;
+
+	auto outputs = simpleInterfaceVariables(vsMasked, "out");
+	auto inputs = simpleInterfaceVariables(fsMasked, "in");
+	if (outputs.empty() || inputs.empty() ||
+		outputs.size() != countSimpleStorageDeclarations(vsMasked, "out") ||
+		inputs.size() != countSimpleStorageDeclarations(fsMasked, "in")) {
+		return; // complex blocks, comma declarations, or unsupported types: don't guess
+	}
+
+	std::unordered_map<std::string, uint32_t> locationByName;
+	std::unordered_map<std::string, std::pair<std::string, uint32_t>> interfaceByName;
+	std::vector<uint32_t> outputLocations, inputLocations;
+	uint32_t nextLocation = 0;
+	for (const SimpleInterfaceVariable &v : outputs) {
+		auto existing = locationByName.find(v.name);
+		uint32_t location;
+		if (existing != locationByName.end()) {
+			const auto &known = interfaceByName.at(v.name);
+			if (known.first != v.type || known.second != v.locationCount) return;
+			location = existing->second;
+		} else {
+			location = nextLocation;
+			locationByName.emplace(v.name, location);
+			interfaceByName.emplace(v.name, std::make_pair(v.type, v.locationCount));
+			nextLocation += v.locationCount;
+		}
+		outputLocations.push_back(location);
+	}
+	for (const SimpleInterfaceVariable &v : inputs) {
+		auto found = locationByName.find(v.name);
+		auto interface = interfaceByName.find(v.name);
+		if (found == locationByName.end() || interface == interfaceByName.end() ||
+			interface->second.first != v.type || interface->second.second != v.locationCount) {
+			return; // don't partially rewrite an interface that doesn't match by name and type
+		}
+		inputLocations.push_back(found->second);
+	}
+
+	std::vector<std::pair<size_t, std::string>> vsInsertions, fsInsertions;
+	for (size_t i = 0; i < outputs.size(); i++) {
+		vsInsertions.emplace_back(outputs[i].insertionOffset, "layout(location = " + std::to_string(outputLocations[i]) + ") ");
+	}
+	for (size_t i = 0; i < inputs.size(); i++) {
+		fsInsertions.emplace_back(inputs[i].insertionOffset, "layout(location = " + std::to_string(inputLocations[i]) + ") ");
+	}
+	auto apply = [](std::string &source, std::vector<std::pair<size_t, std::string>> &insertions) {
+		std::sort(insertions.begin(), insertions.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+		for (const auto &entry : insertions) source.insert(entry.first, entry.second);
+	};
+	apply(vertexSource, vsInsertions);
+	apply(fragmentSource, fsInsertions);
 }
 
 void setupShader(glslang::TShader &shader, EShLanguage stage, const char *const *source) {
@@ -92,6 +266,79 @@ int arraySizeOf(const spirv_cross::SPIRType &type) {
 	return 1;
 }
 
+static bool isMslIdentifierChar(char c) {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_';
+}
+
+static size_t matchingMslParen(const std::string &source, size_t open) {
+	if (open >= source.size() || source[open] != '(') return std::string::npos;
+	int depth = 0;
+	for (size_t i = open; i < source.size(); ++i) {
+		if (source[i] == '(') ++depth;
+		else if (source[i] == ')' && --depth == 0) return i;
+	}
+	return std::string::npos;
+}
+
+// MSL texture2d.read() uses integer texel coordinates. GL texelFetch() outside the texture's
+// extent is undefined; clamping those coordinates preserves every in-range fetch and prevents
+// an invalid integer coordinate (including a fetch through the 1x1 incomplete-texture fallback)
+// from turning into a GPU address fault on Apple GPUs.
+static size_t clampMslTexture2DReadCoordinates(std::string &source) {
+	std::unordered_set<std::string> texture2DNames;
+	const std::string declaration = "texture2d<";
+	size_t scan = 0;
+	while ((scan = source.find(declaration, scan)) != std::string::npos) {
+		size_t typeEnd = source.find('>', scan + declaration.size());
+		if (typeEnd == std::string::npos) break;
+		size_t nameStart = typeEnd + 1;
+		while (nameStart < source.size() && (source[nameStart] == ' ' || source[nameStart] == '\t' || source[nameStart] == '\n')) ++nameStart;
+		size_t nameEnd = nameStart;
+		while (nameEnd < source.size() && isMslIdentifierChar(source[nameEnd])) ++nameEnd;
+		if (nameEnd > nameStart) texture2DNames.insert(source.substr(nameStart, nameEnd - nameStart));
+		scan = typeEnd + 1;
+	}
+
+	size_t rewritten = 0;
+	size_t pos = 0;
+	const std::string call = ".read(uint2(";
+	while ((pos = source.find(call, pos)) != std::string::npos) {
+		// Resolve the receiver identifier immediately before `.read`.
+		size_t nameEnd = pos;
+		size_t nameStart = nameEnd;
+		while (nameStart > 0 && isMslIdentifierChar(source[nameStart - 1])) --nameStart;
+		if (nameStart == nameEnd) { pos += call.size(); continue; }
+		const std::string textureName = source.substr(nameStart, nameEnd - nameStart);
+		if (texture2DNames.find(textureName) == texture2DNames.end()) { pos += call.size(); continue; }
+
+		const size_t readOpen = pos + 5; // opening '(' in `.read(`
+		const size_t coordOpen = source.find('(', readOpen + 1); // opening '(' in `uint2(`
+		if (coordOpen == std::string::npos) break;
+		const size_t coordClose = matchingMslParen(source, coordOpen);
+		const size_t readClose = matchingMslParen(source, readOpen);
+		if (coordClose == std::string::npos || readClose == std::string::npos || coordClose >= readClose) {
+			pos += call.size();
+			continue;
+		}
+		size_t comma = coordClose + 1;
+		while (comma < readClose && (source[comma] == ' ' || source[comma] == '\t' || source[comma] == '\n')) ++comma;
+		if (comma >= readClose || source[comma] != ',') { pos += call.size(); continue; }
+		size_t levelStart = comma + 1;
+		while (levelStart < readClose && (source[levelStart] == ' ' || source[levelStart] == '\t' || source[levelStart] == '\n')) ++levelStart;
+		const std::string level = source.substr(levelStart, readClose - levelStart);
+		if (level.empty()) { pos += call.size(); continue; }
+
+		const std::string coordinates = source.substr(coordOpen + 1, coordClose - coordOpen - 1);
+		const std::string clamped = "uint2(clamp(int2(" + coordinates + "), int2(0), int2(int(" + textureName +
+			".get_width(" + level + ")) - 1, int(" + textureName + ".get_height(" + level + ")) - 1)))";
+		source.replace(pos + std::string(".read(").size(), coordClose - (pos + std::string(".read(").size()) + 1, clamped);
+		++rewritten;
+		pos += std::string(".read(").size() + clamped.size();
+	}
+	return rewritten;
+}
+
 // flipY: second pass over the vertex stage that only produces msl_vs_flipped (reflection was done by the first pass).
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage, bool flipY, TranslatedProgram &out) {
 	try {
@@ -107,7 +354,13 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		common.vertex.flip_vert_y = flipY;
 		msl.set_common_options(common);
 
-		spirv_cross::ShaderResources resources = msl.get_shader_resources();
+		// Reflect only resources statically accessed by this entry point. Iris injects
+		// shared sampler declarations into both stages, even when a stage does not use
+		// them. Reflecting every declaration marks those inactive samplers as present,
+		// which causes needless Metal bindings and can trigger false feedback-loop skips.
+		auto activeVariables = msl.get_active_interface_variables();
+		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+		msl.set_enabled_interface_variables(std::move(activeVariables));
 
 		// Uniform blocks: the default block goes to a fixed high buffer index (see GL4METAL_UNIFORM_BUFFER_INDEX),
 		// real uniform blocks (not supported yet) are parked at 16 + binding so they never collide with vertex buffers.
@@ -232,6 +485,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 				a.vecsize = (int)msl.get_type(r.type_id).vecsize;
 				const spirv_cross::SPIRType::BaseType base = msl.get_type(r.type_id).basetype;
 				a.is_integer = base == spirv_cross::SPIRType::Int || base == spirv_cross::SPIRType::UInt;
+				a.is_unsigned = base == spirv_cross::SPIRType::UInt;
 				a.location = msl.get_decoration(r.id, spv::DecorationLocation);
 				out.attribs.push_back(a);
 			}
@@ -241,7 +495,13 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 		}
 
-		(flipY ? out.msl_vs_flipped : out.msl[stage]) = msl.compile();
+		std::string compiledMsl = msl.compile();
+		const size_t clampedReads = clampMslTexture2DReadCoordinates(compiledMsl);
+		if (clampedReads != 0) {
+			out.log += std::to_string(clampedReads) + " out-of-range-safe texture2d.read coordinate guard(s) added to " +
+				(stage == VS ? "vertex" : "fragment") + " MSL stage\n";
+		}
+		(flipY ? out.msl_vs_flipped : out.msl[stage]) = std::move(compiledMsl);
 		return true;
 	} catch (const std::exception &e) {
 		out.log += std::string(stage == VS ? "vertex" : "fragment") + " stage, SPIRV-Cross: " + e.what() + "\n";
@@ -256,6 +516,7 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 
 	std::string vsText = patchVersion(vertexGLSL);
 	std::string fsText = patchVersion(fragmentGLSL);
+	alignUnqualifiedVaryingLocations(vsText, fsText);
 	const char *vsSource = vsText.c_str();
 	const char *fsSource = fsText.c_str();
 
@@ -267,11 +528,11 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
 	const TBuiltInResource *resources = GetDefaultResources();
 
-	if (!vs.parse(resources, 330, false, messages)) {
+	if (!vs.parse(resources, 410, false, messages)) {
 		out.log += std::string("vertex shader:\n") + vs.getInfoLog() + vs.getInfoDebugLog();
 		return false;
 	}
-	if (!fs.parse(resources, 330, false, messages)) {
+	if (!fs.parse(resources, 410, false, messages)) {
 		out.log += std::string("fragment shader:\n") + fs.getInfoLog() + fs.getInfoDebugLog();
 		return false;
 	}
