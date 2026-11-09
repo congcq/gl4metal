@@ -14,6 +14,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <GL/gl.h>
+#include <GL/glcorearb.h>
+#include <GL/glext.h>
+
 namespace {
 
 enum Stage { VS = 0, FS = 1 };
@@ -117,6 +121,52 @@ std::string maskShaderComments(const std::string &source) {
 		}
 	}
 	return masked;
+}
+
+struct SourceUniformType {
+	bool is_bool = false;
+	int bool_vecsize = 1;
+	uint32_t sampler_gl_type = 0;
+};
+
+static void collectSourceUniformTypes(const std::string &source, std::unordered_map<std::string, SourceUniformType> &types) {
+	const std::string masked = maskShaderComments(source);
+	const std::regex declaration(
+		R"(\buniform[ \t]+(?:(?:lowp|mediump|highp)[ \t]+)?(bool|bvec2|bvec3|bvec4|samplerBuffer|isamplerBuffer|usamplerBuffer)[ \t]+([A-Za-z_][A-Za-z0-9_]*))");
+	for (std::sregex_iterator it(masked.begin(), masked.end(), declaration), end; it != end; ++it) {
+		const std::string typeName = (*it)[1].str();
+		const std::string uniformName = (*it)[2].str();
+		SourceUniformType info;
+		if (typeName == "bool" || typeName == "bvec2" || typeName == "bvec3" || typeName == "bvec4") {
+			info.is_bool = true;
+			info.bool_vecsize = typeName == "bvec2" ? 2 : (typeName == "bvec3" ? 3 : (typeName == "bvec4" ? 4 : 1));
+		} else if (typeName == "samplerBuffer") {
+			info.sampler_gl_type = GL_SAMPLER_BUFFER;
+		} else if (typeName == "isamplerBuffer") {
+			info.sampler_gl_type = GL_INT_SAMPLER_BUFFER;
+		} else if (typeName == "usamplerBuffer") {
+			info.sampler_gl_type = GL_UNSIGNED_INT_SAMPLER_BUFFER;
+		}
+		types[uniformName] = info;
+	}
+}
+
+static void applySourceUniformTypes(TranslatedProgram &out, const std::string &vertexSource, const std::string &fragmentSource) {
+	std::unordered_map<std::string, SourceUniformType> sourceTypes;
+	collectSourceUniformTypes(vertexSource, sourceTypes);
+	collectSourceUniformTypes(fragmentSource, sourceTypes);
+	for (TranslatedUniform &uniform : out.uniforms) {
+		auto sourceType = sourceTypes.find(uniform.name);
+		if (sourceType == sourceTypes.end()) continue;
+		if (sourceType->second.is_bool) {
+			uniform.kind = TranslatedUniform::Bool;
+			uniform.vecsize = sourceType->second.bool_vecsize;
+			uniform.columns = 1;
+		} else if (sourceType->second.sampler_gl_type != 0 && uniform.kind == TranslatedUniform::Sampler) {
+			uniform.sampler_gl_type = sourceType->second.sampler_gl_type;
+			uniform.dim = TranslatedUniform::DimBuffer;
+		}
+	}
 }
 
 struct SimpleInterfaceVariable {
@@ -339,8 +389,198 @@ static size_t clampMslTexture2DReadCoordinates(std::string &source) {
 	return rewritten;
 }
 
-// flipY: second pass over the vertex stage that only produces msl_vs_flipped (reflection was done by the first pass).
-bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage, bool flipY, TranslatedProgram &out) {
+struct RelaxedVaryingInfo {
+	std::string name;
+	uint32_t location = 0;
+	uint32_t vecsize = 0;
+};
+
+static bool isHalfSafeVaryingName(const std::string &name) {
+	std::string lower;
+	lower.reserve(name.size());
+	for (unsigned char ch : name) {
+		lower.push_back((char)((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch));
+	}
+	// Only compact normalized/interpolated data. Never narrow positions, depth,
+	// distances, matrices, or arbitrary values that may contain HDR/world ranges.
+	return lower.find("texcoord") != std::string::npos ||
+		lower.find("lightcoord") != std::string::npos ||
+		lower.find("lmcoord") != std::string::npos ||
+		lower == "uv" || lower == "uv0" || lower == "uv1" || lower == "uv2" ||
+		lower.find("normal") != std::string::npos ||
+		lower.find("tangent") != std::string::npos;
+}
+
+static std::vector<RelaxedVaryingInfo> collectRelaxedVaryings(
+	const std::vector<unsigned int> &spirv, bool collectInputs) {
+	std::vector<RelaxedVaryingInfo> result;
+	spirv_cross::CompilerMSL reflection(spirv);
+	auto activeVariables = reflection.get_active_interface_variables();
+	spirv_cross::ShaderResources resources = reflection.get_shader_resources(activeVariables);
+	const auto &variables = collectInputs ? resources.stage_inputs : resources.stage_outputs;
+	for (const spirv_cross::Resource &resource : variables) {
+		const spirv_cross::SPIRType &type = reflection.get_type(resource.type_id);
+		if (type.basetype != spirv_cross::SPIRType::Float || type.columns != 1 ||
+			type.vecsize < 2 || type.vecsize > 4 || !isHalfSafeVaryingName(resource.name)) {
+			continue;
+		}
+		if (!reflection.has_decoration(resource.id, spv::DecorationLocation)) continue;
+		const bool relaxed =
+			reflection.has_decoration(resource.id, spv::DecorationRelaxedPrecision) ||
+			reflection.has_decoration(resource.type_id, spv::DecorationRelaxedPrecision) ||
+			reflection.has_decoration(resource.base_type_id, spv::DecorationRelaxedPrecision);
+		if (!relaxed) continue;
+		RelaxedVaryingInfo info;
+		info.name = resource.name;
+		info.location = reflection.get_decoration(resource.id, spv::DecorationLocation);
+		info.vecsize = type.vecsize;
+		result.push_back(std::move(info));
+	}
+	return result;
+}
+
+static void buildHalfVaryingNameSets(
+	const std::vector<unsigned int> &vertexSpirv,
+	const std::vector<unsigned int> &fragmentSpirv,
+	std::unordered_set<std::string> &vertexNames,
+	std::unordered_set<std::string> &fragmentNames) {
+	const auto vertexOutputs = collectRelaxedVaryings(vertexSpirv, false);
+	const auto fragmentInputs = collectRelaxedVaryings(fragmentSpirv, true);
+	for (const RelaxedVaryingInfo &vertexOutput : vertexOutputs) {
+		auto matchingInput = std::find_if(fragmentInputs.begin(), fragmentInputs.end(), [&](const RelaxedVaryingInfo &candidate) {
+			return candidate.location == vertexOutput.location && candidate.vecsize == vertexOutput.vecsize &&
+				candidate.name == vertexOutput.name;
+		});
+		if (matchingInput == fragmentInputs.end()) continue;
+		vertexNames.insert(vertexOutput.name);
+		fragmentNames.insert(matchingInput->name);
+	}
+}
+
+static bool addVertexFlipFunctionConstant(std::string &source, std::string &error) {
+	const std::string namespaceLine = "using namespace metal;";
+	const size_t namespacePosition = source.find(namespaceLine);
+	if (namespacePosition == std::string::npos) {
+		error = "could not locate the MSL namespace declaration for vertex specialization";
+		return false;
+	}
+	if (source.find("gl4metal_FlipY") != std::string::npos) {
+		error = "MSL source already contains the reserved Y-flip specialization name";
+		return false;
+	}
+	const size_t declarationPosition = namespacePosition + namespaceLine.size();
+	source.insert(declarationPosition,
+		"\n\nconstant bool gl4metal_FlipY [[function_constant(0)]];\n");
+
+	// SPIRV-Cross emits a return-structure type between the MSL stage keyword and
+	// the entry-point name, for example `vertex main0_out main0(...)`. Do not
+	// assume the invalid `vertex main0(` spelling: simple Minecraft shaders use
+	// a generated `main0_out` type and failed during v15 startup because of it.
+	auto skipWhitespace = [&](size_t position) {
+		while (position < source.size() && (source[position] == ' ' || source[position] == '\t' ||
+			source[position] == '\r' || source[position] == '\n')) ++position;
+		return position;
+	};
+	const std::string masked = maskShaderComments(source);
+	size_t vertexPosition = 0;
+	size_t entryParen = std::string::npos;
+	while ((vertexPosition = masked.find("vertex", vertexPosition)) != std::string::npos) {
+		const size_t vertexEnd = vertexPosition + 6;
+		const bool leftBoundary = vertexPosition == 0 || !isMslIdentifierChar(masked[vertexPosition - 1]);
+		const bool rightBoundary = vertexEnd >= masked.size() || !isMslIdentifierChar(masked[vertexEnd]);
+		if (!leftBoundary || !rightBoundary) {
+			vertexPosition = vertexEnd;
+			continue;
+		}
+		size_t tokenPosition = skipWhitespace(vertexEnd);
+		// Parse the generated MSL return type (main0_out, void, etc.).
+		const size_t returnTypeStart = tokenPosition;
+		while (tokenPosition < masked.size() && isMslIdentifierChar(masked[tokenPosition])) ++tokenPosition;
+		if (tokenPosition == returnTypeStart) {
+			vertexPosition = vertexEnd;
+			continue;
+		}
+		tokenPosition = skipWhitespace(tokenPosition);
+		const size_t functionNameStart = tokenPosition;
+		while (tokenPosition < masked.size() && isMslIdentifierChar(masked[tokenPosition])) ++tokenPosition;
+		const std::string functionName = masked.substr(functionNameStart, tokenPosition - functionNameStart);
+		tokenPosition = skipWhitespace(tokenPosition);
+		if (functionName == "main0" && tokenPosition < masked.size() && masked[tokenPosition] == '(') {
+			entryParen = tokenPosition;
+			break;
+		}
+		vertexPosition = vertexEnd;
+	}
+	if (entryParen == std::string::npos) {
+		error = "could not locate the MSL vertex entry point (expected a vertex main0 function)";
+		return false;
+	}
+	const size_t signatureClose = matchingMslParen(masked, entryParen);
+	if (signatureClose == std::string::npos) {
+		error = "MSL vertex entry-point parameter list is unbalanced";
+		return false;
+	}
+	size_t bodyOpen = signatureClose + 1;
+	while (bodyOpen < masked.size() && masked[bodyOpen] != '{') ++bodyOpen;
+	if (bodyOpen >= masked.size()) {
+		error = "could not locate the MSL vertex entry-point body";
+		return false;
+	}
+	int depth = 0;
+	size_t bodyClose = std::string::npos;
+	for (size_t i = bodyOpen; i < masked.size(); ++i) {
+		if (masked[i] == '{') ++depth;
+		else if (masked[i] == '}' && --depth == 0) { bodyClose = i; break; }
+	}
+	if (bodyClose == std::string::npos) {
+		error = "MSL vertex entry-point braces are unbalanced";
+		return false;
+	}
+
+	// A vertex-stage output struct is normally returned through a local (usually
+	// `out`). Parse the returned identifier instead of hard-coding its spelling.
+	struct ReturnPatch { size_t position; size_t length; std::string expression; };
+	std::vector<ReturnPatch> returnPatches;
+	for (size_t searchPosition = bodyOpen + 1; searchPosition < bodyClose; ) {
+		const size_t returnPosition = masked.find("return", searchPosition);
+		if (returnPosition == std::string::npos || returnPosition >= bodyClose) break;
+		const size_t returnEnd = returnPosition + 6;
+		const bool leftBoundary = returnPosition == 0 || !isMslIdentifierChar(masked[returnPosition - 1]);
+		const bool rightBoundary = returnEnd >= masked.size() || !isMslIdentifierChar(masked[returnEnd]);
+		if (!leftBoundary || !rightBoundary) {
+			searchPosition = returnEnd;
+			continue;
+		}
+		size_t expressionStart = skipWhitespace(returnEnd);
+		size_t expressionEnd = expressionStart;
+		while (expressionEnd < bodyClose && isMslIdentifierChar(masked[expressionEnd])) ++expressionEnd;
+		size_t semicolon = skipWhitespace(expressionEnd);
+		if (expressionEnd == expressionStart || semicolon >= bodyClose || masked[semicolon] != ';') {
+			searchPosition = returnEnd;
+			continue;
+		}
+		returnPatches.push_back({returnPosition, semicolon + 1 - returnPosition,
+			masked.substr(expressionStart, expressionEnd - expressionStart)});
+		searchPosition = semicolon + 1;
+	}
+	if (returnPatches.empty()) {
+		error = "could not locate a return of the MSL vertex output structure";
+		return false;
+	}
+	// Process backwards so replacements do not invalidate remaining offsets.
+	for (auto it = returnPatches.rbegin(); it != returnPatches.rend(); ++it) {
+		const std::string &outputName = it->expression;
+		const std::string specializedReturn = "if (gl4metal_FlipY) { " + outputName +
+			".gl_Position.y = -" + outputName + ".gl_Position.y; }\n    return " + outputName + ";";
+		source.replace(it->position, it->length, specializedReturn);
+	}
+	return true;
+}
+
+// The vertex stage is compiled once. A function constant supplies the render-to-texture
+// Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
+bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
+	const std::unordered_set<std::string> &halfVaryingNames, TranslatedProgram &out) {
 	try {
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 
@@ -351,8 +591,21 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 
 		spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
 		common.vertex.fixup_clipspace = true; // GL clip space z is [-w, w], Metal's is [0, w]
-		common.vertex.flip_vert_y = flipY;
+		common.vertex.flip_vert_y = false;
 		msl.set_common_options(common);
+
+		// Only varyings explicitly marked RelaxedPrecision in BOTH stages are
+		// lowered to half. Uniform blocks, positions, depth, and unqualified desktop
+		// GLSL values retain their original 32-bit representation and std140 layout.
+		if (!halfVaryingNames.empty()) {
+			msl.set_variable_type_remap_callback([&halfVaryingNames](
+				const spirv_cross::SPIRType &type, const std::string &name, std::string &replacementType) {
+				if (halfVaryingNames.find(name) == halfVaryingNames.end() ||
+					type.basetype != spirv_cross::SPIRType::Float || type.columns != 1 ||
+					type.vecsize < 2 || type.vecsize > 4) return;
+				replacementType = type.vecsize == 2 ? "half2" : (type.vecsize == 3 ? "half3" : "half4");
+			});
+		}
 
 		// Reflect only resources statically accessed by this entry point. Iris injects
 		// shared sampler declarations into both stages, even when a stage does not use
@@ -386,9 +639,6 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 			msl.add_msl_resource_binding(b);
 
-			if (flipY) {
-				continue;
-			}
 			if (!isDefault) {
 				std::string blockName = msl.get_name(r.base_type_id);
 				if (blockName.empty()) {
@@ -500,10 +750,6 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			b.msl_sampler = slot;
 			msl.add_msl_resource_binding(b);
 
-			if (flipY) {
-				slot += (uint32_t)count;
-				continue;
-			}
 			TranslatedUniform &u = findOrAdd(out, r.name);
 			u.kind = TranslatedUniform::Sampler;
 			const spirv_cross::SPIRType &samplerType = msl.get_type(r.type_id);
@@ -524,9 +770,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			slot += (uint32_t)count;
 		}
 
-		if (flipY) {
-			// interface already reflected by the regular vertex pass
-		} else if (stage == VS) {
+		if (stage == VS) {
 			for (const spirv_cross::Resource &r : resources.stage_inputs) {
 				if (r.name.compare(0, 3, "gl_") == 0) {
 					continue;
@@ -552,7 +796,14 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			out.log += std::to_string(clampedReads) + " out-of-range-safe texture2d.read coordinate guard(s) added to " +
 				(stage == VS ? "vertex" : "fragment") + " MSL stage\n";
 		}
-		(flipY ? out.msl_vs_flipped : out.msl[stage]) = std::move(compiledMsl);
+		if (stage == VS) {
+			std::string specializationError;
+			if (!addVertexFlipFunctionConstant(compiledMsl, specializationError)) {
+				out.log += "vertex Y-flip specialization: " + specializationError + "\n";
+				return false;
+			}
+		}
+		out.msl[stage] = std::move(compiledMsl);
 		return true;
 	} catch (const std::exception &e) {
 		out.log += std::string(stage == VS ? "vertex" : "fragment") + " stage, SPIRV-Cross: " + e.what() + "\n";
@@ -618,10 +869,24 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 		}
 	}
 
-	// Texture targets are rendered with Y flipped (so texture rows follow GL's bottom-first order and sampling code
-	// behaves exactly like on GL), the default framebuffer is not: hence two vertex variants.
-	std::vector<unsigned int> vertexSpirv = spirv[VS];
-	return compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, false, out) &&
-		   compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, false, out) &&
-		   compileStage(std::move(vertexSpirv), spv::ExecutionModelVertex, VS, true, out);
+	// Narrow only inter-stage values that are explicitly RelaxedPrecision in both
+	// GLSL stages and whose semantics are normalized coordinates/directions.
+	std::unordered_set<std::string> vertexHalfVaryings;
+	std::unordered_set<std::string> fragmentHalfVaryings;
+	buildHalfVaryingNameSets(spirv[VS], spirv[FS], vertexHalfVaryings, fragmentHalfVaryings);
+	if (!vertexHalfVaryings.empty()) {
+		out.log += std::to_string(vertexHalfVaryings.size()) + " explicitly relaxed UV/normal varyings lowered to MSL half\n";
+	}
+
+	// Compile each GLSL stage once. The vertex function constant produces normal and
+	// texture-flipped variants from one Metal library at program-link time.
+	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, out) ||
+		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, out)) {
+		return false;
+	}
+	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.
+	// Preserve their original desktop-GL type for glGetActiveUniform / GL_UNIFORM_TYPE.
+	// Likewise keep the exact samplerBuffer variant for integer/unsigned buffer samplers.
+	applySourceUniformTypes(out, vertexGLSL, fragmentGLSL);
+	return true;
 }

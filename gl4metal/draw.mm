@@ -16,6 +16,69 @@ static std::mutex feedbackLoopSetMutex;
 static std::mutex fallbackTextureMutex;
 static std::mutex fallbackSamplerMutex;
 
+// Large default uniform blocks use one shared upload arena per in-flight command
+// buffer instead of allocating a new MTLBuffer for every draw. Each slice is aligned
+// to 256 bytes, matching the constant-buffer offset alignment used by GL4Metal UBOs.
+struct DrawUniformUploadArena {
+	id<MTLCommandBuffer> commandBuffer = nil;
+	id<MTLBuffer> buffer = nil;
+	NSUInteger used = 0;
+};
+
+static DrawUniformUploadArena drawUniformUploadArena;
+static std::mutex drawUniformUploadArenaMutex;
+
+void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
+	std::lock_guard<std::mutex> lock(drawUniformUploadArenaMutex);
+	if (!commandBuffer || drawUniformUploadArena.commandBuffer == commandBuffer) {
+		drawUniformUploadArena.commandBuffer = nil;
+		drawUniformUploadArena.buffer = nil;
+		drawUniformUploadArena.used = 0;
+	}
+}
+
+static bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
+	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
+	if (!source || length == 0 || !ctx.device || !ctx.currentCommandBuffer ||
+		length > ctx.device.maxBufferLength) return false;
+
+	constexpr NSUInteger alignment = 256;
+	std::lock_guard<std::mutex> lock(drawUniformUploadArenaMutex);
+	id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
+	if (drawUniformUploadArena.commandBuffer != commandBuffer) {
+		drawUniformUploadArena.commandBuffer = commandBuffer;
+		drawUniformUploadArena.buffer = nil;
+		drawUniformUploadArena.used = 0;
+	}
+
+	if (drawUniformUploadArena.used > std::numeric_limits<NSUInteger>::max() - (alignment - 1)) return false;
+	NSUInteger offset = (drawUniformUploadArena.used + (alignment - 1)) & ~(alignment - 1);
+	if (offset > ctx.device.maxBufferLength || length > ctx.device.maxBufferLength - offset) return false;
+	NSUInteger requiredEnd = offset + length;
+	if (!drawUniformUploadArena.buffer || requiredEnd > drawUniformUploadArena.buffer.length) {
+		NSUInteger capacity = std::max<NSUInteger>(256 * 1024, requiredEnd);
+		if (drawUniformUploadArena.buffer && drawUniformUploadArena.buffer.length <= ctx.device.maxBufferLength / 2) {
+			capacity = std::max(capacity, drawUniformUploadArena.buffer.length * 2);
+		}
+		capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
+		if (capacity < requiredEnd) return false;
+		id<MTLBuffer> expanded = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+		if (!expanded) return false;
+		// Earlier encoder bindings retain the previous arena buffer until their command
+		// buffer completes; new allocations can safely continue in the replacement.
+		drawUniformUploadArena.buffer = expanded;
+		drawUniformUploadArena.used = 0;
+		offset = 0;
+		requiredEnd = length;
+	}
+
+	destinationBuffer = drawUniformUploadArena.buffer;
+	destinationOffset = offset;
+	memcpy((uint8_t *)destinationBuffer.contents + destinationOffset, source, (size_t)length);
+	drawUniformUploadArena.used = requiredEnd;
+	return true;
+}
+
 static bool vertexFetchValidationEnabled() {
 	// Full validation scans all indices on the CPU for every indexed draw. Keep it opt-in
 	// for diagnostics; EBO byte-range validation remains enabled unconditionally.
@@ -391,6 +454,7 @@ static GLenum targetForDim(TranslatedUniform::Dim dim) {
 		case TranslatedUniform::DimCube:    return GL_TEXTURE_CUBE_MAP;
 		case TranslatedUniform::Dim3D:      return GL_TEXTURE_3D;
 		case TranslatedUniform::Dim2DArray: return GL_TEXTURE_2D_ARRAY;
+		case TranslatedUniform::DimBuffer:   return GL_TEXTURE_BUFFER;
 		default:                            return GL_TEXTURE_2D;
 	}
 }
@@ -406,10 +470,36 @@ static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
 
 // What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1). The shader decides the texture type,
 // and Metal wants exactly that type bound, so there is one fallback per sampler dimensionality.
-static id<MTLTexture> fallbackTexture(TranslatedUniform::Dim dim) {
-	const int dimensionIndex = (int)dim;
-	if (dimensionIndex < 0 || dimensionIndex >= 4 || !ctx.device) return nil;
+static id<MTLTexture> fallbackTexture(const TranslatedUniform &uniform) {
+	const TranslatedUniform::Dim dim = uniform.dim;
+	if (!ctx.device) return nil;
 	std::lock_guard<std::mutex> lock(fallbackTextureMutex);
+	if (dim == TranslatedUniform::DimBuffer) {
+		static id<MTLTexture> bufferFallbacks[3] = { nil, nil, nil }; // float, signed int, unsigned int
+		const NSUInteger formatIndex = uniform.sampler_gl_type == 0x8DD0u ? 1 :
+			(uniform.sampler_gl_type == 0x8DD8u ? 2 : 0);
+		__strong id<MTLTexture> &slot = bufferFallbacks[formatIndex];
+		if (!slot) {
+			MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+			descriptor.textureType = MTLTextureType2D;
+			descriptor.pixelFormat = formatIndex == 1 ? MTLPixelFormatR32Sint :
+				(formatIndex == 2 ? MTLPixelFormatR32Uint : MTLPixelFormatR32Float);
+			descriptor.width = 4096;
+			descriptor.height = 1;
+			descriptor.depth = 1;
+			descriptor.arrayLength = 1;
+			descriptor.usage = MTLTextureUsageShaderRead;
+			descriptor.storageMode = MTLStorageModeShared;
+			slot = [ctx.device newTextureWithDescriptor:descriptor];
+			if (!slot) return nil;
+			std::vector<uint32_t> zeroes(4096, 0);
+			[slot replaceRegion:MTLRegionMake2D(0, 0, 4096, 1) mipmapLevel:0
+				withBytes:zeroes.data() bytesPerRow:4096 * sizeof(uint32_t)];
+		}
+		return slot;
+	}
+	const int dimensionIndex = (int)dim;
+	if (dimensionIndex < 0 || dimensionIndex >= 4) return nil;
 	static id<MTLTexture> textures[4] = { nil, nil, nil, nil };
 	__strong id<MTLTexture> &slot = textures[dimensionIndex];
 	if (!slot) {
@@ -456,6 +546,7 @@ struct ActiveAttrib {
 	NSUInteger stride = 0;
 	NSUInteger elementBytes = 0; // bytes consumed by one vertex/instance attribute element
 	GLuint divisor = 0;
+	GLuint source_buffer = 0; // zero when buffer points at an internally converted stream
 	NSUInteger slot = 0;
 };
 
@@ -689,14 +780,15 @@ static bool validateVertexFetchRanges(const DrawCall &dc, const char *caller,
 		const uint64_t elementIndex = aa.divisor == 0
 			? range.maxIndex
 			: ((uint64_t)dc.instances - 1) / (uint64_t)aa.divisor;
-		if (aa.elementBytes == 0 || aa.stride == 0 || aa.offset > aa.buffer.length) {
+		const NSUInteger visibleLength = aa.source_buffer != 0 ? glBufferLogicalSize(aa.source_buffer) : aa.buffer.length;
+		if (aa.elementBytes == 0 || aa.stride == 0 || aa.offset > visibleLength) {
 			GL4METAL_LOG("%s: invalid vertex binding for '%s' (offset=%lu stride=%lu element=%lu length=%lu); draw skipped",
 				caller, aa.pa ? aa.pa->name.c_str() : "?", (unsigned long)aa.offset,
-				(unsigned long)aa.stride, (unsigned long)aa.elementBytes, (unsigned long)aa.buffer.length);
+				(unsigned long)aa.stride, (unsigned long)aa.elementBytes, (unsigned long)visibleLength);
 			gl4metalSetError(GL_INVALID_OPERATION);
 			return false;
 		}
-		const uint64_t length = (uint64_t)aa.buffer.length;
+		const uint64_t length = (uint64_t)visibleLength;
 		const uint64_t offset = (uint64_t)aa.offset;
 		const uint64_t stride = (uint64_t)aa.stride;
 		const uint64_t bytes = (uint64_t)aa.elementBytes;
@@ -798,6 +890,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			aa.constant = false;
 			aa.format = format;
 			aa.buffer = bit->second;
+			aa.source_buffer = va.bound_vbo;
 			aa.offset = (NSUInteger)(uintptr_t)va.pointer;
 			aa.stride = va.stride > 0 ? (NSUInteger)va.stride : tight;
 			aa.elementBytes = tight; // native vertex fetch width; converted integer formats override this below
@@ -819,6 +912,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					static const MTLVertexFormat unsignedFormats[5] = { MTLVertexFormatInvalid, MTLVertexFormatUInt, MTLVertexFormatUInt2, MTLVertexFormatUInt3, MTLVertexFormatUInt4 };
 					aa.format = pa.is_unsigned ? unsignedFormats[va.size] : signedFormats[va.size];
 					aa.buffer = converted;
+					aa.source_buffer = 0;
 					aa.offset = 0;
 					aa.stride = convertedStride;
 					aa.elementBytes = (NSUInteger)va.size * sizeof(uint32_t);
@@ -947,16 +1041,17 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				GL4METAL_LOG("%s: default uniform block (%lu bytes) exceeds Metal maxBufferLength; draw skipped", caller, (unsigned long)data.size());
 				return;
 			}
-			id<MTLBuffer> buffer = [ctx.device newBufferWithBytes:data.data() length:data.size() options:MTLResourceStorageModeShared];
-			if (!buffer) {
+			id<MTLBuffer> buffer = nil;
+			NSUInteger offset = 0;
+			if (!uploadLargeDefaultUniformBlock(data.data(), (NSUInteger)data.size(), buffer, offset)) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
-				GL4METAL_LOG("%s: failed to allocate default uniform block (%lu bytes); draw skipped", caller, (unsigned long)data.size());
+				GL4METAL_LOG("%s: failed to reserve %lu bytes in the default-uniform upload arena; draw skipped", caller, (unsigned long)data.size());
 				return;
 			}
 			if (s == 0) {
-				[enc setVertexBuffer:buffer offset:0 atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				[enc setVertexBuffer:buffer offset:offset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
 			} else {
-				[enc setFragmentBuffer:buffer offset:0 atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				[enc setFragmentBuffer:buffer offset:offset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
 			}
 		}
 	}
@@ -1005,7 +1100,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				caller, block.info.name.c_str(), (long long)binding.offset);
 			return;
 		}
-		const NSUInteger length = bound->second.length;
+		const NSUInteger length = glBufferLogicalSize(binding.buffer);
 		const NSUInteger offset = (NSUInteger)binding.offset;
 		if (offset > length) {
 			gl4metalSetError(GL_INVALID_OPERATION);
@@ -1061,6 +1156,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			}
 			id<MTLTexture> texture = nil;
 			id<MTLSamplerState> sampler = nil;
+			const bool isBufferSampler = u.info.dim == TranslatedUniform::DimBuffer;
 			GLuint textureNameForTrace = 0;
 			bool usedFallbackTexture = false;
 			if (unit >= 0 && unit < GL4METAL_MAX_TEXTURE_UNITS) {
@@ -1082,19 +1178,31 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 						hasTextureFeedbackLoop = true;
 					} else {
 						auto to = ctx.texture_objects.find(textureName);
+						if (to != ctx.texture_objects.end() && isBufferSampler &&
+							to->second.buffer_sampler_type != 0 &&
+							to->second.buffer_sampler_type != u.info.sampler_gl_type) {
+							gl4metalSetError(GL_INVALID_OPERATION);
+							GL4METAL_LOG("%s: buffer texture '%s' format class 0x%X is incompatible with sampler type 0x%X; draw skipped",
+								caller, u.info.name.c_str(), to->second.buffer_sampler_type, u.info.sampler_gl_type);
+							return;
+						}
 						if (to != ctx.texture_objects.end() && to->second.texture &&
 							to->second.texture.textureType == typeForDim(u.info.dim) &&
 							(to->second.texture.usage & MTLTextureUsageShaderRead) != 0) {
 							texture = to->second.texture;
-							sampler = samplerFor(to->second, (GLuint)unit);
+							if (isBufferSampler) {
+								markBufferUsed(to->second.buffer_object);
+							} else {
+								sampler = samplerFor(to->second, (GLuint)unit);
+							}
 						}
 					}
 				}
 			}
 			if (!texture) {
 				usedFallbackTexture = true;
-				texture = fallbackTexture(u.info.dim);
-				sampler = fallbackSampler();
+				texture = fallbackTexture(u.info);
+				if (!isBufferSampler) sampler = fallbackSampler();
 			}
 			// Never encode a shader read against a nil or non-readable Metal resource. A nil
 			// texture can surface later as an asynchronous GPU page fault at address zero.
@@ -1104,7 +1212,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					caller, u.info.name.c_str(), unit, ctx.current_program);
 				return;
 			}
-			if (!sampler) {
+			if (!isBufferSampler && !sampler) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("%s: sampler state creation failed for '%s' (unit=%d, program=%u); draw skipped",
 					caller, u.info.name.c_str(), unit, ctx.current_program);
@@ -1141,18 +1249,32 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			if (u.info.stage[0].present) {
 				NSUInteger index = u.info.stage[0].slot + (NSUInteger)e;
 				[enc setVertexTexture:texture atIndex:index];
-				[enc setVertexSamplerState:sampler atIndex:index];
+				if (!isBufferSampler) [enc setVertexSamplerState:sampler atIndex:index];
 			}
 			if (u.info.stage[1].present) {
 				NSUInteger index = u.info.stage[1].slot + (NSUInteger)e;
 				[enc setFragmentTexture:texture atIndex:index];
-				[enc setFragmentSamplerState:sampler atIndex:index];
+				if (!isBufferSampler) [enc setFragmentSamplerState:sampler atIndex:index];
 			}
 		}
 	}
 	if (hasTextureFeedbackLoop) {
 		return; // Do not sample a render attachment, including through a too-small fallback texture.
 	}
+
+	auto markDefaultFramebufferAttachmentsWritten = [&]() {
+		if (!ctx.pass_uses_default_framebuffer || capOn(GL_RASTERIZER_DISCARD)) return;
+		if (ctx.pass_color_format[0] != MTLPixelFormatInvalid &&
+			(ctx.color_masks[0][0] || ctx.color_masks[0][1] || ctx.color_masks[0][2] || ctx.color_masks[0][3])) {
+			ctx.default_color_has_contents = true;
+		}
+		if (ctx.depth_test_enabled && ctx.depth_write_enabled) ctx.default_depth_has_contents = true;
+		auto stencilTest = ctx.caps.find(GL_STENCIL_TEST);
+		if (stencilTest != ctx.caps.end() && stencilTest->second &&
+			(ctx.stencil_front.write_mask != 0 || ctx.stencil_back.write_mask != 0)) {
+			ctx.default_stencil_has_contents = true;
+		}
+	};
 
 	// The draw itself.
 	if (!dc.indexed) {
@@ -1161,6 +1283,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			markActiveDrawBuffers(0);
 			[enc drawPrimitives:prim vertexStart:(NSUInteger)dc.first vertexCount:(NSUInteger)dc.count
 				  instanceCount:(NSUInteger)dc.instances baseInstance:0];
+			markDefaultFramebufferAttachmentsWritten();
 			return;
 		}
 		const uint64_t triangleCount = (uint64_t)dc.count - 2;
@@ -1186,6 +1309,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		markActiveDrawBuffers(0);
 		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
 					 instanceCount:(NSUInteger)dc.instances baseVertex:0 baseInstance:0];
+		markDefaultFramebufferAttachmentsWritten();
 		return;
 	}
 
@@ -1202,10 +1326,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		GL4METAL_LOG("%s: invalid index type 0x%X", caller, dc.indexType);
 		return;
 	}
-	if (dc.indexOffset < 0 || (NSUInteger)dc.indexOffset > ebo.length ||
-		(NSUInteger)dc.count > (ebo.length - (NSUInteger)dc.indexOffset) / indexSize) {
+	const NSUInteger eboLogicalLength = glBufferLogicalSize(vao.element_array_buffer_id);
+	if (dc.indexOffset < 0 || (NSUInteger)dc.indexOffset > eboLogicalLength ||
+		(NSUInteger)dc.count > (eboLogicalLength - (NSUInteger)dc.indexOffset) / indexSize) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("%s: %d indices at offset %ld do not fit the element buffer (%lu bytes)", caller, dc.count, (long)dc.indexOffset, (unsigned long)ebo.length);
+		GL4METAL_LOG("%s: %d indices at offset %ld do not fit the element buffer (%lu bytes)", caller, dc.count, (long)dc.indexOffset, (unsigned long)eboLogicalLength);
 		return;
 	}
 	if (((NSUInteger)dc.indexOffset % indexSize) != 0) {
@@ -1222,6 +1347,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 						 indexType:(dc.indexType == GL_UNSIGNED_INT ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16)
 					   indexBuffer:ebo indexBufferOffset:(NSUInteger)dc.indexOffset
 					 instanceCount:(NSUInteger)dc.instances baseVertex:dc.baseVertex baseInstance:0];
+		markDefaultFramebufferAttachmentsWritten();
 		return;
 	}
 
@@ -1305,6 +1431,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
 				 instanceCount:(NSUInteger)dc.instances baseVertex:dc.baseVertex baseInstance:0];
 	}
+	markDefaultFramebufferAttachmentsWritten();
 }
 
 

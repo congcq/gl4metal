@@ -15,7 +15,7 @@
 
 struct TranslatedUniform {
 	enum Kind { Float, Int, UInt, Bool, Sampler };
-	enum Dim { Dim2D, DimCube, Dim3D, Dim2DArray }; // samplers: what the shader samples
+	enum Dim { Dim2D, DimCube, Dim3D, Dim2DArray, DimBuffer }; // samplers: what the shader samples
 
 	std::string name;
 	Kind kind = Float;
@@ -23,6 +23,7 @@ struct TranslatedUniform {
 	int columns = 1;     // > 1 for matrices
 	int array_size = 1;
 	Dim dim = Dim2D;     // samplers only
+	uint32_t sampler_gl_type = 0; // exact GL sampler enum when source reflection provides it
 
 	struct Stage {
 		bool present = false;
@@ -55,7 +56,6 @@ struct TranslatedAttrib {
 
 struct TranslatedProgram {
 	std::string msl[2];                        // vertex, fragment (entry point "main0")
-	std::string msl_vs_flipped;                // vertex stage again with gl_Position.y negated, for render-to-texture draws
 	uint32_t block_size[2] = {0, 0};           // bytes of the default uniform block, 16 byte aligned, 0 = none
 	std::vector<TranslatedUniform> uniforms;
 	std::vector<TranslatedAttrib> attribs;     // vertex inputs

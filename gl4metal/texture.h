@@ -10,5 +10,7 @@
 
 MTLPixelFormat metalPixelFormat(GLenum internalformat);
 void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer);
+void refreshTextureBufferViews(GLuint bufferObject);
+GLint maxTextureBufferTexels(void);
 
 #endif /* TEXTURE_H */

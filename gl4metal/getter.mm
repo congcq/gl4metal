@@ -169,8 +169,18 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 0; // GL_TEXTURE_2D_ARRAY storage/upload is not implemented yet.
 			break;
 		case GL_MAX_TEXTURE_BUFFER_SIZE:
-			*data = 0; // glTexBuffer is not implemented yet.
+			*data = maxTextureBufferTexels();
 			break;
+		case GL_TEXTURE_BUFFER_FORMAT: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_BUFFER);
+			if (bound == ctx.bound_textures[ctx.active_texture_unit].end() || bound->second == 0) {
+				*data = 0;
+			} else {
+				auto texture = ctx.texture_objects.find(bound->second);
+				*data = texture == ctx.texture_objects.end() ? 0 : (GLint)texture->second.internalformat;
+			}
+			break;
+		}
 		case GL_MAX_SAMPLES: {
 			GLint maxSamples = 1;
 			for (GLint candidate = 2; candidate <= 16; candidate *= 2) {
@@ -283,6 +293,11 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
 			break;
 		}
+		case GL_TEXTURE_BINDING_BUFFER: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_BUFFER);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
 		case GL_SAMPLER_BINDING:
 			*data = (GLint)ctx.bound_samplers[ctx.active_texture_unit];
 			break;
@@ -370,7 +385,7 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 			} else {
 				auto buffer = ctx.buffer_objects.find(binding.buffer);
 				*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
-					? (GLint)buffer->second.length : 0;
+					? (GLint)glBufferLogicalSize(binding.buffer) : 0;
 			}
 			break;
 		}

@@ -144,6 +144,7 @@ static void writeMatrix(GLint location, GLsizei count, int cols, int rows, GLboo
 
 static GLenum glTypeOf(const TranslatedUniform &u) {
 	if (u.kind == TranslatedUniform::Sampler) {
+		if (u.sampler_gl_type != 0) return (GLenum)u.sampler_gl_type;
 		switch (u.dim) {
 			case TranslatedUniform::DimCube:    return GL_SAMPLER_CUBE;
 			case TranslatedUniform::Dim3D:      return GL_SAMPLER_3D;

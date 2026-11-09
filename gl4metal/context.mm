@@ -6,6 +6,7 @@
 //
 
 #import "context.h"
+#import "draw.h"
 
 extern "C" void *objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void *pool);
@@ -48,7 +49,13 @@ void glMakeCurrent(void *metalLayerPtr) {
 
 void glSwapBuffers(void) {
 	FramePoolCycle cycle; // drains the frame's autorelease pool on every return path
+	// The drawable's depth/stencil is not consumed after present. endRenderEncoder()
+	// finalizes deferred Metal store actions as DontCare for this final default-FB pass.
+	ctx.discard_default_depth_stencil_on_end = true;
 	endRenderEncoder(); // a render pass must be closed before the command buffer is committed
+	ctx.default_color_has_contents = false;
+	ctx.default_depth_has_contents = false;
+	ctx.default_stencil_has_contents = false;
 	if (!ctx.currentCommandBuffer && ctx.currentDrawable && ctx.commandQueue) {
 		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer]; // glFlush/fences may have committed this frame's work already
 	}
@@ -60,6 +67,7 @@ void glSwapBuffers(void) {
 	}
 	installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 	[ctx.currentCommandBuffer commit];
+	resetDrawUniformUploadArena(ctx.currentCommandBuffer);
 	resetTextureUploadArena(ctx.currentCommandBuffer);
 	ctx.last_committed_buffer = ctx.currentCommandBuffer;
 	ctx.currentCommandBuffer = nil;

@@ -8,6 +8,7 @@
 #import "buffers.h"
 
 #import "sync.h"
+#import "texture.h"
 
 #include <mutex>
 #include <unordered_set>
@@ -18,7 +19,7 @@ static bool isBufferTarget(GLenum target) {
 	return target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER ||
 		target == GL_UNIFORM_BUFFER || target == GL_COPY_READ_BUFFER ||
 		target == GL_COPY_WRITE_BUFFER || target == GL_PIXEL_PACK_BUFFER ||
-		target == GL_PIXEL_UNPACK_BUFFER;
+		target == GL_PIXEL_UNPACK_BUFFER || target == GL_TEXTURE_BUFFER;
 }
 
 // A buffer used by an encoded draw cannot be mutated in place while its command buffer
@@ -95,6 +96,16 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
 		ctx.buffer_last_use.erase(buf_id);
 	}
 	buffer = replacement;
+	refreshTextureBufferViews(buf_id);
+	// Rebuilding linear texture-buffer views may grow the replacement again to add
+	// row padding. Keep the caller's reference on the final shared backing store;
+	// otherwise the following CPU write would update an obsolete intermediate buffer.
+	auto refreshed = ctx.buffer_objects.find(buf_id);
+	if (refreshed == ctx.buffer_objects.end() || !refreshed->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	buffer = refreshed->second;
 	return true;
 }
 
@@ -127,6 +138,7 @@ void glGenBuffers(GLsizei n, GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
 		GLuint buf_id = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
 		ctx.buffer_objects[buf_id] = nil;     // name exists, storage comes with glBufferData
+		ctx.buffer_sizes[buf_id] = 0;
 		buffers[i] = buf_id;
 	}
 }
@@ -159,12 +171,25 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 				binding = UniformBufferBinding();
 			}
 		}
+		// Deleting a GL buffer detaches it from every texture-buffer object. The
+		// command buffer retains any old Metal resources already referenced by draws.
+		for (auto &textureEntry : ctx.texture_objects) {
+			TextureObject &textureObject = textureEntry.second;
+			if (textureObject.buffer_object == buf_id) {
+				textureObject.buffer_object = 0;
+				textureObject.buffer_sampler_type = 0;
+				textureObject.texture = nil;
+				textureObject.width = 0;
+				textureObject.height = 0;
+			}
+		}
 		invalidateConvertedVertexBuffers(buf_id);
 		{
 			std::lock_guard<std::mutex> lock(bufferUseMutex);
 			ctx.buffer_last_use.erase(buf_id);
 		}
-		ctx.buffer_objects.erase(buf_id); // ARC releases the MTLBuffer once in-flight command buffers are done with it
+		ctx.buffer_objects.erase(buf_id); // deleted buffer references were detached from texture-buffer objects above
+		ctx.buffer_sizes.erase(buf_id);
 	}
 }
 
@@ -180,6 +205,7 @@ void glBindBuffer(GLenum target, GLuint buffer) {
 	}
 	if (buffer != 0 && ctx.buffer_objects.find(buffer) == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil; // GL allows binding a name that was never generated
+		ctx.buffer_sizes[buffer] = 0;
 	}
 	ctx.bound_buffers[target] = buffer;
 	if (target == GL_ELEMENT_ARRAY_BUFFER) {
@@ -200,6 +226,7 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 	}
 	if (buffer != 0 && ctx.buffer_objects.find(buffer) == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil; // names are materialized on first bind, storage is allocated separately
+		ctx.buffer_sizes[buffer] = 0;
 	}
 	UniformBufferBinding newBinding;
 	newBinding.buffer = buffer;
@@ -240,6 +267,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 	auto object = ctx.buffer_objects.find(buffer);
 	if (object == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil;
+		ctx.buffer_sizes[buffer] = 0;
 		object = ctx.buffer_objects.find(buffer);
 	}
 	if (object == ctx.buffer_objects.end() || !object->second) {
@@ -247,7 +275,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 		GL4METAL_LOG("glBindBufferRange: buffer %u has no data store", buffer);
 		return;
 	}
-	const NSUInteger length = object->second.length;
+	const NSUInteger length = glBufferLogicalSize(buffer);
 	const NSUInteger off = (NSUInteger)offset;
 	const NSUInteger bytes = (NSUInteger)size;
 	if (off > length || bytes > length - off) {
@@ -308,11 +336,12 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		ctx.buffer_last_use.erase(buf_id);
 	}
 	ctx.buffer_objects[buf_id] = buffer;
+	ctx.buffer_sizes[buf_id] = (NSUInteger)size;
+	refreshTextureBufferViews(buf_id);
 }
 
 void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER && target != GL_UNIFORM_BUFFER &&
-		target != GL_COPY_READ_BUFFER && target != GL_COPY_WRITE_BUFFER && target != GL_PIXEL_PACK_BUFFER && target != GL_PIXEL_UNPACK_BUFFER) {
+	if (!isBufferTarget(target)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		return;
 	}
@@ -324,7 +353,8 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 		return;
 	}
 	id<MTLBuffer> buffer = it->second;
-	if (offset < 0 || size < 0 || (NSUInteger)offset > buffer.length || (NSUInteger)size > buffer.length - (NSUInteger)offset) {
+	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+	if (offset < 0 || size < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)size > logicalLength - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBufferSubData: range %ld+%ld is outside the buffer", (long)offset, (long)size);
 		return;
@@ -335,7 +365,7 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 			GL4METAL_LOG("glBufferSubData: data is null for a non-empty update");
 			return;
 		}
-		const bool replacesWholeStore = offset == 0 && (NSUInteger)size == buffer.length;
+		const bool replacesWholeStore = offset == 0 && (NSUInteger)size == logicalLength;
 		if (!makeBufferWritableWithoutStall(buf_id, buffer, !replacesWholeStore)) return;
 		invalidateConvertedVertexBuffers(buf_id);
 		memcpy((uint8_t *)buffer.contents + (NSUInteger)offset, data, (size_t)size);
@@ -343,8 +373,7 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 }
 
 void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data) {
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER && target != GL_UNIFORM_BUFFER &&
-		target != GL_COPY_READ_BUFFER && target != GL_COPY_WRITE_BUFFER && target != GL_PIXEL_PACK_BUFFER && target != GL_PIXEL_UNPACK_BUFFER) {
+	if (!isBufferTarget(target)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		return;
 	}
@@ -356,7 +385,8 @@ void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *d
 		return;
 	}
 	id<MTLBuffer> buffer = it->second;
-	if (offset < 0 || size < 0 || (NSUInteger)offset > buffer.length || (NSUInteger)size > buffer.length - (NSUInteger)offset) {
+	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+	if (offset < 0 || size < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)size > logicalLength - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetBufferSubData: range %ld+%ld is outside the buffer", (long)offset, (long)size);
 		return;
@@ -386,7 +416,9 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 	}
 	id<MTLBuffer> from = src->second;
 	id<MTLBuffer> to = dst->second;
-	if (readOffset < 0 || writeOffset < 0 || size < 0 || (NSUInteger)readOffset > from.length || (NSUInteger)size > from.length - (NSUInteger)readOffset || (NSUInteger)writeOffset > to.length || (NSUInteger)size > to.length - (NSUInteger)writeOffset) {
+	const NSUInteger sourceLogicalLength = glBufferLogicalSize(boundBuffer(readTarget));
+	const NSUInteger destinationLogicalLength = glBufferLogicalSize(boundBuffer(writeTarget));
+	if (readOffset < 0 || writeOffset < 0 || size < 0 || (NSUInteger)readOffset > sourceLogicalLength || (NSUInteger)size > sourceLogicalLength - (NSUInteger)readOffset || (NSUInteger)writeOffset > destinationLogicalLength || (NSUInteger)size > destinationLogicalLength - (NSUInteger)writeOffset) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glCopyBufferSubData: range does not fit the buffers");
 		return;
@@ -434,8 +466,7 @@ void *glMapBuffer(GLenum target, GLenum access) {
 }
 
 void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
-	if (target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER && target != GL_UNIFORM_BUFFER &&
-		target != GL_COPY_READ_BUFFER && target != GL_COPY_WRITE_BUFFER && target != GL_PIXEL_PACK_BUFFER && target != GL_PIXEL_UNPACK_BUFFER) {
+	if (!isBufferTarget(target)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		return NULL;
 	}
@@ -447,7 +478,8 @@ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 		return NULL;
 	}
 	id<MTLBuffer> buffer = it->second;
-	if (offset < 0 || length < 0 || (NSUInteger)offset > buffer.length || (NSUInteger)length > buffer.length - (NSUInteger)offset) {
+	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+	if (offset < 0 || length < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)length > logicalLength - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glMapBufferRange: range %ld+%ld outside %lu-byte buffer", (long)offset, (long)length, (unsigned long)buffer.length);
 		return NULL;
@@ -468,7 +500,8 @@ void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length)
 	GLuint buf_id = boundBuffer(target);
 	auto it = ctx.buffer_objects.find(buf_id);
 	if (buf_id == 0 || it == ctx.buffer_objects.end() || !it->second) { gl4metalSetError(GL_INVALID_OPERATION); return; }
-	if (offset < 0 || length < 0 || (NSUInteger)offset > it->second.length || (NSUInteger)length > it->second.length - (NSUInteger)offset) {
+	const NSUInteger logicalLength = glBufferLogicalSize(buf_id);
+	if (offset < 0 || length < 0 || (NSUInteger)offset > logicalLength || (NSUInteger)length > logicalLength - (NSUInteger)offset) {
 		gl4metalSetError(GL_INVALID_VALUE); return;
 	}
 	// Shared storage is coherent on Apple GPUs; invalidate cached repacks after CPU writes.
@@ -496,12 +529,12 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) {
 	}
 	id<MTLBuffer> buffer = it->second;
 	switch (pname) {
-		case GL_BUFFER_SIZE:       *params = (GLint)buffer.length; break;
+		case GL_BUFFER_SIZE:       *params = (GLint)glBufferLogicalSize(buf_id); break;
 		case GL_BUFFER_USAGE:      *params = GL_STATIC_DRAW;       break;
 		case GL_BUFFER_MAPPED:     *params = GL_FALSE;             break;
 		case GL_BUFFER_ACCESS:     *params = GL_READ_WRITE;        break;
 		case GL_BUFFER_MAP_OFFSET: *params = 0;                    break;
-		case GL_BUFFER_MAP_LENGTH: *params = (GLint)buffer.length; break;
+		case GL_BUFFER_MAP_LENGTH: *params = (GLint)glBufferLogicalSize(buf_id); break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetBufferParameteriv: unhandled pname 0x%X", pname);

@@ -29,6 +29,7 @@ static bool dumpEnabled() {
 // remains limited to default-block uniforms; named-block members are introspection-only.
 static GLenum activeUniformGLType(const TranslatedUniform &u) {
 	if (u.kind == TranslatedUniform::Sampler) {
+		if (u.sampler_gl_type != 0) return (GLenum)u.sampler_gl_type;
 		switch (u.dim) {
 			case TranslatedUniform::DimCube: return GL_SAMPLER_CUBE;
 			case TranslatedUniform::Dim3D: return GL_SAMPLER_3D;
@@ -199,23 +200,57 @@ void glLinkProgram(GLuint program) {
 					 program, tp.msl[0].c_str(), program, tp.msl[1].c_str());
 	}
 
-	// MSL -> MTLFunction. The Metal compiler runs here, so its errors become the link log like on a GL driver.
-	auto buildFunction = [&](const std::string &msl, const char *stageName) -> id<MTLFunction> {
+	// MSL -> MTLFunction. Compile one vertex library and specialize its static Y-flip
+	// function constant into two functions. The old path compiled the same vertex
+	// shader twice as separate Metal libraries for default-FB and texture-FB draws.
+	auto makeCompileOptions = []() -> MTLCompileOptions * {
 		MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 		options.languageVersion = MTLLanguageVersion2_2; // matches set_msl_version(2, 2) in the translator
-		NSError *error = nil;
-		NSString *source = [NSString stringWithUTF8String:msl.c_str()];
-		id<MTLLibrary> library = [ctx.device newLibraryWithSource:source options:options error:&error];
-		id<MTLFunction> function = [library newFunctionWithName:@"main0"]; // SPIRV-Cross renames main() to main0()
-		if (!function) {
-			p.info_log += std::string(stageName) + " stage failed to compile as Metal:\n" +
-						  (error ? error.localizedDescription.UTF8String : "no main0 entry point") + "\n";
-		}
-		return function;
+		// Leave Metal's default fast-math mode enabled, as in the previous compilation path.
+		return options;
 	};
-	id<MTLFunction> vertexFunction = buildFunction(tp.msl[0], "vertex");
-	id<MTLFunction> fragmentFunction = buildFunction(tp.msl[1], "fragment");
-	id<MTLFunction> flippedFunction = buildFunction(tp.msl_vs_flipped, "vertex (Y flipped)"); // for draws into textures
+
+	id<MTLLibrary> vertexLibrary = nil;
+	id<MTLFunction> vertexFunction = nil;
+	id<MTLFunction> flippedFunction = nil;
+	{
+		MTLCompileOptions *options = makeCompileOptions();
+		NSError *libraryError = nil;
+		NSString *source = [NSString stringWithUTF8String:tp.msl[0].c_str()];
+		vertexLibrary = [ctx.device newLibraryWithSource:source options:options error:&libraryError];
+		if (vertexLibrary) {
+			MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+			bool flipY = false;
+			[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
+			NSError *normalError = nil;
+			vertexFunction = [vertexLibrary newFunctionWithName:@"main0" constantValues:constants error:&normalError];
+			flipY = true;
+			[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
+			NSError *flippedError = nil;
+			flippedFunction = [vertexLibrary newFunctionWithName:@"main0" constantValues:constants error:&flippedError];
+			if (!vertexFunction || !flippedFunction) {
+				NSString *details = normalError ? normalError.localizedDescription :
+					(flippedError ? flippedError.localizedDescription : @"Metal did not create both specialized vertex functions");
+				p.info_log += std::string("vertex stage function specialization failed:\n") + details.UTF8String + "\n";
+			}
+		} else {
+			p.info_log += std::string("vertex stage failed to compile as Metal:\n") +
+				(libraryError ? libraryError.localizedDescription.UTF8String : "no Metal library") + "\n";
+		}
+	}
+
+	id<MTLFunction> fragmentFunction = nil;
+	{
+		MTLCompileOptions *options = makeCompileOptions();
+		NSError *error = nil;
+		NSString *source = [NSString stringWithUTF8String:tp.msl[1].c_str()];
+		id<MTLLibrary> library = [ctx.device newLibraryWithSource:source options:options error:&error];
+		fragmentFunction = [library newFunctionWithName:@"main0"]; // SPIRV-Cross renames main() to main0()
+		if (!fragmentFunction) {
+			p.info_log += std::string("fragment stage failed to compile as Metal:\n") +
+				(error ? error.localizedDescription.UTF8String : "no main0 entry point") + "\n";
+		}
+	}
 	if (!vertexFunction || !fragmentFunction || !flippedFunction) {
 		GL4METAL_LOG("glLinkProgram(%u): %s", program, p.info_log.c_str());
 		return;

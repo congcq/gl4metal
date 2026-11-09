@@ -18,25 +18,41 @@ MTLPixelFormat metalPixelFormat(GLenum internalformat) {
 		case GL_R8:
 		case GL_RED:
 			return MTLPixelFormatR8Unorm;
+		case GL_R8_SNORM:
+			return MTLPixelFormatR8Snorm;
 		case GL_RG8:
 		case GL_RG:
 			return MTLPixelFormatRG8Unorm;
+		case GL_RG8_SNORM:
+			return MTLPixelFormatRG8Snorm;
 		case GL_RGB8:
 		case GL_RGB:
 		case GL_RGBA8:
 		case GL_RGBA:
 			return MTLPixelFormatRGBA8Unorm;
+		case GL_RGB8_SNORM:
+		case GL_RGBA8_SNORM:
+			// Metal has no RGB8 texture format; RGB is expanded to RGBA by uploadPixels().
+			return MTLPixelFormatRGBA8Snorm;
 		case GL_SRGB8:
 		case GL_SRGB8_ALPHA8:
 			return MTLPixelFormatRGBA8Unorm_sRGB;
 		case GL_R16:
 			return MTLPixelFormatR16Unorm;
+		case GL_R16_SNORM:
+			return MTLPixelFormatR16Snorm;
 		case GL_RG16:
 			return MTLPixelFormatRG16Unorm;
+		case GL_RG16_SNORM:
+			return MTLPixelFormatRG16Snorm;
 		case GL_RGB16:
 		case GL_RGBA16:
 			// Metal has no three-channel 16-bit UNorm texture; keep RGB data in RGBA16.
 			return MTLPixelFormatRGBA16Unorm;
+		case GL_RGB16_SNORM:
+		case GL_RGBA16_SNORM:
+			// Metal has no three-channel 16-bit SNORM texture; keep RGB data in RGBA16Snorm.
+			return MTLPixelFormatRGBA16Snorm;
 		case GL_R16F:
 			return MTLPixelFormatR16Float;
 		case GL_RG16F:
@@ -159,7 +175,7 @@ static const uint8_t *resolveUnpackPointer(const void *pixels, size_t byteOffset
 		return nullptr;
 	}
 	const uintptr_t baseOffset = (uintptr_t)pixels;
-	const NSUInteger length = it->second.length;
+	const NSUInteger length = glBufferLogicalSize(pbo);
 	if (baseOffset > length || byteOffset > length - baseOffset || accessedBytes > length - baseOffset - byteOffset) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: pixel-unpack buffer range offset=%llu span=%llu exceeds %llu-byte buffer %u",
@@ -283,15 +299,21 @@ static bool sourceLayout(GLenum format, int &comps, int idx[4]) {
 // Components and bytes per component of the Metal formats we can write from the CPU.
 static bool destLayout(MTLPixelFormat f, int &comps, int &compSize) {
 	switch (f) {
-		case MTLPixelFormatR8Unorm:         comps = 1; compSize = 1; return true;
-		case MTLPixelFormatRG8Unorm:        comps = 2; compSize = 1; return true;
+		case MTLPixelFormatR8Unorm:
+		case MTLPixelFormatR8Snorm:         comps = 1; compSize = 1; return true;
+		case MTLPixelFormatRG8Unorm:
+		case MTLPixelFormatRG8Snorm:        comps = 2; compSize = 1; return true;
 		case MTLPixelFormatRGBA8Unorm:
-		case MTLPixelFormatRGBA8Unorm_sRGB: comps = 4; compSize = 1; return true;
+		case MTLPixelFormatRGBA8Unorm_sRGB:
+		case MTLPixelFormatRGBA8Snorm:      comps = 4; compSize = 1; return true;
 		case MTLPixelFormatR16Unorm:
+		case MTLPixelFormatR16Snorm:
 		case MTLPixelFormatR16Float:        comps = 1; compSize = 2; return true;
 		case MTLPixelFormatRG16Unorm:
+		case MTLPixelFormatRG16Snorm:
 		case MTLPixelFormatRG16Float:       comps = 2; compSize = 2; return true;
 		case MTLPixelFormatRGBA16Unorm:
+		case MTLPixelFormatRGBA16Snorm:
 		case MTLPixelFormatRGBA16Float:     comps = 4; compSize = 2; return true;
 		case MTLPixelFormatR32Float:        comps = 1; compSize = 4; return true;
 		case MTLPixelFormatRG32Float:       comps = 2; compSize = 4; return true;
@@ -324,14 +346,19 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 
 	int srcComps = 0, idx[4];
 	int dstComps = 0, dstCompSize = 0;
-	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
-		(type == GL_UNSIGNED_SHORT || type == GL_HALF_FLOAT) ? 2 : (type == GL_FLOAT ? 4 : 0);
+	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
+		(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 : (type == GL_FLOAT ? 4 : 0);
 	const MTLPixelFormat dstFormat = t.texture.pixelFormat;
 	const bool dstIs16Unorm = dstFormat == MTLPixelFormatR16Unorm || dstFormat == MTLPixelFormatRG16Unorm || dstFormat == MTLPixelFormatRGBA16Unorm;
 	const bool dstIs16Float = dstFormat == MTLPixelFormatR16Float || dstFormat == MTLPixelFormatRG16Float || dstFormat == MTLPixelFormatRGBA16Float;
+	const bool dstIs8Snorm = dstFormat == MTLPixelFormatR8Snorm || dstFormat == MTLPixelFormatRG8Snorm || dstFormat == MTLPixelFormatRGBA8Snorm;
+	const bool dstIs16Snorm = dstFormat == MTLPixelFormatR16Snorm || dstFormat == MTLPixelFormatRG16Snorm || dstFormat == MTLPixelFormatRGBA16Snorm;
 	const bool incompatible16Type = (dstIs16Unorm && type != GL_UNSIGNED_SHORT) || (dstIs16Float && type != GL_HALF_FLOAT);
+	const bool incompatibleSignedType = (dstIs8Snorm && type != GL_BYTE) || (dstIs16Snorm && type != GL_SHORT) ||
+		(!dstIs8Snorm && !dstIs16Snorm && (type == GL_BYTE || type == GL_SHORT));
 	if (!sourceLayout(format, srcComps, idx) || srcCompSize == 0 || !destLayout(dstFormat, dstComps, dstCompSize) ||
-		srcCompSize != dstCompSize || incompatible16Type || (type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
+		srcCompSize != dstCompSize || incompatible16Type || incompatibleSignedType ||
+		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("%s: unsupported upload, format 0x%X type 0x%X into MTLPixelFormat %d", caller, format, type, (int)t.texture.pixelFormat);
 		return;
@@ -374,7 +401,13 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 	}
 	MTLRegion region = MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h);
 
-	bool identical = (srcComps == dstComps);
+	// Metal stores GL_RGB formats in a four-component texture. Preserve GL's
+	// default alpha of +1 even when the upload source happens to be GL_RGBA.
+	const bool logicalRgb = t.internalformat == GL_RGB || t.internalformat == GL_RGB8 ||
+		t.internalformat == GL_RGB8_SNORM || t.internalformat == GL_SRGB8 ||
+		t.internalformat == GL_RGB16 || t.internalformat == GL_RGB16_SNORM ||
+		t.internalformat == GL_RGB16F || t.internalformat == GL_RGB32F;
+	bool identical = (srcComps == dstComps) && !logicalRgb;
 	for (int c = 0; c < dstComps && identical; c++) identical = (idx[c] == c);
 	if (srcRowBytes < copyRowBytes) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -404,8 +437,8 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		GL4METAL_LOG("%s: failed to allocate %lu-byte CPU upload staging buffer", caller, (unsigned long)tmpBytes);
 		return;
 	}
-	const uint8_t one8 = 255;
-	const uint16_t one16 = dstFormat == MTLPixelFormatRGBA16Float ? 0x3c00u : 0xffffu;
+	const uint8_t one8 = type == GL_BYTE ? 0x7f : 0xff;
+	const uint16_t one16 = dstIs16Snorm ? 0x7fffu : (dstFormat == MTLPixelFormatRGBA16Float ? 0x3c00u : 0xffffu);
 	const float one32 = 1.0f;
 	for (GLsizei row = 0; row < h; row++) {
 		const uint8_t *s = src + (size_t)row * srcRowBytes;
@@ -413,7 +446,11 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		for (GLsizei col = 0; col < w; col++, s += srcBpp, d += dstBpp) {
 			for (int c = 0; c < dstComps; c++) {
 				uint8_t *out = d + (size_t)c * dstCompSize;
-				if (idx[c] >= 0) {
+				if (logicalRgb && c == 3) {
+					const void *one = dstCompSize == 1 ? (const void *)&one8 :
+						(dstCompSize == 2 ? (const void *)&one16 : (const void *)&one32);
+					memcpy(out, one, (size_t)dstCompSize);
+				} else if (idx[c] >= 0) {
 					memcpy(out, s + (size_t)idx[c] * srcCompSize, (size_t)dstCompSize);
 				} else if (c == 3) {
 					const void *one = dstCompSize == 1 ? (const void *)&one8 :
@@ -543,9 +580,291 @@ void glBindTexture(GLenum target, GLuint texture) {
 	ctx.bound_textures[ctx.active_texture_unit][target] = texture;
 }
 
+// SPIRV-Cross's MSL backend emulates samplerBuffer with a 2D texture and
+// spvTexelBufferCoord(index) = uint2(index % 4096, index / 4096). Keep that
+// ABI stable: a linear MTLTexture view over the GL buffer is bound as texture2d<T>.
+static const NSUInteger kTexelBufferWidth = 4096;
+
+struct BufferTextureFormat {
+	MTLPixelFormat pixelFormat;
+	NSUInteger bytesPerTexel;
+	GLenum samplerType;
+};
+
+static bool bufferTextureFormat(GLenum internalformat, BufferTextureFormat &out) {
+	switch (internalformat) {
+		case GL_R8:         out = { MTLPixelFormatR8Unorm, 1, GL_SAMPLER_BUFFER }; return true;
+		case GL_R8_SNORM:   out = { MTLPixelFormatR8Snorm, 1, GL_SAMPLER_BUFFER }; return true;
+		case GL_R8I:        out = { MTLPixelFormatR8Sint, 1, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_R8UI:       out = { MTLPixelFormatR8Uint, 1, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_R16:        out = { MTLPixelFormatR16Unorm, 2, GL_SAMPLER_BUFFER }; return true;
+		case GL_R16_SNORM:  out = { MTLPixelFormatR16Snorm, 2, GL_SAMPLER_BUFFER }; return true;
+		case GL_R16F:       out = { MTLPixelFormatR16Float, 2, GL_SAMPLER_BUFFER }; return true;
+		case GL_R16I:       out = { MTLPixelFormatR16Sint, 2, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_R16UI:      out = { MTLPixelFormatR16Uint, 2, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_R32F:       out = { MTLPixelFormatR32Float, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_R32I:       out = { MTLPixelFormatR32Sint, 4, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_R32UI:      out = { MTLPixelFormatR32Uint, 4, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG8:        out = { MTLPixelFormatRG8Unorm, 2, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG8_SNORM:  out = { MTLPixelFormatRG8Snorm, 2, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG8I:       out = { MTLPixelFormatRG8Sint, 2, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG8UI:      out = { MTLPixelFormatRG8Uint, 2, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG16:       out = { MTLPixelFormatRG16Unorm, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG16_SNORM: out = { MTLPixelFormatRG16Snorm, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG16F:      out = { MTLPixelFormatRG16Float, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG16I:      out = { MTLPixelFormatRG16Sint, 4, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG16UI:     out = { MTLPixelFormatRG16Uint, 4, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG32F:      out = { MTLPixelFormatRG32Float, 8, GL_SAMPLER_BUFFER }; return true;
+		case GL_RG32I:      out = { MTLPixelFormatRG32Sint, 8, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RG32UI:     out = { MTLPixelFormatRG32Uint, 8, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA8:      out = { MTLPixelFormatRGBA8Unorm, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA8_SNORM:out = { MTLPixelFormatRGBA8Snorm, 4, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA8I:     out = { MTLPixelFormatRGBA8Sint, 4, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA8UI:    out = { MTLPixelFormatRGBA8Uint, 4, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA16:     out = { MTLPixelFormatRGBA16Unorm, 8, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA16_SNORM:out = { MTLPixelFormatRGBA16Snorm, 8, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA16F:    out = { MTLPixelFormatRGBA16Float, 8, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA16I:    out = { MTLPixelFormatRGBA16Sint, 8, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA16UI:   out = { MTLPixelFormatRGBA16Uint, 8, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA32F:    out = { MTLPixelFormatRGBA32Float, 16, GL_SAMPLER_BUFFER }; return true;
+		case GL_RGBA32I:    out = { MTLPixelFormatRGBA32Sint, 16, GL_INT_SAMPLER_BUFFER }; return true;
+		case GL_RGBA32UI:   out = { MTLPixelFormatRGBA32Uint, 16, GL_UNSIGNED_INT_SAMPLER_BUFFER }; return true;
+		default: return false;
+	}
+}
+
+static NSUInteger maxTextureBufferHeight(id<MTLDevice> device) {
+	if (!device || kTexelBufferWidth == 0) return 0;
+	NSUInteger maxHeight = 8192;
+	if (@available(iOS 13.0, *)) {
+		if ([device supportsFamily:MTLGPUFamilyApple3]) maxHeight = GL4METAL_MAX_TEXTURE_SIZE;
+	}
+	// GL_MAX_TEXTURE_BUFFER_SIZE is a device-wide texel limit. Advertise a limit
+	// representable even by the largest format supported below (RGBA32*, 16 B/texel),
+	// rather than exposing a limit that only R8 views can allocate.
+	const NSUInteger largestRowBytes = kTexelBufferWidth * 16u;
+	maxHeight = std::min(maxHeight, (NSUInteger)GL4METAL_MAX_TEXTURE_SIZE);
+	maxHeight = std::min(maxHeight, device.maxBufferLength / largestRowBytes);
+	return maxHeight;
+}
+
+GLint maxTextureBufferTexels(void) {
+	const NSUInteger rows = maxTextureBufferHeight(ctx.device);
+	const NSUInteger maxGLint = (NSUInteger)std::numeric_limits<GLint>::max();
+	if (rows > maxGLint / kTexelBufferWidth) return (GLint)maxGLint;
+	return (GLint)(rows * kTexelBufferWidth);
+}
+
+static bool bufferTextureLayout(GLenum internalformat, NSUInteger logicalSize,
+	BufferTextureFormat &viewFormat, NSUInteger &texelCount, NSUInteger &height,
+	NSUInteger &rowBytes, NSUInteger &requiredStorage) {
+	if (!bufferTextureFormat(internalformat, viewFormat)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glTexBuffer: unsupported texture-buffer internalformat 0x%X", internalformat);
+		return false;
+	}
+	if (!ctx.device || kTexelBufferWidth > GL4METAL_MAX_TEXTURE_SIZE) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	const NSUInteger availableTexels = logicalSize / viewFormat.bytesPerTexel;
+	const NSUInteger maximumTexels = (NSUInteger)maxTextureBufferTexels();
+	texelCount = std::min(availableTexels, maximumTexels);
+	if (maximumTexels == 0 && availableTexels != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: device cannot represent a linear texture-buffer row");
+		return false;
+	}
+	height = std::max<NSUInteger>(1, texelCount / kTexelBufferWidth + (texelCount % kTexelBufferWidth ? 1 : 0));
+	if (kTexelBufferWidth > NSUIntegerMax / viewFormat.bytesPerTexel) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return false;
+	}
+	rowBytes = kTexelBufferWidth * viewFormat.bytesPerTexel;
+	const NSUInteger alignment = [ctx.device minimumLinearTextureAlignmentForPixelFormat:viewFormat.pixelFormat];
+	if (alignment == 0 || (rowBytes % alignment) != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: row pitch %lu does not meet Metal linear-texture alignment %lu for format %d",
+			(unsigned long)rowBytes, (unsigned long)alignment, (int)viewFormat.pixelFormat);
+		return false;
+	}
+	if (height > NSUIntegerMax / rowBytes) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return false;
+	}
+	requiredStorage = rowBytes * height;
+	return true;
+}
+
+// Grow the Metal storage once to cover every texture-buffer view attached to this GL buffer.
+// Multiple views may have different pixel sizes/row pitches; growing during the per-view loop
+// would leave earlier views retaining an obsolete MTLBuffer.
+static bool ensureBufferTextureStorage(GLuint bufferObject, NSUInteger logicalSize, NSUInteger requiredStorage) {
+	auto bufferIt = ctx.buffer_objects.find(bufferObject);
+	if (bufferObject == 0 || bufferIt == ctx.buffer_objects.end() || !bufferIt->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: buffer %u has no allocated storage", bufferObject);
+		return false;
+	}
+	id<MTLBuffer> backing = bufferIt->second;
+	if (backing.length >= requiredStorage) return true;
+	if (requiredStorage > ctx.device.maxBufferLength) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glTexBuffer: padded backing store %llu exceeds Metal maxBufferLength",
+			(unsigned long long)requiredStorage);
+		return false;
+	}
+	id<MTLBuffer> expanded = [ctx.device newBufferWithLength:requiredStorage options:MTLResourceStorageModeShared];
+	if (!expanded) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glTexBuffer: failed to allocate %llu-byte padded Metal buffer",
+			(unsigned long long)requiredStorage);
+		return false;
+	}
+	memset(expanded.contents, 0, (size_t)requiredStorage);
+	const NSUInteger copyBytes = std::min<NSUInteger>(logicalSize, backing.length);
+	if (copyBytes != 0) memcpy(expanded.contents, backing.contents, (size_t)copyBytes);
+	ctx.buffer_objects[bufferObject] = expanded;
+	return true;
+}
+
+static id<MTLTexture> makeBufferTextureView(GLuint bufferObject, GLenum internalformat, NSUInteger logicalSize) {
+	BufferTextureFormat viewFormat;
+	NSUInteger texelCount = 0, height = 0, rowBytes = 0, requiredStorage = 0;
+	if (!bufferTextureLayout(internalformat, logicalSize, viewFormat, texelCount, height, rowBytes, requiredStorage)) return nil;
+	if (!ensureBufferTextureStorage(bufferObject, logicalSize, requiredStorage)) return nil;
+	auto bufferIt = ctx.buffer_objects.find(bufferObject);
+	if (bufferIt == ctx.buffer_objects.end() || !bufferIt->second) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return nil;
+	}
+
+	MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+	descriptor.textureType = MTLTextureType2D;
+	descriptor.pixelFormat = viewFormat.pixelFormat;
+	descriptor.width = kTexelBufferWidth;
+	descriptor.height = height;
+	descriptor.depth = 1;
+	descriptor.mipmapLevelCount = 1;
+	descriptor.sampleCount = 1;
+	descriptor.arrayLength = 1;
+	descriptor.usage = MTLTextureUsageShaderRead;
+	descriptor.storageMode = MTLStorageModeShared;
+	id<MTLTexture> view = [bufferIt->second newTextureWithDescriptor:descriptor offset:0 bytesPerRow:rowBytes];
+	if (!view) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: Metal rejected a %lux%lu linear texture view (format=%d rowBytes=%lu)",
+			(unsigned long)descriptor.width, (unsigned long)descriptor.height, (int)viewFormat.pixelFormat, (unsigned long)rowBytes);
+		return nil;
+	}
+	return view;
+}
+
+void refreshTextureBufferViews(GLuint bufferObject) {
+	if (bufferObject == 0) return;
+	const NSUInteger logicalSize = glBufferLogicalSize(bufferObject);
+	NSUInteger maximumStorage = 0;
+	// First pass: find the largest physical layout required by any view of this GL buffer.
+	for (const auto &entry : ctx.texture_objects) {
+		const TextureObject &textureObject = entry.second;
+		if (textureObject.target != GL_TEXTURE_BUFFER || textureObject.buffer_object != bufferObject) continue;
+		BufferTextureFormat viewFormat;
+		NSUInteger texelCount = 0, height = 0, rowBytes = 0, requiredStorage = 0;
+		if (bufferTextureLayout(textureObject.internalformat, logicalSize, viewFormat, texelCount, height, rowBytes, requiredStorage)) {
+			maximumStorage = std::max(maximumStorage, requiredStorage);
+		}
+	}
+	if (maximumStorage != 0 && !ensureBufferTextureStorage(bufferObject, logicalSize, maximumStorage)) {
+		for (auto &entry : ctx.texture_objects) {
+			TextureObject &textureObject = entry.second;
+			if (textureObject.target == GL_TEXTURE_BUFFER && textureObject.buffer_object == bufferObject) textureObject.texture = nil;
+		}
+		return;
+	}
+	// Second pass: all views now alias the same current MTLBuffer backing store.
+	for (auto &entry : ctx.texture_objects) {
+		TextureObject &textureObject = entry.second;
+		if (textureObject.target != GL_TEXTURE_BUFFER || textureObject.buffer_object != bufferObject) continue;
+		BufferTextureFormat viewFormat;
+		if (!bufferTextureFormat(textureObject.internalformat, viewFormat)) {
+			textureObject.texture = nil;
+			textureObject.width = 0;
+			textureObject.height = 1;
+			textureObject.buffer_sampler_type = 0;
+			continue;
+		}
+		textureObject.buffer_sampler_type = viewFormat.samplerType;
+		const NSUInteger visibleTexels = std::min<NSUInteger>(
+			logicalSize / viewFormat.bytesPerTexel, (NSUInteger)maxTextureBufferTexels());
+		textureObject.width = (GLsizei)std::min<NSUInteger>(visibleTexels, (NSUInteger)std::numeric_limits<GLsizei>::max());
+		textureObject.height = 1; // Buffer textures are logically one-dimensional.
+		textureObject.texture = makeBufferTextureView(bufferObject, textureObject.internalformat, logicalSize);
+	}
+}
+
 void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glTexBuffer: Unimplemented");
+	if (target != GL_TEXTURE_BUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *textureObject = boundTexture(GL_TEXTURE_BUFFER);
+	if (!textureObject) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: no GL_TEXTURE_BUFFER texture is bound");
+		return;
+	}
+	BufferTextureFormat viewFormat;
+	if (!bufferTextureFormat(internalformat, viewFormat)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glTexBuffer: unsupported internalformat 0x%X", internalformat);
+		return;
+	}
+	if (buffer == 0) {
+		textureObject->texture = nil;
+		textureObject->buffer_object = 0;
+		textureObject->width = textureObject->height = 0;
+		textureObject->buffer_sampler_type = viewFormat.samplerType;
+		textureObject->internalformat = internalformat;
+		return;
+	}
+	auto bufferIt = ctx.buffer_objects.find(buffer);
+	if (bufferIt == ctx.buffer_objects.end()) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexBuffer: buffer %u is not an existing buffer object", buffer);
+		return;
+	}
+	// An existing buffer with no data store is a legal zero-sized buffer texture.
+	if (!bufferIt->second) {
+		textureObject->texture = nil;
+		textureObject->buffer_object = buffer;
+		textureObject->buffer_sampler_type = viewFormat.samplerType;
+		textureObject->internalformat = internalformat;
+		textureObject->width = 0;
+		textureObject->height = 1;
+		return;
+	}
+	// Attach first, then rebuild every view of this buffer together. A different
+	// format may require a larger padded backing store; creating only this view
+	// could otherwise orphan previously attached views onto the old MTLBuffer.
+	const TextureObject previous = *textureObject;
+	textureObject->texture = nil;
+	textureObject->buffer_object = buffer;
+	textureObject->buffer_sampler_type = viewFormat.samplerType;
+	textureObject->internalformat = internalformat;
+	const NSUInteger visibleTexels = std::min<NSUInteger>(
+		glBufferLogicalSize(buffer) / viewFormat.bytesPerTexel, (NSUInteger)maxTextureBufferTexels());
+	textureObject->width = (GLsizei)std::min<NSUInteger>(visibleTexels, (NSUInteger)std::numeric_limits<GLsizei>::max());
+	textureObject->height = 1; // Buffer textures are logically one-dimensional.
+	refreshTextureBufferViews(buffer);
+	if (!textureObject->texture) {
+		*textureObject = previous;
+		// Rebuild both sets: refresh may have invalidated older views while attempting
+		// to grow storage for the rejected attachment.
+		refreshTextureBufferViews(buffer);
+		if (previous.buffer_object != 0 && previous.buffer_object != buffer)
+			refreshTextureBufferViews(previous.buffer_object);
+		return;
+	}
 }
 
 void glGenerateMipmap(GLenum target) {
@@ -1446,10 +1765,11 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 		return;
 	}
 	if (packBufferObject) {
-		if (bufferOffset > packBufferObject.length || requiredBytes > packBufferObject.length - bufferOffset) {
+		const NSUInteger logicalLength = glBufferLogicalSize(packBuffer);
+		if (bufferOffset > logicalLength || requiredBytes > logicalLength - bufferOffset) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("glGetTexImage: pixel-pack buffer range %lu+%lu exceeds %lu bytes",
-				(unsigned long)bufferOffset, (unsigned long)requiredBytes, (unsigned long)packBufferObject.length);
+				(unsigned long)bufferOffset, (unsigned long)requiredBytes, (unsigned long)logicalLength);
 			return;
 		}
 	}
@@ -1556,8 +1876,14 @@ void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat 
 }
 
 void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (target == GL_TEXTURE_BUFFER && level != 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	GLsizei w = 0, h = 0;
 	GLenum internalformat = 0;
+	GLuint bufferObject = 0;
 
 	if (target == GL_PROXY_TEXTURE_2D) {
 		w = ctx.proxy_texture_2d.w;
@@ -1565,7 +1891,12 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 		internalformat = ctx.proxy_texture_2d.internalformat;
 	} else {
 		TextureObject *t = boundTexture(cubeFace(target) >= 0 ? GL_TEXTURE_CUBE_MAP : target);
-		if (t && t->texture && level >= 0 && (NSUInteger)level < t->texture.mipmapLevelCount) {
+		if (t && level >= 0 && t->target == GL_TEXTURE_BUFFER && target == GL_TEXTURE_BUFFER) {
+			w = t->width;
+			h = t->height;
+			internalformat = t->internalformat;
+			bufferObject = t->buffer_object;
+		} else if (t && t->texture && level >= 0 && (NSUInteger)level < t->texture.mipmapLevelCount) {
 			w = std::max(1, t->width >> level);
 			h = std::max(1, t->height >> level);
 			internalformat = t->internalformat;
@@ -1575,8 +1906,12 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 	switch (pname) {
 		case GL_TEXTURE_WIDTH:           *params = w; break;
 		case GL_TEXTURE_HEIGHT:          *params = h; break;
-		case GL_TEXTURE_DEPTH:           *params = (w > 0) ? 1 : 0; break;
+		case GL_TEXTURE_DEPTH:           *params = (target == GL_TEXTURE_BUFFER || w > 0) ? 1 : 0; break;
 		case GL_TEXTURE_INTERNAL_FORMAT: *params = (GLint)internalformat; break;
+		case GL_TEXTURE_BUFFER_DATA_STORE_BINDING:
+			if (target != GL_TEXTURE_BUFFER) { gl4metalSetError(GL_INVALID_ENUM); *params = 0; break; }
+			*params = (GLint)bufferObject;
+			break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetTexLevelParameteriv: unhandled pname 0x%X", pname);

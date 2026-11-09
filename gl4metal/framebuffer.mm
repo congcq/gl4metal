@@ -17,9 +17,19 @@
 
 void endRenderEncoder(void) {
 	if (ctx.currentEncoder) {
+		if (ctx.pass_uses_default_framebuffer) {
+			const MTLStoreAction depthStencilStore = ctx.discard_default_depth_stencil_on_end
+				? MTLStoreActionDontCare : MTLStoreActionStore;
+			// Default-FB descriptors use Unknown so these encoder methods can choose the
+			// final action. Mid-frame switches must preserve data; present can discard it.
+			[ctx.currentEncoder setDepthStoreAction:depthStencilStore];
+			[ctx.currentEncoder setStencilStoreAction:depthStencilStore];
+		}
 		[ctx.currentEncoder endEncoding];
 		ctx.currentEncoder = nil;
 	}
+	ctx.discard_default_depth_stencil_on_end = false;
+	ctx.pass_uses_default_framebuffer = false;
 }
 
 static bool isDepthFormat(MTLPixelFormat format) {
@@ -98,6 +108,8 @@ static id<MTLTexture> defaultDepthTexture(NSUInteger width, NSUInteger height) {
 																			  mipmapped:NO];
 	d.usage = MTLTextureUsageRenderTarget;
 	d.storageMode = MTLStorageModePrivate;
+	ctx.default_depth_has_contents = false;
+	ctx.default_stencil_has_contents = false;
 	ctx.depthTexture = [ctx.device newTextureWithDescriptor:d];
 	if (!ctx.depthTexture || (ctx.depthTexture.usage & MTLTextureUsageRenderTarget) == 0) {
 		GL4METAL_LOG("beginRenderPass: failed to allocate default depth/stencil texture (%lux%lu)", (unsigned long)width, (unsigned long)height);
@@ -191,6 +203,11 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 		rtWidth = color.width;
 		rtHeight = color.height;
 
+		// Newly acquired drawables have undefined previous contents. Don't load them
+		// on the first pass unless GL has already rendered to this drawable this frame.
+		if (!(clearMask & GL_COLOR_BUFFER_BIT) && !ctx.default_color_has_contents) {
+			colorLoad = MTLLoadActionDontCare;
+		}
 		MTLRenderPassColorAttachmentDescriptor *ca = rp.colorAttachments[0];
 		ca.texture = color;
 		ca.loadAction = colorLoad;
@@ -200,13 +217,23 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 
 		id<MTLTexture> depth = defaultDepthTexture(rtWidth, rtHeight);
 		if (!depth) return nil;
+		// The drawable's depth/stencil is not preserved across presented frames. Avoid
+		// loading undefined contents on the first pass that does not explicitly clear.
+		if (!(clearMask & GL_DEPTH_BUFFER_BIT) && !ctx.default_depth_has_contents) {
+			depthLoad = MTLLoadActionDontCare;
+		}
+		if (!(clearMask & GL_STENCIL_BUFFER_BIT) && !ctx.default_stencil_has_contents) {
+			stencilLoad = MTLLoadActionDontCare;
+		}
 		rp.depthAttachment.texture = depth;
 		rp.depthAttachment.loadAction = depthLoad;
-		rp.depthAttachment.storeAction = MTLStoreActionStore;
+		// Store is deferred until endRenderEncoder(): Store for an intermediate pass,
+		// DontCare after present. Metal requires Unknown for the encoder setter APIs.
+		rp.depthAttachment.storeAction = MTLStoreActionUnknown;
 		rp.depthAttachment.clearDepth = ctx.clear_depth;
 		rp.stencilAttachment.texture = depth;
 		rp.stencilAttachment.loadAction = stencilLoad;
-		rp.stencilAttachment.storeAction = MTLStoreActionStore;
+		rp.stencilAttachment.storeAction = MTLStoreActionUnknown;
 		rp.stencilAttachment.clearStencil = (uint32_t)ctx.clear_stencil;
 		ctx.pass_depth_format = depth.pixelFormat;
 		ctx.pass_stencil_format = depth.pixelFormat;
@@ -299,6 +326,12 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
 	}
 	ctx.render_target_width = rtWidth;
 	ctx.render_target_height = rtHeight;
+	ctx.pass_uses_default_framebuffer = (ctx.draw_fbo == 0);
+	if (ctx.pass_uses_default_framebuffer) {
+		if (clearMask & GL_COLOR_BUFFER_BIT) ctx.default_color_has_contents = true;
+		if (clearMask & GL_DEPTH_BUFFER_BIT) ctx.default_depth_has_contents = true;
+		if (clearMask & GL_STENCIL_BUFFER_BIT) ctx.default_stencil_has_contents = true;
+	}
 	applyViewportAndScissor();
 	return ctx.currentEncoder;
 }
@@ -804,6 +837,226 @@ static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
 	return pipeline;
 }
 
+static bool ensureDefaultFramebufferDepthTexture() {
+	if (!ctx.metalLayer) return false;
+	if (!ctx.currentDrawable) ctx.currentDrawable = [ctx.metalLayer nextDrawable];
+	if (!ctx.currentDrawable || !ctx.currentDrawable.texture) return false;
+	return defaultDepthTexture(ctx.currentDrawable.texture.width, ctx.currentDrawable.texture.height) != nil;
+}
+
+static id<MTLTexture> framebufferDepthStencilTexture(GLuint framebuffer, bool depth) {
+	if (framebuffer == 0) {
+		if (!ensureDefaultFramebufferDepthTexture()) return nil;
+		return ctx.depthTexture;
+	}
+	auto framebufferIt = ctx.fbo_objects.find(framebuffer);
+	if (framebufferIt == ctx.fbo_objects.end()) return nil;
+	return attachmentTexture(depth ? framebufferIt->second.depth : framebufferIt->second.stencil);
+}
+
+static NSUInteger blitMetalY(GLuint framebuffer, id<MTLTexture> texture, NSUInteger level, GLint glY, NSUInteger height) {
+	const NSUInteger textureHeight = std::max<NSUInteger>(1, texture.height >> level);
+	if (framebuffer == 0) return textureHeight - ((NSUInteger)glY + height);
+	return (NSUInteger)glY;
+}
+
+static bool encodeDepthStencilPlaneCopy(id<MTLTexture> source, NSUInteger sourceLevel,
+	id<MTLTexture> destination, NSUInteger destinationLevel,
+	NSUInteger sourceX, NSUInteger sourceY, NSUInteger destinationX, NSUInteger destinationY,
+	NSUInteger width, NSUInteger height, bool depthPlane) {
+	if (!source || !destination || !ctx.device || source.pixelFormat != destination.pixelFormat ||
+		source.sampleCount != 1 || destination.sampleCount != 1 ||
+		source.textureType != MTLTextureType2D || destination.textureType != MTLTextureType2D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBlitFramebuffer: depth/stencil source and destination must be single-sample 2D textures with identical formats");
+		return false;
+	}
+	const NSUInteger sourceWidth = std::max<NSUInteger>(1, source.width >> sourceLevel);
+	const NSUInteger sourceHeight = std::max<NSUInteger>(1, source.height >> sourceLevel);
+	const NSUInteger destinationWidth = std::max<NSUInteger>(1, destination.width >> destinationLevel);
+	const NSUInteger destinationHeight = std::max<NSUInteger>(1, destination.height >> destinationLevel);
+	if (sourceX > sourceWidth || width > sourceWidth - sourceX || sourceY > sourceHeight || height > sourceHeight - sourceY ||
+		destinationX > destinationWidth || width > destinationWidth - destinationX ||
+		destinationY > destinationHeight || height > destinationHeight - destinationY) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glBlitFramebuffer: depth/stencil rectangle is outside the source or destination attachment");
+		return false;
+	}
+
+	const bool packedDepthStencil = source.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+	if (!packedDepthStencil) {
+		if (depthPlane && !isDepthFormat(source.pixelFormat)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return false;
+		}
+		if (!depthPlane && !isStencilFormat(source.pixelFormat)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return false;
+		}
+		if (!ctx.currentCommandBuffer) {
+			if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+		}
+		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
+		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+		[copyEncoder copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
+			sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+			sourceSize:MTLSizeMake(width, height, 1)
+			toTexture:destination destinationSlice:0 destinationLevel:destinationLevel
+			destinationOrigin:MTLOriginMake(destinationX, destinationY, 0)];
+		[copyEncoder endEncoding];
+		return true;
+	}
+
+	// A depth-only or stencil-only blit from a packed Depth32Float_Stencil8 texture
+	// uses Metal's explicit aspect extraction options through a temporary linear buffer.
+	const NSUInteger bytesPerPixel = depthPlane ? 4 : 1;
+	const NSUInteger rawRowBytes = width * bytesPerPixel;
+	const NSUInteger rowBytes = (rawRowBytes + 255u) & ~((NSUInteger)255u);
+	if (height > NSUIntegerMax / rowBytes) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+	const NSUInteger scratchLength = rowBytes * height;
+	if (scratchLength > ctx.device.maxBufferLength) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+	id<MTLBuffer> scratch = [ctx.device newBufferWithLength:scratchLength options:MTLResourceStorageModeShared];
+	if (!scratch) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+	if (!ctx.currentCommandBuffer) {
+		if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	}
+	id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
+	if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+	const MTLBlitOption aspectOption = depthPlane ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionStencilFromDepthStencil;
+	[copyEncoder copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
+		sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+		sourceSize:MTLSizeMake(width, height, 1)
+		toBuffer:scratch destinationOffset:0 destinationBytesPerRow:rowBytes
+		destinationBytesPerImage:0 options:aspectOption];
+	[copyEncoder copyFromBuffer:scratch sourceOffset:0 sourceBytesPerRow:rowBytes
+		sourceBytesPerImage:0 sourceSize:MTLSizeMake(width, height, 1)
+		toTexture:destination destinationSlice:0 destinationLevel:destinationLevel
+		destinationOrigin:MTLOriginMake(destinationX, destinationY, 0) options:aspectOption];
+	[copyEncoder endEncoding];
+	return true;
+}
+
+static bool performDepthStencilBlit(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+	GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask) {
+	if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) == 0) return true;
+	auto markDefaultDepthStencilContents = [&](GLbitfield copiedAspects) {
+		if (ctx.draw_fbo != 0) return;
+		if (copiedAspects & GL_DEPTH_BUFFER_BIT) ctx.default_depth_has_contents = true;
+		if (copiedAspects & GL_STENCIL_BUFFER_BIT) ctx.default_stencil_has_contents = true;
+	};
+	if ((ctx.read_fbo != 0 && glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) ||
+		(ctx.draw_fbo != 0 && glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)) {
+		gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
+		return false;
+	}
+	if (srcX0 < 0 || srcY0 < 0 || dstX0 < 0 || dstY0 < 0 ||
+		srcX1 <= srcX0 || srcY1 <= srcY0 || dstX1 <= dstX0 || dstY1 <= dstY0 ||
+		srcX1 - srcX0 != dstX1 - dstX0 || srcY1 - srcY0 != dstY1 - dstY0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBlitFramebuffer: depth/stencil blits require positive, equal-sized source and destination rectangles");
+		return false;
+	}
+	const NSUInteger width = (NSUInteger)(srcX1 - srcX0);
+	const NSUInteger height = (NSUInteger)(srcY1 - srcY0);
+	id<MTLTexture> sourceDepth = nil, destinationDepth = nil;
+	id<MTLTexture> sourceStencil = nil, destinationStencil = nil;
+	NSUInteger sourceDepthLevel = 0, destinationDepthLevel = 0;
+	NSUInteger sourceStencilLevel = 0, destinationStencilLevel = 0;
+
+	if (mask & GL_DEPTH_BUFFER_BIT) {
+		if (ctx.read_fbo != 0) {
+			auto sourceFbo = ctx.fbo_objects.find(ctx.read_fbo);
+			if (sourceFbo != ctx.fbo_objects.end()) sourceDepthLevel = (NSUInteger)std::max(sourceFbo->second.depth.level, 0);
+		}
+		if (ctx.draw_fbo != 0) {
+			auto destinationFbo = ctx.fbo_objects.find(ctx.draw_fbo);
+			if (destinationFbo != ctx.fbo_objects.end()) destinationDepthLevel = (NSUInteger)std::max(destinationFbo->second.depth.level, 0);
+		}
+		sourceDepth = framebufferDepthStencilTexture(ctx.read_fbo, true);
+		destinationDepth = framebufferDepthStencilTexture(ctx.draw_fbo, true);
+		if (!sourceDepth || !destinationDepth) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glBlitFramebuffer: depth bit requested but the read/draw framebuffer lacks a valid depth attachment");
+			return false;
+		}
+	}
+	if (mask & GL_STENCIL_BUFFER_BIT) {
+		if (ctx.read_fbo != 0) {
+			auto sourceFbo = ctx.fbo_objects.find(ctx.read_fbo);
+			if (sourceFbo != ctx.fbo_objects.end()) sourceStencilLevel = (NSUInteger)std::max(sourceFbo->second.stencil.level, 0);
+		}
+		if (ctx.draw_fbo != 0) {
+			auto destinationFbo = ctx.fbo_objects.find(ctx.draw_fbo);
+			if (destinationFbo != ctx.fbo_objects.end()) destinationStencilLevel = (NSUInteger)std::max(destinationFbo->second.stencil.level, 0);
+		}
+		sourceStencil = framebufferDepthStencilTexture(ctx.read_fbo, false);
+		destinationStencil = framebufferDepthStencilTexture(ctx.draw_fbo, false);
+		if (!sourceStencil || !destinationStencil) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glBlitFramebuffer: stencil bit requested but the read/draw framebuffer lacks a valid stencil attachment");
+			return false;
+		}
+	}
+
+	// Copy both aspects in one operation when both framebuffers use the same packed format.
+	if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) == (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) &&
+		sourceDepth && destinationDepth && sourceStencil == sourceDepth && destinationStencil == destinationDepth &&
+		sourceDepth.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && destinationDepth.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+		if (sourceDepth.sampleCount != 1 || destinationDepth.sampleCount != 1 || sourceDepth.textureType != MTLTextureType2D || destinationDepth.textureType != MTLTextureType2D) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return false;
+		}
+		const NSUInteger sourceWidth = std::max<NSUInteger>(1, sourceDepth.width >> sourceDepthLevel);
+		const NSUInteger sourceHeight = std::max<NSUInteger>(1, sourceDepth.height >> sourceDepthLevel);
+		const NSUInteger destinationWidth = std::max<NSUInteger>(1, destinationDepth.width >> destinationDepthLevel);
+		const NSUInteger destinationHeight = std::max<NSUInteger>(1, destinationDepth.height >> destinationDepthLevel);
+		if ((NSUInteger)srcX0 + width > sourceWidth || (NSUInteger)srcY0 + height > sourceHeight ||
+			(NSUInteger)dstX0 + width > destinationWidth || (NSUInteger)dstY0 + height > destinationHeight) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			return false;
+		}
+		if (sourceDepth == destinationDepth) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+		endRenderEncoder();
+		if (!ctx.currentCommandBuffer) {
+			if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+		}
+		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
+		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+		const NSUInteger sourceMetalY = blitMetalY(ctx.read_fbo, sourceDepth, sourceDepthLevel, srcY0, height);
+		const NSUInteger destinationMetalY = blitMetalY(ctx.draw_fbo, destinationDepth, destinationDepthLevel, dstY0, height);
+		[copyEncoder copyFromTexture:sourceDepth sourceSlice:0 sourceLevel:sourceDepthLevel
+			sourceOrigin:MTLOriginMake((NSUInteger)srcX0, sourceMetalY, 0)
+			sourceSize:MTLSizeMake(width, height, 1)
+			toTexture:destinationDepth destinationSlice:0 destinationLevel:destinationDepthLevel
+			destinationOrigin:MTLOriginMake((NSUInteger)dstX0, destinationMetalY, 0)];
+		[copyEncoder endEncoding];
+		markDefaultDepthStencilContents(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+		return true;
+	}
+
+	endRenderEncoder();
+	if (mask & GL_DEPTH_BUFFER_BIT) {
+		if (sourceDepth == destinationDepth) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+		const NSUInteger sourceMetalY = blitMetalY(ctx.read_fbo, sourceDepth, sourceDepthLevel, srcY0, height);
+		const NSUInteger destinationMetalY = blitMetalY(ctx.draw_fbo, destinationDepth, destinationDepthLevel, dstY0, height);
+		if (!encodeDepthStencilPlaneCopy(sourceDepth, sourceDepthLevel, destinationDepth, destinationDepthLevel,
+			(NSUInteger)srcX0, sourceMetalY, (NSUInteger)dstX0, destinationMetalY, width, height, true)) return false;
+		markDefaultDepthStencilContents(GL_DEPTH_BUFFER_BIT);
+	}
+	if (mask & GL_STENCIL_BUFFER_BIT) {
+		if (sourceStencil == destinationStencil) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+		const NSUInteger sourceMetalY = blitMetalY(ctx.read_fbo, sourceStencil, sourceStencilLevel, srcY0, height);
+		const NSUInteger destinationMetalY = blitMetalY(ctx.draw_fbo, destinationStencil, destinationStencilLevel, dstY0, height);
+		if (!encodeDepthStencilPlaneCopy(sourceStencil, sourceStencilLevel, destinationStencil, destinationStencilLevel,
+			(NSUInteger)srcX0, sourceMetalY, (NSUInteger)dstX0, destinationMetalY, width, height, false)) return false;
+		markDefaultDepthStencilContents(GL_STENCIL_BUFFER_BIT);
+	}
+	return true;
+}
+
 static id<MTLSamplerState> blitSampler(bool linear) {
 	static std::mutex samplerMutex;
 	std::lock_guard<std::mutex> lock(samplerMutex);
@@ -828,12 +1081,16 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 		gl4metalSetError(GL_INVALID_VALUE);
 		return;
 	}
+	if (srcX0 == srcX1 || srcY0 == srcY1 || dstX0 == dstX1 || dstY0 == dstY1) return;
 	if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
-		GL4METAL_LOG("glBlitFramebuffer: depth/stencil blits are not supported yet (colour only)");
+		if (filter != GL_NEAREST) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glBlitFramebuffer: depth/stencil blits require GL_NEAREST");
+			return;
+		}
+		if (!performDepthStencilBlit(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask)) return;
 	}
-	if (!(mask & GL_COLOR_BUFFER_BIT)) {
-		return;
-	}
+	if (!(mask & GL_COLOR_BUFFER_BIT)) return;
 	if (srcX0 == srcX1 || srcY0 == srcY1 || dstX0 == dstX1 || dstY0 == dstY1) return;
 
 	// Source: colour attachment of the read framebuffer.
@@ -912,7 +1169,10 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 	rp.colorAttachments[0].texture = dst;
 	rp.colorAttachments[0].level = dstLevel;
-	rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+	// A newly acquired drawable has undefined contents. Loading it before the
+	// first write is both unnecessary and potentially undefined on tile GPUs.
+	rp.colorAttachments[0].loadAction =
+		(dstDefault && !ctx.default_color_has_contents) ? MTLLoadActionDontCare : MTLLoadActionLoad;
 	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 
 	if (!ctx.currentCommandBuffer) {
@@ -955,6 +1215,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 	[enc setFragmentSamplerState:sampler atIndex:0];
 	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 	[enc endEncoding];
+	if (dstDefault) ctx.default_color_has_contents = true;
 }
 
 static bool checkedReadSizeAdd(size_t a, size_t b, size_t &out) {
@@ -1081,10 +1342,11 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 			GL4METAL_LOG("glReadPixels: GL_PIXEL_PACK_BUFFER %u has no CPU-visible storage", pbo);
 			return;
 		}
-		if (baseOffset > buffer->second.length || requiredSpan > buffer->second.length - baseOffset) {
+		const NSUInteger logicalLength = glBufferLogicalSize(pbo);
+		if (baseOffset > logicalLength || requiredSpan > logicalLength - baseOffset) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("glReadPixels: pixel-pack range offset=%llu span=%llu exceeds buffer %u length %llu",
-				(unsigned long long)baseOffset, (unsigned long long)requiredSpan, pbo, (unsigned long long)buffer->second.length);
+				(unsigned long long)baseOffset, (unsigned long long)requiredSpan, pbo, (unsigned long long)logicalLength);
 			return;
 		}
 		dst = (uint8_t *)buffer->second.contents + baseOffset;

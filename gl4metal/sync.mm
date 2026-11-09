@@ -1,4 +1,5 @@
 #import "sync.h"
+#import "draw.h"
 
 #include <unistd.h>
 #include <mutex>
@@ -53,6 +54,7 @@ void flushCommandBuffer(bool waitUntilCompleted) {
 	if (ctx.currentCommandBuffer) {
 		installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 		[ctx.currentCommandBuffer commit];
+		resetDrawUniformUploadArena(ctx.currentCommandBuffer);
 		resetTextureUploadArena(ctx.currentCommandBuffer);
 		ctx.last_committed_buffer = ctx.currentCommandBuffer;
 		ctx.currentCommandBuffer = nil;

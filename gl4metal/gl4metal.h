@@ -25,6 +25,17 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
+// Some older platform GL headers expose the ARB-suffixed token only, even
+// though GL_TEXTURE_BUFFER_FORMAT is part of the OpenGL 3.1 texture-buffer API.
+// Keep the unsuffixed core spelling available to the backend on every build.
+#ifndef GL_TEXTURE_BUFFER_FORMAT
+#  ifdef GL_TEXTURE_BUFFER_FORMAT_ARB
+#    define GL_TEXTURE_BUFFER_FORMAT GL_TEXTURE_BUFFER_FORMAT_ARB
+#  else
+#    define GL_TEXTURE_BUFFER_FORMAT 0x8C2E
+#  endif
+#endif
+
 #include "shadertranslator.h"
 
 #define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
@@ -42,6 +53,8 @@ struct TextureObject {
 	id<MTLTexture> texture = nil;
 	GLenum internalformat = GL_RGBA8;
 	GLsizei width = 0, height = 0; // level 0 size
+	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
+	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
 
 	// sampler parameters (consumed when the texture is bound to a shader)
 	GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR;
@@ -316,9 +329,26 @@ struct MTLContext {
 	// Independent blend factors/equations for GL draw-buffer indices 0...7.
 	// Appended to keep the offsets of older MTLContext members stable.
 	BlendBufferState blend_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS];
+
+	// Exact GL buffer-store sizes. Metal storage may be larger when padded for linear texture-buffer views.
+	std::unordered_map<GLuint, NSUInteger> buffer_sizes;
+
+	// Default drawable depth/stencil contents are transient between presents. Appended to preserve layout.
+	bool default_color_has_contents = false;
+	bool default_depth_has_contents = false;
+	bool default_stencil_has_contents = false;
+	bool pass_uses_default_framebuffer = false;
+	bool discard_default_depth_stencil_on_end = false;
 };
 
 extern MTLContext ctx;
+
+inline NSUInteger glBufferLogicalSize(GLuint bufferName) {
+	auto sizeIt = ctx.buffer_sizes.find(bufferName);
+	if (sizeIt != ctx.buffer_sizes.end()) return sizeIt->second;
+	auto bufferIt = ctx.buffer_objects.find(bufferName);
+	return bufferIt != ctx.buffer_objects.end() && bufferIt->second ? bufferIt->second.length : 0;
+}
 extern std::recursive_mutex gl4metalSamplerObjectMutex; // sampler object state shared by GL entry points and draw.mm
 
 static inline GLuint boundBuffer(GLenum target) {
