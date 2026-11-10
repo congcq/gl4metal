@@ -83,7 +83,7 @@ static void writeVector(GLint location, GLsizei count, int comps, SrcKind kind, 
 	}
 
 	for (GLsizei i = 0; i < count && element + i < u->info.array_size; i++) {
-		for (int s = 0; s < 2; s++) { // the same uniform may live in both stages
+		for (int s = 0; s < 3; s++) { // the same uniform may live in vertex, fragment or compute
 			const TranslatedUniform::Stage &st = u->info.stage[s];
 			if (!st.present) {
 				continue;
@@ -121,7 +121,7 @@ static void writeMatrix(GLint location, GLsizei count, int cols, int rows, GLboo
 
 	for (GLsizei i = 0; i < count && element + i < u->info.array_size; i++) {
 		const GLfloat *m = value + (size_t)i * cols * rows;
-		for (int s = 0; s < 2; s++) {
+		for (int s = 0; s < 3; s++) {
 			const TranslatedUniform::Stage &st = u->info.stage[s];
 			if (!st.present) {
 				continue;
@@ -198,7 +198,7 @@ static void readUniform(GLuint program, GLint location, int count, double *out) 
 		out[0] = u.units[(size_t)element];
 		return;
 	}
-	for (int s = 0; s < 2; s++) {
+	for (int s = 0; s < 3; s++) {
 		const TranslatedUniform::Stage &st = u.info.stage[s];
 		if (!st.present) {
 			continue;
@@ -405,6 +405,7 @@ void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum 
 			break;
 		case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER: *params = block.info.stage[0].present; break;
 		case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER: *params = block.info.stage[1].present; break;
+		case GL_UNIFORM_BLOCK_REFERENCED_BY_COMPUTE_SHADER: *params = block.info.stage[2].present; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetActiveUniformBlockiv: unhandled pname 0x%X", pname);

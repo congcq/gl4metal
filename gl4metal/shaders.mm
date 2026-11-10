@@ -2,8 +2,8 @@
 #include <GL/glcorearb.h>
 
 GLuint glCreateShader(GLenum type) {
-	if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER) {
-		gl4metalSetError(GL_INVALID_OPERATION);
+	if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER && type != GL_COMPUTE_SHADER) {
+		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glCreateShader: unsupported shader type 0x%X (Metal has no geometry/tessellation stage in this layer)", type);
 		return 0;
 	}
@@ -84,7 +84,7 @@ void glCompileShader(GLuint shader) {
 	const char *dump = getenv("GL4METAL_DUMP_SHADERS");
 	if (dump && dump[0] == '1') {
 		GL4METAL_LOG("---- %s shader %u ----\n%s\n---- end shader %u ----",
-			s.type == GL_VERTEX_SHADER ? "vertex" : "fragment", shader, s.source.c_str(), shader);
+			s.type == GL_VERTEX_SHADER ? "vertex" : (s.type == GL_FRAGMENT_SHADER ? "fragment" : "compute"), shader, s.source.c_str(), shader);
 	}
 }
 

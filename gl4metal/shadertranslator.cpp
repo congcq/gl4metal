@@ -14,6 +14,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <GL/gl.h>
+#include <GL/glcorearb.h>
+#include <GL/glext.h>
+
 namespace {
 
 enum Stage { VS = 0, FS = 1 };
@@ -51,7 +55,7 @@ std::string renameSamplerIdentifier(const std::string &source) {
 // layout(location) on stage inputs/outputs, which is core syntax starting with GLSL 4.10.
 // Keep the original profile suffix (for example, "core") and do not rewrite GLSL ES versions.
 // No GL_ARB_separate_shader_objects directive is injected; GL4Metal does not claim to implement it.
-std::string patchVersion(const std::string &source) {
+std::string patchVersion(const std::string &source, int minimumVersion = 410) {
 	std::string out = source;
 	size_t lineStart = 0;
 	while (lineStart < out.size()) {
@@ -74,8 +78,8 @@ std::string patchVersion(const std::string &source) {
 				while (profile < lineEnd && (out[profile] == ' ' || out[profile] == '\t')) ++profile;
 				const bool isGlslEs = out.compare(profile, 2, "es") == 0 &&
 					(profile + 2 == lineEnd || out[profile + 2] == ' ' || out[profile + 2] == '\t' || out[profile + 2] == '\r');
-				if (!isGlslEs && version < 410) {
-					out.replace(numberStart, numberEnd - numberStart, "410");
+				if (!isGlslEs && version < minimumVersion) {
+					out.replace(numberStart, numberEnd - numberStart, std::to_string(minimumVersion));
 				}
 			}
 			break; // only the real leading #version directive controls the shader language version
@@ -127,7 +131,7 @@ struct SourceUniformType {
 
 static void collectSourceUniformTypes(const std::string &source, std::unordered_map<std::string, SourceUniformType> &types) {
 	const std::string masked = maskShaderComments(source);
-	const std::regex declaration(
+	static const std::regex declaration(
 		R"(\buniform[ \t]+(?:(?:lowp|mediump|highp)[ \t]+)?(bool|bvec2|bvec3|bvec4|samplerBuffer|isamplerBuffer|usamplerBuffer)[ \t]+([A-Za-z_][A-Za-z0-9_]*))");
 	for (std::sregex_iterator it(masked.begin(), masked.end(), declaration), end; it != end; ++it) {
 		const std::string typeName = (*it)[1].str();
@@ -137,11 +141,11 @@ static void collectSourceUniformTypes(const std::string &source, std::unordered_
 			info.is_bool = true;
 			info.bool_vecsize = typeName == "bvec2" ? 2 : (typeName == "bvec3" ? 3 : (typeName == "bvec4" ? 4 : 1));
 		} else if (typeName == "samplerBuffer") {
-			info.sampler_gl_type = 0x8DC2u; // GL_SAMPLER_BUFFER
+			info.sampler_gl_type = GL_SAMPLER_BUFFER;
 		} else if (typeName == "isamplerBuffer") {
-			info.sampler_gl_type = 0x8DD0u; // GL_INT_SAMPLER_BUFFER
+			info.sampler_gl_type = GL_INT_SAMPLER_BUFFER;
 		} else if (typeName == "usamplerBuffer") {
-			info.sampler_gl_type = 0x8DD8u; // GL_UNSIGNED_INT_SAMPLER_BUFFER
+			info.sampler_gl_type = GL_UNSIGNED_INT_SAMPLER_BUFFER;
 		}
 		types[uniformName] = info;
 	}
@@ -184,10 +188,9 @@ static uint32_t interfaceLocationCount(const std::string &type, const std::strin
 }
 
 static std::vector<SimpleInterfaceVariable> simpleInterfaceVariables(const std::string &masked, const char *storage) {
-	const std::string qualifiers = R"((?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*)";
-	const std::string pattern = R"((^|\n)([ \t]*))" + qualifiers + R"(\b)" + storage +
-		R"([ \t]+(float|int|uint|bool|[biu]?vec[234]|mat[234](?:x[234])?)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?:\[[ \t]*([0-9]+)[ \t]*\])?[ \t]*;)";
-	const std::regex re(pattern);
+	static const std::regex outputRe(R"((^|\n)([ \t]*)(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bout[ \t]+(float|int|uint|bool|[biu]?vec[234]|mat[234](?:x[234])?)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?:\[[ \t]*([0-9]+)[ \t]*\])?[ \t]*;)");
+	static const std::regex inputRe(R"((^|\n)([ \t]*)(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bin[ \t]+(float|int|uint|bool|[biu]?vec[234]|mat[234](?:x[234])?)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?:\[[ \t]*([0-9]+)[ \t]*\])?[ \t]*;)");
+	const std::regex &re = storage[0] == 'o' ? outputRe : inputRe;
 	std::vector<SimpleInterfaceVariable> vars;
 	for (std::sregex_iterator it(masked.begin(), masked.end(), re), end; it != end; ++it) {
 		const std::smatch &m = *it;
@@ -202,15 +205,16 @@ static std::vector<SimpleInterfaceVariable> simpleInterfaceVariables(const std::
 }
 
 static size_t countSimpleStorageDeclarations(const std::string &masked, const char *storage) {
-	const std::string qualifiers = R"((?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*)";
-	const std::string pattern = R"((^|[;\n])[ \t]*)" + qualifiers + R"(\b)" + storage + R"(\b[^;\n]*;)";
-	const std::regex re(pattern);
+	static const std::regex outputRe(R"((^|[;\n])[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bout\b[^;\n]*;)");
+	static const std::regex inputRe(R"((^|[;\n])[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bin\b[^;\n]*;)");
+	const std::regex &re = storage[0] == 'o' ? outputRe : inputRe;
 	return (size_t)std::distance(std::sregex_iterator(masked.begin(), masked.end(), re), std::sregex_iterator());
 }
 
 static bool hasLayoutQualifiedStorage(const std::string &masked, const char *storage) {
-	const std::string pattern = std::string(R"(layout[ \t]*\([^)]*\)[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\b)") + storage + R"(\b)";
-	return std::regex_search(masked, std::regex(pattern));
+	static const std::regex outputRe(R"(layout[ \t]*\([^)]*\)[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bout\b)");
+	static const std::regex inputRe(R"(layout[ \t]*\([^)]*\)[ \t]*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)[ \t]+)*\bin\b)");
+	return std::regex_search(masked, storage[0] == 'o' ? outputRe : inputRe);
 }
 
 // SPIR-V locations must match across the stages. Metal matches [[user(locnN)]] by location, so explicitly number simple
@@ -288,14 +292,19 @@ void setupShader(glslang::TShader &shader, EShLanguage stage, const char *const 
 	shader.setAutoMapBindings(true);
 }
 
-TranslatedUniform &findOrAdd(TranslatedProgram &out, const std::string &name) {
-	for (TranslatedUniform &u : out.uniforms) {
-		if (u.name == name) {
-			return u;
-		}
-	}
+struct TranslationLookup {
+	std::unordered_map<std::string, size_t> uniform_indices;
+	std::unordered_map<std::string, size_t> block_indices;
+	std::unordered_map<std::string, std::pair<size_t, size_t>> block_member_indices;
+};
+
+TranslatedUniform &findOrAdd(TranslatedProgram &out, const std::string &name, TranslationLookup &lookup) {
+	auto found = lookup.uniform_indices.find(name);
+	if (found != lookup.uniform_indices.end()) return out.uniforms[found->second];
+	const size_t index = out.uniforms.size();
 	out.uniforms.emplace_back();
 	out.uniforms.back().name = name;
+	lookup.uniform_indices.emplace(name, index);
 	return out.uniforms.back();
 }
 
@@ -445,14 +454,18 @@ static void buildHalfVaryingNameSets(
 	std::unordered_set<std::string> &fragmentNames) {
 	const auto vertexOutputs = collectRelaxedVaryings(vertexSpirv, false);
 	const auto fragmentInputs = collectRelaxedVaryings(fragmentSpirv, true);
+	std::unordered_map<std::string, const RelaxedVaryingInfo *> fragmentByName;
+	fragmentByName.reserve(fragmentInputs.size());
+	for (const RelaxedVaryingInfo &fragmentInput : fragmentInputs) {
+		fragmentByName.emplace(fragmentInput.name, &fragmentInput);
+	}
 	for (const RelaxedVaryingInfo &vertexOutput : vertexOutputs) {
-		auto matchingInput = std::find_if(fragmentInputs.begin(), fragmentInputs.end(), [&](const RelaxedVaryingInfo &candidate) {
-			return candidate.location == vertexOutput.location && candidate.vecsize == vertexOutput.vecsize &&
-				candidate.name == vertexOutput.name;
-		});
-		if (matchingInput == fragmentInputs.end()) continue;
+		auto matchingInput = fragmentByName.find(vertexOutput.name);
+		if (matchingInput == fragmentByName.end()) continue;
+		const RelaxedVaryingInfo &fragmentInput = *matchingInput->second;
+		if (fragmentInput.location != vertexOutput.location || fragmentInput.vecsize != vertexOutput.vecsize) continue;
 		vertexNames.insert(vertexOutput.name);
-		fragmentNames.insert(matchingInput->name);
+		fragmentNames.insert(fragmentInput.name);
 	}
 }
 
@@ -460,7 +473,7 @@ static void buildHalfVaryingNameSets(
 // shaders that reference gl_FragCoord in an expression get the extra MSL parameter.
 static bool usesFragmentFragCoord(const std::string &source) {
 	std::string masked = maskShaderComments(source);
-	const std::regex redeclaration(
+	static const std::regex redeclaration(
 		R"((?:layout\s*\([^)]*\)\s*)?(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)\s+)*\bin\s+(?:(?:lowp|mediump|highp)\s+)?[A-Za-z_][A-Za-z0-9_]*\s+gl_FragCoord\s*;)");
 	for (std::sregex_iterator it(masked.begin(), masked.end(), redeclaration), end; it != end; ++it) {
 		const size_t start = (size_t)it->position();
@@ -478,7 +491,7 @@ static bool usesFragmentFragCoord(const std::string &source) {
 
 static bool declaresFragCoordOriginUpperLeft(const std::string &source) {
 	const std::string masked = maskShaderComments(source);
-	const std::regex declaration(
+	static const std::regex declaration(
 		R"(\blayout\s*\([^)]*\borigin_upper_left\b[^)]*\)\s*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)\s+)*\bin\b[^;]*\bgl_FragCoord\b)");
 	return std::regex_search(masked, declaration);
 }
@@ -710,13 +723,14 @@ static bool addVertexFlipFunctionConstant(std::string &source, std::string &erro
 // The vertex stage is compiled once. A function constant supplies the render-to-texture
 // Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
-	const std::unordered_set<std::string> &halfVaryingNames, bool fixFragmentFragCoordY, TranslatedProgram &out) {
+	const std::unordered_set<std::string> &halfVaryingNames, bool fixFragmentFragCoordY,
+	TranslatedProgram &out, TranslationLookup &lookup) {
 	try {
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 
 		spirv_cross::CompilerMSL::Options options;
-		options.platform = spirv_cross::CompilerMSL::Options::iOS; // iOS GPUs, not macOS
-		options.set_msl_version(2, 2);
+		options.platform = spirv_cross::CompilerMSL::Options::iOS;
+		options.set_msl_version(2, 4);
 		msl.set_msl_options(options);
 
 		spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
@@ -775,15 +789,15 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 					blockName = r.name;
 				}
 				TranslatedBlock *block = nullptr;
-				for (TranslatedBlock &candidate : out.blocks) {
-					if (candidate.name == blockName) {
-						block = &candidate;
-					}
-				}
-				if (!block) {
+				auto blockFound = lookup.block_indices.find(blockName);
+				if (blockFound == lookup.block_indices.end()) {
+					const size_t blockIndex = out.blocks.size();
 					out.blocks.emplace_back();
+					out.blocks.back().name = blockName;
+					lookup.block_indices.emplace(blockName, blockIndex);
 					block = &out.blocks.back();
-					block->name = blockName;
+				} else {
+					block = &out.blocks[blockFound->second];
 				}
 				size_t blockSize = msl.get_declared_struct_size(type);
 				// GL_UNIFORM_BLOCK_DATA_SIZE includes the std140 structure's tail padding.
@@ -810,19 +824,23 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 						continue;
 					}
 					const std::string memberName = memberPrefix + "." + memberLeaf;
-					auto memberIt = std::find_if(block->members.begin(), block->members.end(), [&](const TranslatedUniform &candidate) {
-						return candidate.name == memberName;
-					});
-					if (memberIt == block->members.end()) {
+					auto memberFound = lookup.block_member_indices.find(memberName);
+					TranslatedUniform *member = nullptr;
+					if (memberFound == lookup.block_member_indices.end()) {
+						const size_t blockIndex = (size_t)(block - out.blocks.data());
+						const size_t memberIndex = block->members.size();
 						block->members.emplace_back();
-						memberIt = block->members.end() - 1;
-						memberIt->name = memberName;
+						block->members.back().name = memberName;
+						lookup.block_member_indices.emplace(memberName, std::make_pair(blockIndex, memberIndex));
+						member = &block->members.back();
+					} else {
+						member = &out.blocks[memberFound->second.first].members[memberFound->second.second];
 					}
-					memberIt->kind = kindOf(memberType.basetype);
-					memberIt->vecsize = (int)memberType.vecsize;
-					memberIt->columns = (int)memberType.columns;
-					memberIt->array_size = arraySizeOf(memberType);
-					TranslatedUniform::Stage &memberStage = memberIt->stage[stage];
+					member->kind = kindOf(memberType.basetype);
+					member->vecsize = (int)memberType.vecsize;
+					member->columns = (int)memberType.columns;
+					member->array_size = arraySizeOf(memberType);
+					TranslatedUniform::Stage &memberStage = member->stage[stage];
 					memberStage.present = true;
 					memberStage.offset = msl.type_struct_member_offset(type, memberIndex);
 					memberStage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(type, memberIndex);
@@ -843,7 +861,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 					out.log += "uniform '" + name + "' is a struct, not supported\n";
 					continue;
 				}
-				TranslatedUniform &u = findOrAdd(out, name);
+				TranslatedUniform &u = findOrAdd(out, name, lookup);
 				u.kind = kindOf(member.basetype);
 				u.vecsize = (int)member.vecsize;
 				u.columns = (int)member.columns;
@@ -878,9 +896,10 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			b.binding = entry.first;
 			b.msl_texture = slot;
 			b.msl_sampler = slot;
+			b.count = (uint32_t)count; // reserve the complete texture/sampler range for array uniforms
 			msl.add_msl_resource_binding(b);
 
-			TranslatedUniform &u = findOrAdd(out, r.name);
+			TranslatedUniform &u = findOrAdd(out, r.name, lookup);
 			u.kind = TranslatedUniform::Sampler;
 			const spirv_cross::SPIRType &samplerType = msl.get_type(r.type_id);
 			if (samplerType.image.dim == spv::DimCube) {
@@ -946,6 +965,342 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		return true;
 	} catch (const std::exception &e) {
 		out.log += std::string(stage == VS ? "vertex" : "fragment") + " stage, SPIRV-Cross: " + e.what() + "\n";
+		return false;
+	}
+}
+
+struct ComputeSourceBindings {
+	std::unordered_map<std::string, uint32_t> uniformBlocks;
+	std::unordered_map<std::string, uint32_t> storageBlocks;
+	std::unordered_map<std::string, uint32_t> storageImages;
+};
+
+static bool parseLayoutBinding(const std::string &layout, uint32_t &bindingValue) {
+	static const std::regex bindingPattern(R"(\bbinding\s*=\s*([0-9]+))");
+	std::smatch match;
+	if (!std::regex_search(layout, match, bindingPattern)) return false;
+	try {
+		bindingValue = (uint32_t)std::stoul(match[1].str());
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+static ComputeSourceBindings collectComputeSourceBindings(const std::string &source) {
+	ComputeSourceBindings result;
+	const std::string masked = maskShaderComments(source);
+	static const std::regex uniformBlockPattern(
+		R"(layout\s*\(([^)]*)\)\s*uniform\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+	static const std::regex storageBlockPattern(
+		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*buffer\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+	static const std::regex storageImagePattern(
+		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*uniform\s+(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*[iu]?image[A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*))");
+	for (std::sregex_iterator it(masked.begin(), masked.end(), uniformBlockPattern), end; it != end; ++it) {
+		uint32_t bindingValue = 0;
+		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.uniformBlocks[(*it)[2].str()] = bindingValue;
+	}
+	for (std::sregex_iterator it(masked.begin(), masked.end(), storageBlockPattern), end; it != end; ++it) {
+		uint32_t bindingValue = 0;
+		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.storageBlocks[(*it)[2].str()] = bindingValue;
+	}
+	for (std::sregex_iterator it(masked.begin(), masked.end(), storageImagePattern), end; it != end; ++it) {
+		uint32_t bindingValue = 0;
+		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result.storageImages[(*it)[2].str()] = bindingValue;
+	}
+	return result;
+}
+
+static uint32_t glImageFormatForSpirv(spv::ImageFormat format) {
+	switch (format) {
+		case spv::ImageFormatRgba32f: return GL_RGBA32F;
+		case spv::ImageFormatRgba16f: return GL_RGBA16F;
+		case spv::ImageFormatR32f: return GL_R32F;
+		case spv::ImageFormatRgba8: return GL_RGBA8;
+		case spv::ImageFormatRgba8Snorm: return GL_RGBA8_SNORM;
+		case spv::ImageFormatRgba16: return GL_RGBA16;
+		case spv::ImageFormatRg16: return GL_RG16;
+		case spv::ImageFormatRg8: return GL_RG8;
+		case spv::ImageFormatR16: return GL_R16;
+		case spv::ImageFormatR8: return GL_R8;
+		case spv::ImageFormatRgba16Snorm: return GL_RGBA16_SNORM;
+		case spv::ImageFormatRg16Snorm: return GL_RG16_SNORM;
+		case spv::ImageFormatRg8Snorm: return GL_RG8_SNORM;
+		case spv::ImageFormatR16Snorm: return GL_R16_SNORM;
+		case spv::ImageFormatR8Snorm: return GL_R8_SNORM;
+		case spv::ImageFormatRgba32i: return GL_RGBA32I;
+		case spv::ImageFormatRgba16i: return GL_RGBA16I;
+		case spv::ImageFormatRgba8i: return GL_RGBA8I;
+		case spv::ImageFormatR32i: return GL_R32I;
+		case spv::ImageFormatRgba32ui: return GL_RGBA32UI;
+		case spv::ImageFormatRgba16ui: return GL_RGBA16UI;
+		case spv::ImageFormatRgba8ui: return GL_RGBA8UI;
+		case spv::ImageFormatR32ui: return GL_R32UI;
+		case spv::ImageFormatR11fG11fB10f: return GL_R11F_G11F_B10F;
+		case spv::ImageFormatRgb10A2: return GL_RGB10_A2;
+		case spv::ImageFormatRg32f: return GL_RG32F;
+		case spv::ImageFormatRg16f: return GL_RG16F;
+		case spv::ImageFormatR16f: return GL_R16F;
+		case spv::ImageFormatRg32i: return GL_RG32I;
+		case spv::ImageFormatRg16i: return GL_RG16I;
+		case spv::ImageFormatRg8i: return GL_RG8I;
+		case spv::ImageFormatR16i: return GL_R16I;
+		case spv::ImageFormatR8i: return GL_R8I;
+		case spv::ImageFormatRg32ui: return GL_RG32UI;
+		case spv::ImageFormatRg16ui: return GL_RG16UI;
+		case spv::ImageFormatRg8ui: return GL_RG8UI;
+		case spv::ImageFormatR16ui: return GL_R16UI;
+		case spv::ImageFormatR8ui: return GL_R8UI;
+		default: return 0;
+	}
+}
+
+static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgram &out, TranslationLookup &lookup,
+	const ComputeSourceBindings &sourceBindings) {
+	try {
+		spirv_cross::CompilerMSL msl(std::move(spirv));
+		spirv_cross::CompilerMSL::Options options;
+		options.platform = spirv_cross::CompilerMSL::Options::iOS;
+		options.set_msl_version(2, 2);
+		msl.set_msl_options(options);
+
+		auto activeVariables = msl.get_active_interface_variables();
+		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+		msl.set_enabled_interface_variables(std::move(activeVariables));
+
+		// In Metal, buffer, texture and sampler namespaces are separate. Keep SSBOs
+		// in slots 0...15, named UBOs in 16...29, and GL's loose uniforms in slot 30.
+		std::vector<std::pair<uint32_t, const spirv_cross::Resource *>> storageBuffers;
+		storageBuffers.reserve(resources.storage_buffers.size());
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+			storageBuffers.emplace_back(msl.get_decoration(resource.id, spv::DecorationBinding), &resource);
+		}
+		std::sort(storageBuffers.begin(), storageBuffers.end(), [](const auto &a, const auto &b) {
+			return a.first < b.first;
+		});
+		if (storageBuffers.size() > 16) {
+			out.log += "compute shader uses more than 16 active storage buffers; Metal buffer slots 0...15 are exhausted\n";
+			return false;
+		}
+		for (uint32_t slot = 0; slot < storageBuffers.size(); ++slot) {
+			const auto &resource = *storageBuffers[slot].second;
+			const std::string blockTypeName = msl.get_name(resource.base_type_id);
+			auto sourceBinding = sourceBindings.storageBlocks.find(blockTypeName);
+			const uint32_t glBindingPoint = sourceBinding == sourceBindings.storageBlocks.end() ? 0 : sourceBinding->second;
+			if (glBindingPoint >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) {
+				out.log += "compute storage-buffer binding exceeds GL4Metal's 16 SSBO binding points\n";
+				return false;
+			}
+			spirv_cross::MSLResourceBinding binding;
+			binding.stage = spv::ExecutionModelGLCompute;
+			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
+			binding.binding = storageBuffers[slot].first;
+			binding.msl_buffer = slot;
+			msl.add_msl_resource_binding(binding);
+
+			TranslatedStorageBuffer reflected;
+			reflected.name = resource.name;
+			reflected.binding = glBindingPoint;
+			reflected.slot = slot;
+			const spirv_cross::SPIRType &storageType = msl.get_type(resource.base_type_id);
+			for (uint32_t memberTypeId : storageType.member_types) {
+				const spirv_cross::SPIRType &memberType = msl.get_type(memberTypeId);
+				if (!memberType.array.empty() && memberType.array.back() == 0) {
+					reflected.runtime_sized = true;
+				}
+			}
+			try {
+				reflected.required_size = (uint32_t)msl.get_declared_struct_size(storageType);
+			} catch (...) {
+				// Runtime-sized SSBO tails have no fixed minimum size in SPIR-V reflection.
+				reflected.required_size = 0;
+			}
+			out.storage_buffers.push_back(std::move(reflected));
+		}
+
+		uint32_t nextUniformBufferSlot = 16;
+		for (const spirv_cross::Resource &resource : resources.uniform_buffers) {
+			const spirv_cross::SPIRType &type = msl.get_type(resource.base_type_id);
+			const bool isDefault = msl.get_name(resource.base_type_id) == "gl_DefaultUniformBlock" ||
+				resource.name == "gl_DefaultUniformBlock";
+			spirv_cross::MSLResourceBinding binding;
+			binding.stage = spv::ExecutionModelGLCompute;
+			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
+			binding.binding = msl.get_decoration(resource.id, spv::DecorationBinding);
+			if (isDefault) {
+				binding.msl_buffer = GL4METAL_UNIFORM_BUFFER_INDEX;
+			} else {
+				if (nextUniformBufferSlot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
+					out.log += "compute shader uses more than 14 active uniform blocks; Metal buffer slots are exhausted\n";
+					return false;
+				}
+				binding.msl_buffer = nextUniformBufferSlot++;
+			}
+			msl.add_msl_resource_binding(binding);
+
+			if (!isDefault) {
+				std::string blockName = msl.get_name(resource.base_type_id);
+				if (blockName.empty()) blockName = resource.name;
+				auto blockFound = lookup.block_indices.find(blockName);
+				size_t blockIndex = 0;
+				if (blockFound == lookup.block_indices.end()) {
+					blockIndex = out.blocks.size();
+					out.blocks.emplace_back();
+					out.blocks.back().name = blockName;
+					lookup.block_indices.emplace(blockName, blockIndex);
+				} else {
+					blockIndex = blockFound->second;
+				}
+				TranslatedBlock &block = out.blocks[blockIndex];
+				const size_t blockSize = msl.get_declared_struct_size(type);
+				auto sourceBinding = sourceBindings.uniformBlocks.find(blockName);
+				block.binding = sourceBinding == sourceBindings.uniformBlocks.end() ? 0 : sourceBinding->second;
+				block.size = std::max(block.size, (uint32_t)((blockSize + 15) & ~(size_t)15));
+				block.required_size = std::max(block.required_size, (uint32_t)blockSize);
+				block.stage[2].present = true;
+				block.stage[2].slot = binding.msl_buffer;
+
+				const std::string memberPrefix = resource.name.empty() ? blockName : resource.name;
+				for (uint32_t memberIndex = 0; memberIndex < type.member_types.size(); ++memberIndex) {
+					const spirv_cross::SPIRType &memberType = msl.get_type(type.member_types[memberIndex]);
+					if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+						out.log += "compute uniform-block member is a nested struct; nested reflection is not supported\n";
+						continue;
+					}
+					const std::string memberName = memberPrefix + "." + msl.get_member_name(resource.base_type_id, memberIndex);
+					TranslatedUniform *member = nullptr;
+					auto memberFound = lookup.block_member_indices.find(memberName);
+					if (memberFound == lookup.block_member_indices.end()) {
+						const size_t memberPosition = block.members.size();
+						block.members.emplace_back();
+						block.members.back().name = memberName;
+						lookup.block_member_indices.emplace(memberName, std::make_pair(blockIndex, memberPosition));
+						member = &block.members.back();
+					} else {
+						member = &out.blocks[memberFound->second.first].members[memberFound->second.second];
+					}
+					member->kind = kindOf(memberType.basetype);
+					member->vecsize = (int)memberType.vecsize;
+					member->columns = (int)memberType.columns;
+					member->array_size = arraySizeOf(memberType);
+					TranslatedUniform::Stage &memberStage = member->stage[2];
+					memberStage.present = true;
+					memberStage.offset = msl.type_struct_member_offset(type, memberIndex);
+					memberStage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(type, memberIndex);
+					memberStage.matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(type, memberIndex) : 0;
+					memberStage.row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+				}
+				continue;
+			}
+
+			const size_t blockSize = msl.get_declared_struct_size(type);
+			out.block_size[2] = (uint32_t)((blockSize + 15) & ~(size_t)15);
+			for (uint32_t memberIndex = 0; memberIndex < type.member_types.size(); ++memberIndex) {
+				const spirv_cross::SPIRType &memberType = msl.get_type(type.member_types[memberIndex]);
+				if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+					out.log += "compute default uniform contains an unsupported nested struct\n";
+					continue;
+				}
+				const std::string uniformName = msl.get_member_name(resource.base_type_id, memberIndex);
+				TranslatedUniform &uniform = findOrAdd(out, uniformName, lookup);
+				uniform.kind = kindOf(memberType.basetype);
+				uniform.vecsize = (int)memberType.vecsize;
+				uniform.columns = (int)memberType.columns;
+				uniform.array_size = arraySizeOf(memberType);
+				TranslatedUniform::Stage &stage = uniform.stage[2];
+				stage.present = true;
+				stage.offset = msl.type_struct_member_offset(type, memberIndex);
+				stage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(type, memberIndex);
+				stage.matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(type, memberIndex) : 0;
+				stage.row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+			}
+		}
+
+		std::vector<std::pair<uint32_t, const spirv_cross::Resource *>> sampledImages;
+		sampledImages.reserve(resources.sampled_images.size());
+		for (const spirv_cross::Resource &resource : resources.sampled_images) {
+			sampledImages.emplace_back(msl.get_decoration(resource.id, spv::DecorationBinding), &resource);
+		}
+		std::sort(sampledImages.begin(), sampledImages.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+		uint32_t nextTextureSlot = 0;
+		for (const auto &entry : sampledImages) {
+			const spirv_cross::Resource &resource = *entry.second;
+			const int count = arraySizeOf(msl.get_type(resource.type_id));
+			spirv_cross::MSLResourceBinding binding;
+			binding.stage = spv::ExecutionModelGLCompute;
+			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
+			binding.binding = entry.first;
+			binding.msl_texture = nextTextureSlot;
+			binding.msl_sampler = nextTextureSlot;
+			binding.count = (uint32_t)count; // SPIRV-Cross reserves all array elements in Metal
+			msl.add_msl_resource_binding(binding);
+
+			TranslatedUniform &uniform = findOrAdd(out, resource.name, lookup);
+			uniform.kind = TranslatedUniform::Sampler;
+			const spirv_cross::SPIRType &samplerType = msl.get_type(resource.type_id);
+			if (samplerType.image.dim == spv::DimBuffer) uniform.dim = TranslatedUniform::DimBuffer;
+			else if (samplerType.image.dim == spv::DimCube) uniform.dim = TranslatedUniform::DimCube;
+			else if (samplerType.image.dim == spv::Dim3D) uniform.dim = TranslatedUniform::Dim3D;
+			else if (samplerType.image.arrayed) uniform.dim = TranslatedUniform::Dim2DArray;
+			else uniform.dim = TranslatedUniform::Dim2D;
+			uniform.vecsize = 1;
+			uniform.columns = 1;
+			uniform.array_size = count;
+			uniform.stage[2].present = true;
+			uniform.stage[2].slot = nextTextureSlot;
+			nextTextureSlot += (uint32_t)count;
+			if (nextTextureSlot > 32) {
+				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
+				return false;
+			}
+		}
+
+		for (const spirv_cross::Resource &resource : resources.storage_images) {
+			const spirv_cross::SPIRType &imageType = msl.get_type(resource.type_id);
+			if (imageType.image.dim != spv::Dim2D || imageType.image.arrayed || !imageType.array.empty()) {
+				out.log += "compute storage images currently support non-array image2D only\n";
+				return false;
+			}
+			if (nextTextureSlot >= 32) {
+				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
+				return false;
+			}
+			const uint32_t spirvBinding = msl.get_decoration(resource.id, spv::DecorationBinding);
+			auto sourceBinding = sourceBindings.storageImages.find(resource.name);
+			const uint32_t bindingPoint = sourceBinding == sourceBindings.storageImages.end() ? 0 : sourceBinding->second;
+			if (bindingPoint >= GL4METAL_MAX_TEXTURE_UNITS) {
+				out.log += "compute storage-image binding exceeds GL4Metal's 32 image units\n";
+				return false;
+			}
+			spirv_cross::MSLResourceBinding binding;
+			binding.stage = spv::ExecutionModelGLCompute;
+			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
+			binding.binding = spirvBinding;
+			binding.msl_texture = nextTextureSlot;
+			msl.add_msl_resource_binding(binding);
+
+			TranslatedImage image;
+			image.name = resource.name;
+			image.binding = bindingPoint;
+			image.slot = nextTextureSlot++;
+			image.format = glImageFormatForSpirv(imageType.image.format);
+			image.read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
+			image.write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
+			out.storage_images.push_back(std::move(image));
+		}
+
+		out.workgroup_size[0] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 0);
+		out.workgroup_size[1] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 1);
+		out.workgroup_size[2] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 2);
+		if (!out.workgroup_size[0] || !out.workgroup_size[1] || !out.workgroup_size[2]) {
+			out.log += "compute shader has an invalid local workgroup size\n";
+			return false;
+		}
+
+		out.msl[2] = msl.compile();
+		return true;
+	} catch (const std::exception &e) {
+		out.log += std::string("compute stage, SPIRV-Cross: ") + e.what() + "\n";
 		return false;
 	}
 }
@@ -1021,15 +1376,65 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 		out.log += std::to_string(vertexHalfVaryings.size()) + " explicitly relaxed UV/normal varyings lowered to MSL half\n";
 	}
 
+	// Keep name-to-index maps for the complete linked program. SPIRV-Cross resource
+	// reflection visits both stages; linear vector searches here used to become O(N^2)
+	// for shader packs with many UBO members and samplers.
+	TranslationLookup lookup;
+	lookup.uniform_indices.reserve(64);
+	lookup.block_indices.reserve(16);
+	lookup.block_member_indices.reserve(128);
+
 	// Compile each GLSL stage once. The vertex function constant produces normal and
 	// texture-flipped variants from one Metal library at program-link time.
-	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false, out) ||
-		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, fixFragmentFragCoordY, out)) {
+	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false, out, lookup) ||
+		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, fixFragmentFragCoordY, out, lookup)) {
 		return false;
 	}
 	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.
 	// Preserve their original desktop-GL type for glGetActiveUniform / GL_UNIFORM_TYPE.
 	// Likewise keep the exact samplerBuffer variant for integer/unsigned buffer samplers.
 	applySourceUniformTypes(out, vertexGLSL, fragmentGLSL);
+	return true;
+}
+
+
+bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out) {
+	initGlslang();
+	out = TranslatedProgram();
+	std::string computeText = patchVersion(computeGLSL, 430);
+	const char *computeSource = computeText.c_str();
+	glslang::TShader shader(EShLangCompute);
+	setupShader(shader, EShLangCompute, &computeSource);
+	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
+	const TBuiltInResource *resources = GetDefaultResources();
+	if (!shader.parse(resources, 430, false, messages)) {
+		out.log += std::string("compute shader:\n") + shader.getInfoLog() + shader.getInfoDebugLog();
+		return false;
+	}
+	glslang::TProgram program;
+	program.addShader(&shader);
+	if (!program.link(messages)) {
+		out.log += std::string("compute link:\n") + program.getInfoLog() + program.getInfoDebugLog();
+		return false;
+	}
+	glslang::TIntermediate *intermediate = program.getIntermediate(EShLangCompute);
+	if (!intermediate) {
+		out.log += "no intermediate representation for compute stage\n";
+		return false;
+	}
+	std::vector<unsigned int> spirv;
+	spv::SpvBuildLogger logger;
+	glslang::GlslangToSpv(*intermediate, spirv, &logger);
+	if (spirv.empty()) {
+		out.log += "compute SPIR-V generation failed: " + logger.getAllMessages() + "\n";
+		return false;
+	}
+	TranslationLookup lookup;
+	lookup.uniform_indices.reserve(64);
+	lookup.block_indices.reserve(16);
+	lookup.block_member_indices.reserve(128);
+	const ComputeSourceBindings sourceBindings = collectComputeSourceBindings(computeGLSL);
+	if (!compileComputeStage(std::move(spirv), out, lookup, sourceBindings)) return false;
+	applySourceUniformTypes(out, computeGLSL, std::string());
 	return true;
 }

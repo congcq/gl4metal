@@ -51,6 +51,10 @@ void installCommandBufferErrorHandler(id<MTLCommandBuffer> commandBuffer) {
 // Commits the open command buffer so that fences waiting for it can complete.
 void flushCommandBuffer(bool waitUntilCompleted) {
 	endRenderEncoder();
+	if (ctx.currentComputeEncoder) {
+		[ctx.currentComputeEncoder endEncoding];
+		ctx.currentComputeEncoder = nil;
+	}
 	if (ctx.currentCommandBuffer) {
 		installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 		[ctx.currentCommandBuffer commit];

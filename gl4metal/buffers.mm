@@ -17,7 +17,7 @@
 
 static bool isBufferTarget(GLenum target) {
 	return target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER ||
-		target == GL_UNIFORM_BUFFER || target == GL_COPY_READ_BUFFER ||
+		target == GL_UNIFORM_BUFFER || target == GL_SHADER_STORAGE_BUFFER || target == GL_COPY_READ_BUFFER ||
 		target == GL_COPY_WRITE_BUFFER || target == GL_PIXEL_PACK_BUFFER ||
 		target == GL_PIXEL_UNPACK_BUFFER || target == GL_TEXTURE_BUFFER;
 }
@@ -167,9 +167,10 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 			}
 		}
 		for (UniformBufferBinding &binding : ctx.uniform_buffer_bindings) {
-			if (binding.buffer == buf_id) {
-				binding = UniformBufferBinding();
-			}
+			if (binding.buffer == buf_id) binding = UniformBufferBinding();
+		}
+		for (ShaderStorageBufferBinding &binding : ctx.shader_storage_buffer_bindings) {
+			if (binding.buffer == buf_id) binding = ShaderStorageBufferBinding();
 		}
 		// Deleting a GL buffer detaches it from every texture-buffer object. The
 		// command buffer retains any old Metal resources already referenced by draws.
@@ -214,12 +215,15 @@ void glBindBuffer(GLenum target, GLuint buffer) {
 }
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
-	if (target != GL_UNIFORM_BUFFER) {
+	const bool uniformTarget = target == GL_UNIFORM_BUFFER;
+	const bool storageTarget = target == GL_SHADER_STORAGE_BUFFER;
+	if (!uniformTarget && !storageTarget) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glBindBufferBase: unsupported target 0x%X", target);
 		return;
 	}
-	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
+	const GLuint bindingCount = uniformTarget ? GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS : GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+	if (index >= bindingCount) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindBufferBase: binding point %u is out of range", index);
 		return;
@@ -228,28 +232,40 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 		ctx.buffer_objects[buffer] = nil; // names are materialized on first bind, storage is allocated separately
 		ctx.buffer_sizes[buffer] = 0;
 	}
-	UniformBufferBinding newBinding;
-	newBinding.buffer = buffer;
-	newBinding.offset = 0;
-	newBinding.size = 0; // size 0 means the whole current store
-	ctx.uniform_buffer_bindings[index] = newBinding;
+	if (uniformTarget) {
+		UniformBufferBinding newBinding;
+		newBinding.buffer = buffer;
+		newBinding.offset = 0;
+		newBinding.size = 0; // size 0 means the whole current store
+		ctx.uniform_buffer_bindings[index] = newBinding;
+	} else {
+		ShaderStorageBufferBinding newBinding;
+		newBinding.buffer = buffer;
+		newBinding.offset = 0;
+		newBinding.size = 0;
+		ctx.shader_storage_buffer_bindings[index] = newBinding;
+	}
 	ctx.bound_buffers[target] = buffer;
 }
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
-	if (target != GL_UNIFORM_BUFFER) {
+	const bool uniformTarget = target == GL_UNIFORM_BUFFER;
+	const bool storageTarget = target == GL_SHADER_STORAGE_BUFFER;
+	if (!uniformTarget && !storageTarget) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glBindBufferRange: unsupported target 0x%X", target);
 		return;
 	}
-	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
+	const GLuint bindingCount = uniformTarget ? GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS : GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+	if (index >= bindingCount) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindBufferRange: binding point %u is out of range", index);
 		return;
 	}
 	if (buffer == 0) {
 		// Match the indexed-binding unbind semantics without leaving a stale range behind.
-		ctx.uniform_buffer_bindings[index] = UniformBufferBinding();
+		if (uniformTarget) ctx.uniform_buffer_bindings[index] = UniformBufferBinding();
+		else ctx.shader_storage_buffer_bindings[index] = ShaderStorageBufferBinding();
 		ctx.bound_buffers[target] = 0;
 		return;
 	}
@@ -258,10 +274,12 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 		GL4METAL_LOG("glBindBufferRange: offset must be non-negative and size must be positive (offset=%lld size=%lld)", (long long)offset, (long long)size);
 		return;
 	}
-	// The value returned by GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT is 256 in getter.mm.
-	if ((offset % 256) != 0) {
+	// UBO offsets follow the reported 256-byte GL alignment. Metal's setBuffer
+	// offset for SSBOs only needs 4-byte alignment on iOS.
+	const GLintptr alignment = uniformTarget ? 256 : 4;
+	if ((offset % alignment) != 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glBindBufferRange: offset %lld is not aligned to GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT (256)", (long long)offset);
+		GL4METAL_LOG("glBindBufferRange: offset %lld is not aligned to %lld bytes", (long long)offset, (long long)alignment);
 		return;
 	}
 	auto object = ctx.buffer_objects.find(buffer);
@@ -284,11 +302,19 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 			(unsigned long long)off, (unsigned long long)bytes, buffer, (unsigned long long)length);
 		return;
 	}
-	UniformBufferBinding newBinding;
-	newBinding.buffer = buffer;
-	newBinding.offset = offset;
-	newBinding.size = size;
-	ctx.uniform_buffer_bindings[index] = newBinding;
+	if (uniformTarget) {
+		UniformBufferBinding newBinding;
+		newBinding.buffer = buffer;
+		newBinding.offset = offset;
+		newBinding.size = size;
+		ctx.uniform_buffer_bindings[index] = newBinding;
+	} else {
+		ShaderStorageBufferBinding newBinding;
+		newBinding.buffer = buffer;
+		newBinding.offset = offset;
+		newBinding.size = size;
+		ctx.shader_storage_buffer_bindings[index] = newBinding;
+	}
 	ctx.bound_buffers[target] = buffer; // also the generic binding point
 }
 

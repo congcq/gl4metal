@@ -1,5 +1,9 @@
 #import "program.h"
 #import "shaders.h"
+#import "draw.h"
+#import "sync.h"
+
+#include <mutex>
 
 // MARK: - Helpers
 
@@ -23,6 +27,50 @@ static void destroyProgram(GLuint program) {
 static bool dumpEnabled() {
 	const char *dump = getenv("GL4METAL_DUMP_SHADERS");
 	return dump && dump[0] == '1';
+}
+
+// Compute pipelines are expensive to compile and independent of GL object names.
+// Cache by the complete generated MSL source so shader-pack reloads can reuse them.
+static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslSource, std::string &errorText) {
+	if (!ctx.device) {
+		errorText = "Metal device is not initialized";
+		return nil;
+	}
+	static std::mutex cacheMutex;
+	static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
+	{
+		std::lock_guard<std::mutex> lock(cacheMutex);
+		auto cached = cache.find(mslSource);
+		if (cached != cache.end()) return cached->second;
+	}
+
+	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+	options.languageVersion = MTLLanguageVersion2_2;
+	NSError *libraryError = nil;
+	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	id<MTLFunction> computeFunction = [library newFunctionWithName:@"main0"];
+	if (!computeFunction) {
+		errorText = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal library compilation failed") : "no main0 compute entry point";
+		return nil;
+	}
+	NSError *pipelineError = nil;
+	id<MTLComputePipelineState> pipeline = [ctx.device newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
+	if (!pipeline) {
+		errorText = pipelineError ? (pipelineError.localizedDescription.UTF8String ?: "Metal compute pipeline creation failed") : "unknown Metal compute pipeline error";
+		return nil;
+	}
+	{
+		std::lock_guard<std::mutex> lock(cacheMutex);
+		auto inserted = cache.emplace(mslSource, pipeline);
+		if (!inserted.second) return inserted.first->second;
+		if (cache.size() > 64) {
+			auto victim = cache.begin();
+			if (victim == inserted.first) ++victim;
+			if (victim != cache.end()) cache.erase(victim);
+		}
+	}
+	return pipeline;
 }
 
 // Active-uniform type mapping for GL reflection. The runtime uniform-location table
@@ -67,6 +115,466 @@ static GLenum activeUniformGLType(const TranslatedUniform &u) {
 
 static std::string activeUniformName(const TranslatedUniform &u) {
 	return u.array_size > 1 ? u.name + "[0]" : u.name;
+}
+
+static bool linkComputeProgram(GLuint programName, ProgramObject &program, const ShaderObject &computeShader) {
+	TranslatedProgram translated;
+	if (!translateComputeProgram(computeShader.source, translated)) {
+		program.info_log = translated.log;
+		GL4METAL_LOG("glLinkProgram(%u): compute translation failed:\n%s", programName, translated.log.c_str());
+		return false;
+	}
+	if (dumpEnabled()) {
+		if (!translated.log.empty()) GL4METAL_LOG("compute program %u translation notes:\n%s", programName, translated.log.c_str());
+		GL4METAL_LOG("---- MSL compute, program %u ----\n%s\n---- end MSL ----", programName, translated.msl[2].c_str());
+	}
+
+	std::string pipelineError;
+	id<MTLComputePipelineState> computePipeline = computePipelineForMSL(translated.msl[2], pipelineError);
+	if (!computePipeline) {
+		program.info_log = "compute Metal pipeline compilation failed:\n" + pipelineError + "\n";
+		GL4METAL_LOG("glLinkProgram(%u): %s", programName, program.info_log.c_str());
+		return false;
+	}
+
+	program.compute_pipeline = computePipeline;
+	program.compute_workgroup_size[0] = translated.workgroup_size[0];
+	program.compute_workgroup_size[1] = translated.workgroup_size[1];
+	program.compute_workgroup_size[2] = translated.workgroup_size[2];
+	program.storage_buffers = translated.storage_buffers;
+	program.storage_images = translated.storage_images;
+	program.uniforms.reserve(translated.uniforms.size());
+	GLint nextLocation = 0;
+	for (const TranslatedUniform &uniformInfo : translated.uniforms) {
+		ProgramUniform uniform;
+		uniform.info = uniformInfo;
+		uniform.base_location = nextLocation;
+		uniform.units.assign((size_t)uniformInfo.array_size, 0);
+		for (int element = 0; element < uniformInfo.array_size; ++element) {
+			program.locations.emplace_back((GLint)program.uniforms.size(), element);
+		}
+		nextLocation += uniformInfo.array_size;
+		program.uniforms.push_back(std::move(uniform));
+	}
+	program.uniform_data[2].assign(translated.block_size[2], 0);
+	for (const TranslatedBlock &blockInfo : translated.blocks) {
+		ProgramBlock block;
+		block.info = blockInfo;
+		block.binding_point = blockInfo.binding;
+		program.blocks.push_back(std::move(block));
+	}
+	for (const ProgramUniform &uniform : program.uniforms) {
+		ActiveUniformInfo active;
+		active.name = activeUniformName(uniform.info);
+		active.type = activeUniformGLType(uniform.info);
+		active.size = uniform.info.array_size;
+		active.block_index = -1;
+		const TranslatedUniform::Stage &stage = uniform.info.stage[2];
+		active.offset = (GLint)stage.offset;
+		active.array_stride = (GLint)stage.array_stride;
+		active.matrix_stride = (GLint)stage.matrix_stride;
+		active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+		program.active_uniforms.push_back(std::move(active));
+	}
+	for (size_t blockIndex = 0; blockIndex < program.blocks.size(); ++blockIndex) {
+		ProgramBlock &block = program.blocks[blockIndex];
+		for (const TranslatedUniform &member : block.info.members) {
+			ActiveUniformInfo active;
+			active.name = activeUniformName(member);
+			active.type = activeUniformGLType(member);
+			active.size = member.array_size;
+			active.block_index = (GLint)blockIndex;
+			const TranslatedUniform::Stage &stage = member.stage[2];
+			active.offset = (GLint)stage.offset;
+			active.array_stride = (GLint)stage.array_stride;
+			active.matrix_stride = (GLint)stage.matrix_stride;
+			active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+			block.active_uniform_indices.push_back((GLuint)program.active_uniforms.size());
+			program.active_uniforms.push_back(std::move(active));
+		}
+	}
+	program.is_compute = true;
+	program.linked = GL_TRUE;
+	return true;
+}
+
+// MARK: - Compute resource binding
+
+static GLenum computeTargetForDim(TranslatedUniform::Dim dimension) {
+	switch (dimension) {
+		case TranslatedUniform::DimCube: return GL_TEXTURE_CUBE_MAP;
+		case TranslatedUniform::Dim3D: return GL_TEXTURE_3D;
+		case TranslatedUniform::Dim2DArray: return GL_TEXTURE_2D_ARRAY;
+		case TranslatedUniform::DimBuffer: return GL_TEXTURE_BUFFER;
+		default: return GL_TEXTURE_2D;
+	}
+}
+
+static MTLTextureType computeTextureTypeForDim(TranslatedUniform::Dim dimension) {
+	switch (dimension) {
+		case TranslatedUniform::DimCube: return MTLTextureTypeCube;
+		case TranslatedUniform::Dim3D: return MTLTextureType3D;
+		case TranslatedUniform::Dim2DArray: return MTLTextureType2DArray;
+		default: return MTLTextureType2D;
+	}
+}
+
+static bool resolveComputeBuffer(GLuint buffer_id, GLintptr offset, GLsizeiptr boundSize,
+	uint32_t requiredSize, bool runtimeSized, __strong id<MTLBuffer> &metalBuffer,
+	NSUInteger &metalOffset, NSUInteger &availableSize) {
+	auto bufferFound = ctx.buffer_objects.find(buffer_id);
+	if (buffer_id == 0 || bufferFound == ctx.buffer_objects.end() || !bufferFound->second || offset < 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	const NSUInteger logicalSize = glBufferLogicalSize(buffer_id);
+	const NSUInteger start = (NSUInteger)offset;
+	if (start > logicalSize) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	const NSUInteger remaining = logicalSize - start;
+	const NSUInteger requested = boundSize > 0 ? (NSUInteger)boundSize : remaining;
+	if (requested > remaining || requested < (NSUInteger)requiredSize ||
+		(runtimeSized && requested != remaining) || start > bufferFound->second.length ||
+		requested > bufferFound->second.length - start) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	metalBuffer = bufferFound->second;
+	metalOffset = start;
+	availableSize = requested;
+	return true;
+}
+
+struct ComputeBufferBinding {
+	id<MTLBuffer> buffer = nil;
+	NSUInteger offset = 0;
+	NSUInteger size = 0;
+	NSUInteger slot = 0;
+};
+
+struct ComputeTextureBinding {
+	id<MTLTexture> texture = nil;
+	id<MTLSamplerState> sampler = nil;
+	NSUInteger slot = 0;
+	bool usesSampler = false;
+};
+
+static void addUniqueBufferName(std::vector<GLuint> &bufferNames, GLuint buffer_id) {
+	if (buffer_id == 0) return;
+	if (std::find(bufferNames.begin(), bufferNames.end(), buffer_id) == bufferNames.end()) {
+		bufferNames.push_back(buffer_id);
+	}
+}
+
+// MARK: - Compute entry points
+
+void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer,
+	GLenum access, GLenum format) {
+	if (unit >= GL4METAL_MAX_TEXTURE_UNITS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (access != GL_READ_ONLY && access != GL_WRITE_ONLY && access != GL_READ_WRITE) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (texture == 0) {
+		ctx.image_unit_bindings[unit] = ImageUnitBinding();
+		return;
+	}
+	if (level != 0 || layered != GL_FALSE || layer != 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glBindImageTexture: only non-layered 2D level 0 images are supported on iOS");
+		return;
+	}
+	auto textureFound = ctx.texture_objects.find(texture);
+	if (textureFound == ctx.texture_objects.end() || textureFound->second.target != GL_TEXTURE_2D ||
+		!textureFound->second.texture || textureFound->second.width <= 0 || textureFound->second.height <= 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBindImageTexture: texture %u is not an allocated GL_TEXTURE_2D", texture);
+		return;
+	}
+	if (format != textureFound->second.internalformat) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glBindImageTexture: image format 0x%X does not match texture %u internal format 0x%X",
+			format, texture, textureFound->second.internalformat);
+		return;
+	}
+	ImageUnitBinding binding;
+	binding.texture = texture;
+	binding.level = level;
+	binding.layered = layered;
+	binding.layer = layer;
+	binding.access = access;
+	binding.format = format;
+	ctx.image_unit_bindings[unit] = binding;
+}
+
+void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
+	ProgramObject *program = findProgram(ctx.current_program);
+	if (!program || !program->linked || !program->is_compute || !program->compute_pipeline) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glDispatchCompute: current program is not a linked compute program");
+		return;
+	}
+	if (num_groups_x > 65535 || num_groups_y > 65535 || num_groups_z > 65535) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glDispatchCompute: workgroup count exceeds the iOS limit of 65535 per dimension");
+		return;
+	}
+	if (num_groups_x == 0 || num_groups_y == 0 || num_groups_z == 0) return;
+
+	const uint64_t localThreadCount = (uint64_t)program->compute_workgroup_size[0] *
+		(uint64_t)program->compute_workgroup_size[1] * (uint64_t)program->compute_workgroup_size[2];
+	if (localThreadCount == 0 || localThreadCount > GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS ||
+		localThreadCount > program->compute_pipeline.maxTotalThreadsPerThreadgroup) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glDispatchCompute: local workgroup size (%u,%u,%u) exceeds GL4Metal/iOS limit (%lu)",
+			program->compute_workgroup_size[0], program->compute_workgroup_size[1],
+			program->compute_workgroup_size[2], (unsigned long)std::min<NSUInteger>(
+				program->compute_pipeline.maxTotalThreadsPerThreadgroup, GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS));
+		return;
+	}
+
+	// Keep the per-dispatch scratch capacity on the GL submission thread. Compute-heavy
+	// frames often dispatch the same small set of kernels repeatedly; reusing these
+	// vectors avoids allocator churn without retaining resources past the next dispatch.
+	struct DispatchScratch {
+		std::vector<ComputeBufferBinding> storageBuffers;
+		std::vector<ComputeBufferBinding> uniformBuffers;
+		std::vector<ComputeTextureBinding> sampledTextures;
+		std::vector<ComputeTextureBinding> imageTextures;
+		std::vector<GLuint> usedBuffers;
+	};
+	static thread_local DispatchScratch scratch;
+	scratch.storageBuffers.clear();
+	scratch.uniformBuffers.clear();
+	scratch.sampledTextures.clear();
+	scratch.imageTextures.clear();
+	scratch.usedBuffers.clear();
+	auto &storageBufferBindings = scratch.storageBuffers;
+	auto &uniformBufferBindings = scratch.uniformBuffers;
+	auto &sampledTextureBindings = scratch.sampledTextures;
+	auto &imageTextureBindings = scratch.imageTextures;
+	auto &usedBufferNames = scratch.usedBuffers;
+	storageBufferBindings.reserve(program->storage_buffers.size());
+	uniformBufferBindings.reserve(program->blocks.size());
+	sampledTextureBindings.reserve(program->uniforms.size());
+	imageTextureBindings.reserve(program->storage_images.size());
+	usedBufferNames.reserve(program->storage_buffers.size() + program->blocks.size() + program->uniforms.size());
+
+	// Resolve every buffer and check its logical GL range before creating an encoder.
+	for (const TranslatedStorageBuffer &storageInfo : program->storage_buffers) {
+		if (storageInfo.binding >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS || storageInfo.slot >= 16) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: invalid SSBO binding/Metal slot for '%s'", storageInfo.name.c_str());
+			return;
+		}
+		const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[storageInfo.binding];
+		ComputeBufferBinding resolved;
+		if (!resolveComputeBuffer(binding.buffer, binding.offset, binding.size, storageInfo.required_size,
+			storageInfo.runtime_sized, resolved.buffer, resolved.offset, resolved.size)) {
+			GL4METAL_LOG("glDispatchCompute: SSBO '%s' has no compatible buffer range (binding=%u)",
+				storageInfo.name.c_str(), storageInfo.binding);
+			return;
+		}
+		resolved.slot = storageInfo.slot;
+		storageBufferBindings.push_back(resolved);
+		addUniqueBufferName(usedBufferNames, binding.buffer);
+	}
+
+	// UBO indices map into Metal buffer slots 16...29; loose uniforms use slot 30.
+	for (const ProgramBlock &block : program->blocks) {
+		const TranslatedBlock::Stage &stage = block.info.stage[2];
+		if (!stage.present) continue;
+		if (block.binding_point >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS || stage.slot < 16 ||
+			stage.slot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: invalid UBO binding/Metal slot for '%s'", block.info.name.c_str());
+			return;
+		}
+		const UniformBufferBinding &binding = ctx.uniform_buffer_bindings[block.binding_point];
+		ComputeBufferBinding resolved;
+		if (!resolveComputeBuffer(binding.buffer, binding.offset, binding.size, block.info.required_size,
+			false, resolved.buffer, resolved.offset, resolved.size)) {
+			GL4METAL_LOG("glDispatchCompute: UBO '%s' is missing or smaller than its reflected layout (binding=%u size=%u)",
+				block.info.name.c_str(), block.binding_point, block.info.required_size);
+			return;
+		}
+		resolved.slot = stage.slot;
+		uniformBufferBindings.push_back(resolved);
+		addUniqueBufferName(usedBufferNames, binding.buffer);
+	}
+
+	// Resolve regular samplers, including texture-buffer views, using the same fallback
+	// and sampler-object caches as the graphics path.
+	for (const ProgramUniform &uniform : program->uniforms) {
+		const TranslatedUniform &uniformInfo = uniform.info;
+		const TranslatedUniform::Stage &stage = uniformInfo.stage[2];
+		if (uniformInfo.kind != TranslatedUniform::Sampler || !stage.present) continue;
+		const bool isBufferSampler = uniformInfo.dim == TranslatedUniform::DimBuffer;
+		const GLenum target = computeTargetForDim(uniformInfo.dim);
+		const MTLTextureType expectedType = computeTextureTypeForDim(uniformInfo.dim);
+		for (int element = 0; element < uniformInfo.array_size; ++element) {
+			const NSUInteger metalSlot = (NSUInteger)stage.slot + (NSUInteger)element;
+			if (metalSlot >= 32) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("glDispatchCompute: sampler '%s' exceeds the 32 Metal texture slots", uniformInfo.name.c_str());
+				return;
+			}
+			const GLint textureUnit = uniform.units[(size_t)element];
+			if (textureUnit < 0 || textureUnit >= GL4METAL_MAX_TEXTURE_UNITS) {
+				gl4metalSetError(GL_INVALID_VALUE);
+				GL4METAL_LOG("glDispatchCompute: sampler '%s' references texture unit %d out of range", uniformInfo.name.c_str(), textureUnit);
+				return;
+			}
+			id<MTLTexture> texture = nil;
+			id<MTLSamplerState> sampler = nil;
+			auto boundTexture = ctx.bound_textures[(GLuint)textureUnit].find(target);
+			if (boundTexture != ctx.bound_textures[(GLuint)textureUnit].end() && boundTexture->second != 0) {
+				auto textureObject = ctx.texture_objects.find(boundTexture->second);
+				if (textureObject != ctx.texture_objects.end()) {
+					const TextureObject &object = textureObject->second;
+					if (isBufferSampler && object.buffer_sampler_type != 0 &&
+						object.buffer_sampler_type != uniformInfo.sampler_gl_type) {
+						gl4metalSetError(GL_INVALID_OPERATION);
+						GL4METAL_LOG("glDispatchCompute: buffer texture '%s' has an incompatible sampler type", uniformInfo.name.c_str());
+						return;
+					}
+					if (object.texture && object.texture.textureType == expectedType &&
+						(object.texture.usage & MTLTextureUsageShaderRead) != 0) {
+						texture = object.texture;
+						if (isBufferSampler) addUniqueBufferName(usedBufferNames, object.buffer_object);
+						else sampler = gl4metalSamplerForTexture(object, (GLuint)textureUnit);
+					}
+				}
+			}
+			if (!texture) {
+				texture = gl4metalFallbackTextureForUniform(uniformInfo);
+				if (!isBufferSampler) sampler = gl4metalFallbackSampler();
+			}
+			if (!texture || (texture.usage & MTLTextureUsageShaderRead) == 0 || (!isBufferSampler && !sampler)) {
+				gl4metalSetError(GL_OUT_OF_MEMORY);
+				GL4METAL_LOG("glDispatchCompute: no usable texture/sampler for '%s' (unit=%d)", uniformInfo.name.c_str(), textureUnit);
+				return;
+			}
+			ComputeTextureBinding resolved;
+			resolved.texture = texture;
+			resolved.sampler = sampler;
+			resolved.slot = metalSlot;
+			resolved.usesSampler = !isBufferSampler;
+			sampledTextureBindings.push_back(resolved);
+		}
+	}
+
+	// Image binding points are GL image units; Metal texture slots are remapped
+	// independently by the translator after all sampled textures.
+	for (const TranslatedImage &imageInfo : program->storage_images) {
+		if (imageInfo.binding >= GL4METAL_MAX_TEXTURE_UNITS || imageInfo.slot >= 32) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		const ImageUnitBinding &binding = ctx.image_unit_bindings[imageInfo.binding];
+		auto textureObject = ctx.texture_objects.find(binding.texture);
+		if (binding.texture == 0 || textureObject == ctx.texture_objects.end() ||
+			textureObject->second.target != GL_TEXTURE_2D || !textureObject->second.texture ||
+			textureObject->second.texture.textureType != MTLTextureType2D || binding.level != 0 ||
+			binding.layered != GL_FALSE || binding.layer != 0 || binding.format != textureObject->second.internalformat ||
+			(imageInfo.format != 0 && binding.format != imageInfo.format)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: storage image '%s' has no compatible image2D binding on unit %u",
+				imageInfo.name.c_str(), imageInfo.binding);
+			return;
+		}
+		if ((imageInfo.read_only && binding.access == GL_WRITE_ONLY) ||
+			(imageInfo.write_only && binding.access == GL_READ_ONLY)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: image access for '%s' is incompatible with glBindImageTexture", imageInfo.name.c_str());
+			return;
+		}
+		const MTLTextureUsage usage = textureObject->second.texture.usage;
+		if ((!imageInfo.read_only && (usage & MTLTextureUsageShaderWrite) == 0) ||
+			(!imageInfo.write_only && (usage & MTLTextureUsageShaderRead) == 0)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: image '%s' does not have the required Metal ShaderRead/ShaderWrite usage", imageInfo.name.c_str());
+			return;
+		}
+		ComputeTextureBinding resolved;
+		resolved.texture = textureObject->second.texture;
+		resolved.slot = imageInfo.slot;
+		imageTextureBindings.push_back(resolved);
+	}
+
+	// Close render work before compute work. Encoders remain asynchronous in the same
+	// command buffer, allowing Metal's hazard tracking to order dependent resources.
+	endRenderEncoder();
+	if (ctx.currentComputeEncoder) {
+		[ctx.currentComputeEncoder endEncoding];
+		ctx.currentComputeEncoder = nil;
+	}
+	if (!ctx.currentCommandBuffer && ctx.commandQueue) {
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	}
+	if (!ctx.currentCommandBuffer) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return;
+	}
+	id<MTLComputeCommandEncoder> computeEncoder = [ctx.currentCommandBuffer computeCommandEncoder];
+	if (!computeEncoder) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glDispatchCompute: Metal could not create a compute command encoder");
+		return;
+	}
+	ctx.currentComputeEncoder = computeEncoder;
+	[computeEncoder setComputePipelineState:program->compute_pipeline];
+	for (const ComputeBufferBinding &binding : storageBufferBindings) {
+		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
+	}
+	for (const ComputeBufferBinding &binding : uniformBufferBindings) {
+		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
+	}
+	if (!program->uniform_data[2].empty()) {
+		const std::vector<uint8_t> &uniformBytes = program->uniform_data[2];
+		if (uniformBytes.size() <= 4096) {
+			[computeEncoder setBytes:uniformBytes.data() length:uniformBytes.size() atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+		} else {
+			__strong id<MTLBuffer> uniformBuffer = nil;
+			NSUInteger uniformOffset = 0;
+			if (!uploadLargeDefaultUniformBlock(uniformBytes.data(), uniformBytes.size(), uniformBuffer, uniformOffset)) {
+				[computeEncoder endEncoding];
+				ctx.currentComputeEncoder = nil;
+				gl4metalSetError(GL_OUT_OF_MEMORY);
+				return;
+			}
+			[computeEncoder setBuffer:uniformBuffer offset:uniformOffset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+		}
+	}
+	for (const ComputeTextureBinding &binding : sampledTextureBindings) {
+		[computeEncoder setTexture:binding.texture atIndex:binding.slot];
+		if (binding.usesSampler) [computeEncoder setSamplerState:binding.sampler atIndex:binding.slot];
+	}
+	for (const ComputeTextureBinding &binding : imageTextureBindings) {
+		[computeEncoder setTexture:binding.texture atIndex:binding.slot];
+	}
+	if (!usedBufferNames.empty()) markBuffersUsed(usedBufferNames.data(), usedBufferNames.size());
+	[computeEncoder dispatchThreadgroups:MTLSizeMake(num_groups_x, num_groups_y, num_groups_z)
+		threadsPerThreadgroup:MTLSizeMake(program->compute_workgroup_size[0],
+			program->compute_workgroup_size[1], program->compute_workgroup_size[2])];
+	[computeEncoder endEncoding];
+	ctx.currentComputeEncoder = nil;
+}
+
+void glMemoryBarrier(GLbitfield barriers) {
+	(void)barriers; // Metal's tracked-resource hazards cover the implemented image/SSBO/texture accesses.
+	if (ctx.currentComputeEncoder) {
+		[ctx.currentComputeEncoder endEncoding];
+		ctx.currentComputeEncoder = nil;
+	}
+	endRenderEncoder();
+	// Deliberately do not commit or wait: command-buffer ordering provides the
+	// dependency while keeping the frame pipeline asynchronous.
 }
 
 // MARK: - Program objects
@@ -154,18 +662,26 @@ void glLinkProgram(GLuint program) {
 	p.vertex_function = nil;
 	p.fragment_function = nil;
 	p.vertex_function_flipped = nil;
+	p.compute_pipeline = nil;
+	p.compute_workgroup_size[0] = p.compute_workgroup_size[1] = p.compute_workgroup_size[2] = 1;
+	p.is_compute = false;
+	p.storage_buffers.clear();
+	p.storage_images.clear();
 	p.attribs.clear();
 	p.uniforms.clear();
 	p.active_uniforms.clear();
 	p.locations.clear();
 	p.uniform_data[0].clear();
 	p.uniform_data[1].clear();
+	p.uniform_data[2].clear();
 	p.frag_outputs.clear();
 	p.blocks.clear();
 	p.uses_gl_frag_coord = false;
 
 	const ShaderObject *vs = nullptr;
 	const ShaderObject *fs = nullptr;
+	const ShaderObject *cs = nullptr;
+	unsigned computeShaderCount = 0;
 	for (GLuint shader : p.shaders) {
 		auto it = ctx.shader_objects.find(shader);
 		if (it == ctx.shader_objects.end()) {
@@ -175,7 +691,22 @@ void glLinkProgram(GLuint program) {
 			vs = &it->second;
 		} else if (it->second.type == GL_FRAGMENT_SHADER) {
 			fs = &it->second;
+		} else if (it->second.type == GL_COMPUTE_SHADER) {
+			cs = &it->second;
+			++computeShaderCount;
 		}
+	}
+	if (cs) {
+		if (vs || fs || computeShaderCount != 1) {
+			p.info_log = "a compute program must contain exactly one compute shader and no graphics stages\n";
+			return;
+		}
+		if (!cs->compiled) {
+			p.info_log = "the attached compute shader is not compiled\n";
+			return;
+		}
+		linkComputeProgram(program, p, *cs);
+		return;
 	}
 	if (!vs || !fs) {
 		p.info_log = "a program needs one vertex and one fragment shader attached\n";
@@ -312,7 +843,7 @@ void glLinkProgram(GLuint program) {
 	for (const TranslatedBlock &tb : tp.blocks) {
 		ProgramBlock pb;
 		pb.info = tb;
-		pb.binding_point = 0; // GL's default until glUniformBlockBinding
+		pb.binding_point = 0; // graphics UBO binding defaults to 0 until glUniformBlockBinding
 		p.blocks.push_back(pb);
 	}
 
@@ -441,6 +972,15 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 		}
 		case GL_ACTIVE_UNIFORM_BLOCKS:
 			*params = (GLint)p->blocks.size();
+			break;
+		case GL_COMPUTE_WORK_GROUP_SIZE:
+			if (p->is_compute) {
+				params[0] = (GLint)p->compute_workgroup_size[0];
+				params[1] = (GLint)p->compute_workgroup_size[1];
+				params[2] = (GLint)p->compute_workgroup_size[2];
+			} else {
+				params[0] = params[1] = params[2] = 0;
+			}
 			break;
 		case GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH: {
 			size_t longest = 0;

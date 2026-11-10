@@ -526,10 +526,11 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		}
 		for (auto &unit : ctx.bound_textures) {
 			for (auto &binding : unit) {
-				if (binding.second == tex_id) {
-					binding.second = 0;
-				}
+				if (binding.second == tex_id) binding.second = 0;
 			}
+		}
+		for (ImageUnitBinding &binding : ctx.image_unit_bindings) {
+			if (binding.texture == tex_id) binding = ImageUnitBinding();
 		}
 		// GL detaches a deleted texture from the framebuffers it is attached to.
 		bool detached = false;
@@ -1018,8 +1019,17 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 			if (mtlFormat != MTLPixelFormatRGB9E5Float) {
 				d.usage = d.usage | MTLTextureUsageRenderTarget; // RGB9E5 is not renderable
 			}
+			// Compute imageStore needs ShaderWrite. Keep depth and RGB9E5 textures
+			// out of this path; on older iOS GPU families retry without ShaderWrite
+			// so an image-write-capable descriptor never breaks ordinary sampling.
+			const bool canShaderWrite = !isDepthStencilFormat(mtlFormat) && mtlFormat != MTLPixelFormatRGB9E5Float;
+			if (canShaderWrite) d.usage = d.usage | MTLTextureUsageShaderWrite;
 			d.storageMode = isDepthStencilFormat(mtlFormat) ? MTLStorageModePrivate : MTLStorageModeShared;
 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:d];
+			if (!newTexture && canShaderWrite) {
+				d.usage = (MTLTextureUsage)(d.usage & ~MTLTextureUsageShaderWrite);
+				newTexture = [ctx.device newTextureWithDescriptor:d];
+			}
 			if (!newTexture) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("glTexImage2D: failed to allocate a %dx%d MTLPixelFormat %d texture; previous storage preserved", width, height, (int)mtlFormat);

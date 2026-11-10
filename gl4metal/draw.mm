@@ -37,7 +37,7 @@ void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
 	}
 }
 
-static bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
+bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
 	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
 	if (!source || length == 0 || !ctx.device || !ctx.currentCommandBuffer ||
 		length > ctx.device.maxBufferLength) return false;
@@ -534,6 +534,20 @@ static id<MTLSamplerState> fallbackSampler() {
 	return sampler;
 }
 
+// Shared with the compute dispatch path so graphics and compute use the same
+// sampler-state cache and the same dimension-correct zero texture fallback.
+id<MTLTexture> gl4metalFallbackTextureForUniform(const TranslatedUniform &uniform) {
+	return fallbackTexture(uniform);
+}
+
+id<MTLSamplerState> gl4metalFallbackSampler(void) {
+	return fallbackSampler();
+}
+
+id<MTLSamplerState> gl4metalSamplerForTexture(const TextureObject &texture, GLuint textureUnit) {
+	return samplerFor(texture, textureUnit);
+}
+
 // One entry per vertex attribute the program uses. Every attribute gets its own Metal buffer slot (0...15), so the
 // byte offset of the attribute inside its GL buffer is simply the binding offset and Metal's "attribute must fit in the
 // stride" rule can't be violated by separate streams that live in the same GL buffer.
@@ -551,7 +565,6 @@ struct ActiveAttrib {
 };
 
 static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p, std::vector<ActiveAttrib> &attribs, const char *caller) {
-	std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
 	bool flip = ctx.pass_flipped;
 	bool blend = false;
 	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment)
@@ -605,9 +618,12 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		put(aa.constant ? 1 : 0);
 	}
 
-	auto cached = ctx.pipeline_cache.find(key);
-	if (cached != ctx.pipeline_cache.end()) {
-		return cached->second; // may be nil: a combination that already failed was reported once
+	{
+		std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
+		auto cached = ctx.pipeline_cache.find(key);
+		if (cached != ctx.pipeline_cache.end()) {
+			return cached->second; // may be nil: a combination that already failed was reported once
+		}
 	}
 
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -674,7 +690,14 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		GL4METAL_LOG("%s: pipeline creation failed for program %u: %s", caller, programId,
 			error ? error.localizedDescription.UTF8String : "unknown Metal pipeline error");
 	}
-	ctx.pipeline_cache[key] = pipeline;
+	// Pipeline compilation can take milliseconds on iOS. Do it outside the shared
+	// cache mutex so unrelated variants can compile concurrently on worker threads.
+	// A racing thread may have populated the same key; use that canonical entry.
+	{
+		std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
+		auto inserted = ctx.pipeline_cache.emplace(key, pipeline);
+		if (!inserted.second) return inserted.first->second;
+	}
 	return pipeline;
 }
 
@@ -830,6 +853,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	ProgramObject &p = pit->second;
+	if (p.is_compute) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("%s: compute program cannot be used for draw calls", caller);
+		return;
+	}
 
 	MTLPrimitiveType prim = MTLPrimitiveTypeTriangle;
 	bool fan = false;

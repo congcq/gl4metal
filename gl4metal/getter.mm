@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 
 #include <sys/utsname.h>
+#include <limits>
 
 // Apple2 devices support 8192; Apple3 and
 // later Apple GPU families support at least 16384. GL4Metal intentionally
@@ -203,6 +204,41 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:
 			*data = 4096;
 			break;
+		case GL_MAX_IMAGE_UNITS:
+			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			break;
+		case GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS:
+			*data = GL4METAL_MAX_TEXTURE_UNITS + GL4METAL_MAX_COLOR_ATTACHMENTS;
+			break;
+		case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
+			*data = ctx.device ? (GLint)std::min<NSUInteger>(ctx.device.maxThreadgroupMemoryLength, (NSUInteger)std::numeric_limits<GLint>::max()) : 16384;
+			break;
+		case GL_MAX_COMPUTE_UNIFORM_COMPONENTS:
+			*data = 1024;
+			break;
+		case GL_MAX_COMBINED_COMPUTE_UNIFORM_COMPONENTS:
+			*data = 4096;
+			break;
+		case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS:
+			*data = GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS; // conservative cross-device iOS cap
+			break;
+		case GL_MAX_COMPUTE_UNIFORM_BLOCKS:
+			*data = 14;
+			break;
+		case GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS:
+			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			break;
+		case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
+			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			break;
+		case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS:
+		case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS:
+		case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS:
+			*data = GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+			break;
+		case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT:
+			*data = 4;
+			break;
 		case GL_MAX_VARYING_COMPONENTS:
 			*data = 60;
 			break;
@@ -272,6 +308,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			break;
 		case GL_UNIFORM_BUFFER_BINDING:
 			*data = (GLint)boundBuffer(GL_UNIFORM_BUFFER);
+			break;
+		case GL_SHADER_STORAGE_BUFFER_BINDING:
+			*data = (GLint)boundBuffer(GL_SHADER_STORAGE_BUFFER);
 			break;
 		case GL_PIXEL_UNPACK_BUFFER_BINDING:
 			*data = (GLint)boundBuffer(GL_PIXEL_UNPACK_BUFFER);
@@ -370,9 +409,13 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 		}
 		return;
 	}
-	if (index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS && (target == GL_UNIFORM_BUFFER_BINDING || target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE)) {
+	const bool uniformBindingQuery = target == GL_UNIFORM_BUFFER_BINDING || target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE;
+	const bool storageBindingQuery = target == GL_SHADER_STORAGE_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_START || target == GL_SHADER_STORAGE_BUFFER_SIZE;
+	if ((uniformBindingQuery && index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) ||
+		(storageBindingQuery && index >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) ||
+		((target == GL_MAX_COMPUTE_WORK_GROUP_COUNT || target == GL_MAX_COMPUTE_WORK_GROUP_SIZE) && index >= 3)) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glGetIntegeri_v: binding point %u is out of range (GL_INVALID_VALUE)", index);
+		GL4METAL_LOG("glGetIntegeri_v: index %u is out of range (GL_INVALID_VALUE)", index);
 		return;
 	}
 	switch (target) {
@@ -387,6 +430,25 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 				*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
 					? (GLint)glBufferLogicalSize(binding.buffer) : 0;
 			}
+			break;
+		}
+		case GL_SHADER_STORAGE_BUFFER_BINDING: *data = (GLint)ctx.shader_storage_buffer_bindings[index].buffer; break;
+		case GL_SHADER_STORAGE_BUFFER_START: *data = (GLint)ctx.shader_storage_buffer_bindings[index].offset; break;
+		case GL_SHADER_STORAGE_BUFFER_SIZE: {
+			const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[index];
+			if (binding.size != 0) *data = (GLint)binding.size;
+			else {
+				auto buffer = ctx.buffer_objects.find(binding.buffer);
+				*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
+					? (GLint)glBufferLogicalSize(binding.buffer) : 0;
+			}
+			break;
+		}
+		case GL_MAX_COMPUTE_WORK_GROUP_COUNT: *data = 65535; break;
+		case GL_MAX_COMPUTE_WORK_GROUP_SIZE: {
+			const MTLSize limits = ctx.device ? ctx.device.maxThreadsPerThreadgroup : MTLSizeMake(512, 512, 64);
+			const NSUInteger values[3] = { limits.width, limits.height, limits.depth };
+			*data = (GLint)std::min<NSUInteger>(values[index], (NSUInteger)std::numeric_limits<GLint>::max());
 			break;
 		}
 		default:

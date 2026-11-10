@@ -38,13 +38,81 @@
 
 #include "shadertranslator.h"
 
+#ifndef GL_COMPUTE_SHADER
+#  define GL_COMPUTE_SHADER 0x91B9
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER
+#  define GL_SHADER_STORAGE_BUFFER 0x90D2
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_BINDING
+#  define GL_SHADER_STORAGE_BUFFER_BINDING 0x90D3
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_START
+#  define GL_SHADER_STORAGE_BUFFER_START 0x90D4
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_SIZE
+#  define GL_SHADER_STORAGE_BUFFER_SIZE 0x90D5
+#endif
+#ifndef GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
+#  define GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 0x90DD
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
+#  define GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT 0x90DF
+#endif
+#ifndef GL_MAX_IMAGE_UNITS
+#  define GL_MAX_IMAGE_UNITS 0x8F38
+#endif
+#ifndef GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS
+#  define GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS 0x8F39
+#endif
+#ifndef GL_MAX_COMPUTE_SHARED_MEMORY_SIZE
+#  define GL_MAX_COMPUTE_SHARED_MEMORY_SIZE 0x8262
+#endif
+#ifndef GL_MAX_COMPUTE_UNIFORM_COMPONENTS
+#  define GL_MAX_COMPUTE_UNIFORM_COMPONENTS 0x8263
+#endif
+#ifndef GL_MAX_COMBINED_COMPUTE_UNIFORM_COMPONENTS
+#  define GL_MAX_COMBINED_COMPUTE_UNIFORM_COMPONENTS 0x8266
+#endif
+#ifndef GL_MAX_COMPUTE_UNIFORM_BLOCKS
+#  define GL_MAX_COMPUTE_UNIFORM_BLOCKS 0x91BB
+#endif
+#ifndef GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS
+#  define GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS 0x91BC
+#endif
+#ifndef GL_MAX_COMPUTE_IMAGE_UNIFORMS
+#  define GL_MAX_COMPUTE_IMAGE_UNIFORMS 0x91BD
+#endif
+#ifndef GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
+#  define GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS 0x90DB
+#endif
+#ifndef GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS
+#  define GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS 0x90DC
+#endif
+#ifndef GL_MAX_COMPUTE_WORK_GROUP_COUNT
+#  define GL_MAX_COMPUTE_WORK_GROUP_COUNT 0x91BE
+#endif
+#ifndef GL_MAX_COMPUTE_WORK_GROUP_SIZE
+#  define GL_MAX_COMPUTE_WORK_GROUP_SIZE 0x91BF
+#endif
+#ifndef GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS
+#  define GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 0x90EB
+#endif
+#ifndef GL_COMPUTE_WORK_GROUP_SIZE
+#  define GL_COMPUTE_WORK_GROUP_SIZE 0x8267
+#endif
+#ifndef GL_UNIFORM_BLOCK_REFERENCED_BY_COMPUTE_SHADER
+#  define GL_UNIFORM_BLOCK_REFERENCED_BY_COMPUTE_SHADER 0x90EC
+#endif
+
 #define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
 
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
-#define GL4METAL_MAX_TEXTURE_UNITS 32
 #define GL4METAL_MAX_COLOR_ATTACHMENTS 8
 #define GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS 36
+// Metal reserves buffer slots 16...30 for UBOs/default uniforms; compute SSBOs use 0...15.
+#define GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 512
 
 // MARK: - Textures
 
@@ -198,10 +266,30 @@ struct ProgramObject {
 	std::vector<ProgramUniform> uniforms; // default-block uniforms with glUniform locations
 	std::vector<ActiveUniformInfo> active_uniforms; // GL_ACTIVE_UNIFORMS includes named-block members too
 	std::vector<std::pair<GLint, GLint>> locations; // GL uniform location -> (index in uniforms, array element)
-	std::vector<uint8_t> uniform_data[2];           // CPU copy of the default uniform block, [0] vertex, [1] fragment
+	std::vector<uint8_t> uniform_data[3];           // CPU copy of default uniforms: [0] vertex, [1] fragment, [2] compute
 	std::unordered_map<std::string, GLint> frag_outputs;
 	std::vector<ProgramBlock> blocks;
+	std::vector<TranslatedStorageBuffer> storage_buffers;
+	std::vector<TranslatedImage> storage_images;
+	id<MTLComputePipelineState> compute_pipeline = nil;
+	uint32_t compute_workgroup_size[3] = {1, 1, 1};
+	bool is_compute = false;
 	bool uses_gl_frag_coord = false; // fragment MSL needs the per-render-pass coordinate parameters
+};
+
+struct ShaderStorageBufferBinding {
+	GLuint buffer = 0;
+	GLintptr offset = 0;
+	GLsizeiptr size = 0; // 0 = whole store
+};
+
+struct ImageUnitBinding {
+	GLuint texture = 0;
+	GLint level = 0;
+	GLboolean layered = GL_FALSE;
+	GLint layer = 0;
+	GLenum access = GL_READ_ONLY;
+	GLenum format = GL_RGBA8;
 };
 
 struct MTLContext {
@@ -294,6 +382,8 @@ struct MTLContext {
 	std::unordered_map<GLuint, SamplerObject> sampler_objects;
 	GLuint bound_samplers[GL4METAL_MAX_TEXTURE_UNITS]; // glBindSampler, 0 = none
 	UniformBufferBinding uniform_buffer_bindings[GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS];
+	ShaderStorageBufferBinding shader_storage_buffer_bindings[GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS];
+	ImageUnitBinding image_unit_bindings[GL4METAL_MAX_TEXTURE_UNITS];
 	std::unordered_set<const void *> sync_objects;
 	id<MTLCommandBuffer> last_committed_buffer;
 	GLboolean pack_swap_bytes = GL_FALSE; // GL_PACK_SWAP_BYTES; appended to preserve existing member offsets
@@ -342,6 +432,9 @@ struct MTLContext {
 	bool discard_default_depth_stencil_on_end = false;
 	// Fragment gl_FragCoord parameters are constant for the lifetime of one render encoder.
 	bool fragcoord_params_bound = false;
+
+	// Compute encoder is appended to preserve all existing MTLContext member offsets.
+	id<MTLComputeCommandEncoder> currentComputeEncoder = nil;
 };
 
 extern MTLContext ctx;
