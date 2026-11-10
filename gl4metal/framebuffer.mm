@@ -28,6 +28,7 @@ void endRenderEncoder(void) {
 		[ctx.currentEncoder endEncoding];
 		ctx.currentEncoder = nil;
 	}
+	ctx.fragcoord_params_bound = false;
 	ctx.discard_default_depth_stencil_on_end = false;
 	ctx.pass_uses_default_framebuffer = false;
 }

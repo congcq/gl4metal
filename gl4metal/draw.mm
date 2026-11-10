@@ -975,6 +975,25 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	[enc setRenderPipelineState:pipeline];
+	if (p.uses_gl_frag_coord && !ctx.fragcoord_params_bound) {
+		struct alignas(8) FragmentCoordFixupParams {
+			uint32_t target_height;
+			uint32_t flip_y;
+		};
+		static_assert(sizeof(FragmentCoordFixupParams) == 8, "MSL fragment-coordinate parameter layout changed");
+		if (ctx.render_target_height == 0 || ctx.render_target_height > (NSUInteger)UINT32_MAX) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: invalid render-target height for gl_FragCoord conversion (%llu); draw skipped",
+				caller, (unsigned long long)ctx.render_target_height);
+			return;
+		}
+		FragmentCoordFixupParams fragCoordParams = {
+			(uint32_t)ctx.render_target_height,
+			ctx.pass_flipped ? 0u : 1u
+		};
+		[enc setFragmentBytes:&fragCoordParams length:sizeof(fragCoordParams) atIndex:GL4METAL_FRAGCOORD_BUFFER_INDEX];
+		ctx.fragcoord_params_bound = true;
+	}
 	[enc setDepthStencilState:activeDepthState];
 	[enc setStencilFrontReferenceValue:(uint32_t)ctx.stencil_front.ref backReferenceValue:(uint32_t)ctx.stencil_back.ref];
 	[enc setFrontFacingWinding:ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];

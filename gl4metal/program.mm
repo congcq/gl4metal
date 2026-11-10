@@ -162,6 +162,7 @@ void glLinkProgram(GLuint program) {
 	p.uniform_data[1].clear();
 	p.frag_outputs.clear();
 	p.blocks.clear();
+	p.uses_gl_frag_coord = false;
 
 	const ShaderObject *vs = nullptr;
 	const ShaderObject *fs = nullptr;
@@ -351,6 +352,7 @@ void glLinkProgram(GLuint program) {
 	p.vertex_function = vertexFunction;
 	p.fragment_function = fragmentFunction;
 	p.vertex_function_flipped = flippedFunction;
+	p.uses_gl_frag_coord = tp.uses_gl_frag_coord;
 	p.linked = GL_TRUE;
 
 	if (dumpEnabled()) {

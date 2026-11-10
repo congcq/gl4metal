@@ -12,6 +12,8 @@
 // Metal buffer argument index of the "default uniform block" (GL's loose uniforms) in both stages.
 // Vertex buffers occupy the low indices (0...15), so the uniform data lives at the top of the argument table.
 #define GL4METAL_UNIFORM_BUFFER_INDEX 30
+// Reserved fragment-stage buffer slot for the dynamic GL gl_FragCoord coordinate fixup.
+#define GL4METAL_FRAGCOORD_BUFFER_INDEX 15
 
 struct TranslatedUniform {
 	enum Kind { Float, Int, UInt, Bool, Sampler };
@@ -61,6 +63,7 @@ struct TranslatedProgram {
 	std::vector<TranslatedAttrib> attribs;     // vertex inputs
 	std::vector<TranslatedBlock> blocks;       // uniform blocks other than the default one
 	std::vector<std::pair<std::string, uint32_t>> frag_outputs;
+	bool uses_gl_frag_coord = false; // fragment MSL entry point includes the dynamic render-target coordinate parameters
 	std::string log;
 };
 

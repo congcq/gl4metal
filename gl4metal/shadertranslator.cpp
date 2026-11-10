@@ -14,10 +14,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <GL/gl.h>
-#include <GL/glcorearb.h>
-#include <GL/glext.h>
-
 namespace {
 
 enum Stage { VS = 0, FS = 1 };
@@ -141,11 +137,11 @@ static void collectSourceUniformTypes(const std::string &source, std::unordered_
 			info.is_bool = true;
 			info.bool_vecsize = typeName == "bvec2" ? 2 : (typeName == "bvec3" ? 3 : (typeName == "bvec4" ? 4 : 1));
 		} else if (typeName == "samplerBuffer") {
-			info.sampler_gl_type = GL_SAMPLER_BUFFER;
+			info.sampler_gl_type = 0x8DC2u; // GL_SAMPLER_BUFFER
 		} else if (typeName == "isamplerBuffer") {
-			info.sampler_gl_type = GL_INT_SAMPLER_BUFFER;
+			info.sampler_gl_type = 0x8DD0u; // GL_INT_SAMPLER_BUFFER
 		} else if (typeName == "usamplerBuffer") {
-			info.sampler_gl_type = GL_UNSIGNED_INT_SAMPLER_BUFFER;
+			info.sampler_gl_type = 0x8DD8u; // GL_UNSIGNED_INT_SAMPLER_BUFFER
 		}
 		types[uniformName] = info;
 	}
@@ -238,28 +234,31 @@ void alignUnqualifiedVaryingLocations(std::string &vertexSource, std::string &fr
 	std::vector<uint32_t> outputLocations, inputLocations;
 	uint32_t nextLocation = 0;
 	for (const SimpleInterfaceVariable &v : outputs) {
-		auto existing = locationByName.find(v.name);
-		uint32_t location;
-		if (existing != locationByName.end()) {
-			const auto &known = interfaceByName.at(v.name);
-			if (known.first != v.type || known.second != v.locationCount) return;
-			location = existing->second;
-		} else {
-			location = nextLocation;
-			locationByName.emplace(v.name, location);
-			interfaceByName.emplace(v.name, std::make_pair(v.type, v.locationCount));
-			nextLocation += v.locationCount;
+		if (locationByName.find(v.name) != locationByName.end() || v.locationCount > UINT32_MAX - nextLocation) {
+			return; // duplicate or unrepresentable interface: do not guess
 		}
+		const uint32_t location = nextLocation;
+		nextLocation += v.locationCount;
+		locationByName.emplace(v.name, location);
+		interfaceByName.emplace(v.name, std::make_pair(v.type, v.locationCount));
 		outputLocations.push_back(location);
 	}
 	for (const SimpleInterfaceVariable &v : inputs) {
 		auto found = locationByName.find(v.name);
 		auto interface = interfaceByName.find(v.name);
-		if (found == locationByName.end() || interface == interfaceByName.end() ||
-			interface->second.first != v.type || interface->second.second != v.locationCount) {
-			return; // don't partially rewrite an interface that doesn't match by name and type
+		if (found != locationByName.end() && interface != interfaceByName.end()) {
+			if (interface->second.first != v.type || interface->second.second != v.locationCount) {
+				return; // same-name type mismatch: do not silently connect incompatible varyings
+			}
+			inputLocations.push_back(found->second);
+		} else {
+			// A fragment input may be declared but not written by the vertex stage. Inactive
+			// inputs are removed by SPIRV-Cross; assigning a private location here prevents
+			// such a declaration from shifting every later, correctly matched varying.
+			if (v.locationCount > UINT32_MAX - nextLocation) return;
+			inputLocations.push_back(nextLocation);
+			nextLocation += v.locationCount;
 		}
-		inputLocations.push_back(found->second);
 	}
 
 	std::vector<std::pair<size_t, std::string>> vsInsertions, fsInsertions;
@@ -457,6 +456,137 @@ static void buildHalfVaryingNameSets(
 	}
 }
 
+// A built-in redeclaration by itself is not a read. Ignore that declarator so only
+// shaders that reference gl_FragCoord in an expression get the extra MSL parameter.
+static bool usesFragmentFragCoord(const std::string &source) {
+	std::string masked = maskShaderComments(source);
+	const std::regex redeclaration(
+		R"((?:layout\s*\([^)]*\)\s*)?(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)\s+)*\bin\s+(?:(?:lowp|mediump|highp)\s+)?[A-Za-z_][A-Za-z0-9_]*\s+gl_FragCoord\s*;)");
+	for (std::sregex_iterator it(masked.begin(), masked.end(), redeclaration), end; it != end; ++it) {
+		const size_t start = (size_t)it->position();
+		std::fill(masked.begin() + start, masked.begin() + start + it->length(), ' ');
+	}
+	const size_t identifierLength = sizeof("gl_FragCoord") - 1;
+	for (size_t position = 0; (position = masked.find("gl_FragCoord", position)) != std::string::npos; ++position) {
+		const bool leftBoundary = position == 0 || !isMslIdentifierChar(masked[position - 1]);
+		const size_t end = position + identifierLength;
+		const bool rightBoundary = end >= masked.size() || !isMslIdentifierChar(masked[end]);
+		if (leftBoundary && rightBoundary) return true;
+	}
+	return false;
+}
+
+static bool declaresFragCoordOriginUpperLeft(const std::string &source) {
+	const std::string masked = maskShaderComments(source);
+	const std::regex declaration(
+		R"(\blayout\s*\([^)]*\borigin_upper_left\b[^)]*\)\s*(?:(?:flat|smooth|noperspective|centroid|sample|invariant|precise|highp|mediump|lowp)\s+)*\bin\b[^;]*\bgl_FragCoord\b)");
+	return std::regex_search(masked, declaration);
+}
+
+// SPIRV-Cross maps the Vulkan fragment builtin to Metal's top-left [[position]] input.
+// Rewrite only shaders that actually consume gl_FragCoord and use desktop GL's default
+// lower-left convention. The render-target height and whether a conversion is needed
+// for the current pass are supplied by the draw encoder, not baked into the shader.
+static bool addFragmentFragCoordYFixup(std::string &source, std::string &error) {
+	const std::string namespaceLine = "using namespace metal;";
+	const std::string masked = maskShaderComments(source);
+	const size_t namespacePosition = masked.find(namespaceLine);
+	if (namespacePosition == std::string::npos) {
+		error = "could not locate the MSL namespace declaration for fragment coordinate fixup";
+		return false;
+	}
+
+	auto skipWhitespace = [&](size_t position) {
+		while (position < masked.size() && (masked[position] == ' ' || masked[position] == '\t' ||
+			masked[position] == '\r' || masked[position] == '\n')) ++position;
+		return position;
+	};
+
+	size_t entryParen = std::string::npos;
+	size_t fragmentPosition = 0;
+	while ((fragmentPosition = masked.find("fragment", fragmentPosition)) != std::string::npos) {
+		const size_t fragmentEnd = fragmentPosition + 8;
+		const bool leftBoundary = fragmentPosition == 0 || !isMslIdentifierChar(masked[fragmentPosition - 1]);
+		const bool rightBoundary = fragmentEnd >= masked.size() || !isMslIdentifierChar(masked[fragmentEnd]);
+		if (!leftBoundary || !rightBoundary) {
+			fragmentPosition = fragmentEnd;
+			continue;
+		}
+		size_t tokenPosition = skipWhitespace(fragmentEnd);
+		const size_t returnTypeStart = tokenPosition;
+		while (tokenPosition < masked.size() && isMslIdentifierChar(masked[tokenPosition])) ++tokenPosition;
+		if (tokenPosition == returnTypeStart) {
+			fragmentPosition = fragmentEnd;
+			continue;
+		}
+		tokenPosition = skipWhitespace(tokenPosition);
+		const size_t functionNameStart = tokenPosition;
+		while (tokenPosition < masked.size() && isMslIdentifierChar(masked[tokenPosition])) ++tokenPosition;
+		const std::string functionName = masked.substr(functionNameStart, tokenPosition - functionNameStart);
+		tokenPosition = skipWhitespace(tokenPosition);
+		if (functionName == "main0" && tokenPosition < masked.size() && masked[tokenPosition] == '(') {
+			entryParen = tokenPosition;
+			break;
+		}
+		fragmentPosition = fragmentEnd;
+	}
+	if (entryParen == std::string::npos) {
+		error = "could not locate the MSL fragment main0 entry point";
+		return false;
+	}
+
+	const size_t signatureClose = matchingMslParen(masked, entryParen);
+	if (signatureClose == std::string::npos) {
+		error = "MSL fragment entry-point parameter list is unbalanced";
+		return false;
+	}
+	const size_t positionAttribute = masked.find("[[position]]", entryParen);
+	if (positionAttribute == std::string::npos || positionAttribute >= signatureClose) {
+		error = "the active fragment entry point has no [[position]] input to rewrite";
+		return false;
+	}
+	size_t nameEnd = positionAttribute;
+	while (nameEnd > entryParen && (masked[nameEnd - 1] == ' ' || masked[nameEnd - 1] == '\t' ||
+		masked[nameEnd - 1] == '\r' || masked[nameEnd - 1] == '\n')) --nameEnd;
+	size_t nameStart = nameEnd;
+	while (nameStart > entryParen && isMslIdentifierChar(masked[nameStart - 1])) --nameStart;
+	if (nameStart == nameEnd) {
+		error = "could not identify the MSL [[position]] fragment input";
+		return false;
+	}
+	const std::string fragCoordName = masked.substr(nameStart, nameEnd - nameStart);
+
+	size_t bodyOpen = signatureClose + 1;
+	while (bodyOpen < masked.size() && masked[bodyOpen] != '{') ++bodyOpen;
+	if (bodyOpen >= masked.size()) {
+		error = "could not locate the MSL fragment entry-point body";
+		return false;
+	}
+
+	std::string paramsType = "GL4MetalFragCoordParams";
+	std::string paramsName = "gl4metal_FragCoordParams";
+	for (uint32_t suffix = 1; source.find(paramsType) != std::string::npos || source.find(paramsName) != std::string::npos; ++suffix) {
+		paramsType = "GL4MetalFragCoordParams" + std::to_string(suffix);
+		paramsName = "gl4metal_FragCoordParams" + std::to_string(suffix);
+	}
+
+	size_t parameterStart = skipWhitespace(entryParen + 1);
+	const bool hasParameters = parameterStart < signatureClose;
+	const std::string parameter = std::string(hasParameters ? ", " : "") +
+		"constant " + paramsType + "& " + paramsName + " [[buffer(" +
+		std::to_string(GL4METAL_FRAGCOORD_BUFFER_INDEX) + ")]]";
+	const std::string fixup = "\n    if (" + paramsName + ".flip_y != 0u) {\n" +
+		"        " + fragCoordName + ".y = float(" + paramsName + ".target_height) - " + fragCoordName + ".y;\n" +
+		"    }\n";
+	const std::string paramsStruct = "\n\nstruct " + paramsType + " { uint target_height; uint flip_y; };\n";
+
+	// Insert from right to left so the offsets obtained from the masked source stay valid.
+	source.insert(bodyOpen + 1, fixup);
+	source.insert(signatureClose, parameter);
+	source.insert(namespacePosition + namespaceLine.size(), paramsStruct);
+	return true;
+}
+
 static bool addVertexFlipFunctionConstant(std::string &source, std::string &error) {
 	const std::string namespaceLine = "using namespace metal;";
 	const size_t namespacePosition = source.find(namespaceLine);
@@ -580,7 +710,7 @@ static bool addVertexFlipFunctionConstant(std::string &source, std::string &erro
 // The vertex stage is compiled once. A function constant supplies the render-to-texture
 // Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
-	const std::unordered_set<std::string> &halfVaryingNames, TranslatedProgram &out) {
+	const std::unordered_set<std::string> &halfVaryingNames, bool fixFragmentFragCoordY, TranslatedProgram &out) {
 	try {
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 
@@ -796,6 +926,15 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			out.log += std::to_string(clampedReads) + " out-of-range-safe texture2d.read coordinate guard(s) added to " +
 				(stage == VS ? "vertex" : "fragment") + " MSL stage\n";
 		}
+		if (stage == FS && fixFragmentFragCoordY) {
+			std::string fixupError;
+			if (addFragmentFragCoordYFixup(compiledMsl, fixupError)) {
+				out.uses_gl_frag_coord = true;
+				out.log += "desktop GL gl_FragCoord Y conversion enabled for the fragment stage\n";
+			} else {
+				out.log += "gl_FragCoord Y conversion not injected: " + fixupError + "\n";
+			}
+		}
 		if (stage == VS) {
 			std::string specializationError;
 			if (!addVertexFlipFunctionConstant(compiledMsl, specializationError)) {
@@ -818,6 +957,10 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 
 	std::string vsText = patchVersion(vertexGLSL);
 	std::string fsText = patchVersion(fragmentGLSL);
+	const bool fragmentUsesFragCoord = usesFragmentFragCoord(fsText);
+	const bool fragmentUsesUpperLeftOrigin = declaresFragCoordOriginUpperLeft(fsText);
+	const bool fixFragmentFragCoordY = fragmentUsesFragCoord && !fragmentUsesUpperLeftOrigin;
+	out.uses_gl_frag_coord = false;
 	alignUnqualifiedVaryingLocations(vsText, fsText);
 	const char *vsSource = vsText.c_str();
 	const char *fsSource = fsText.c_str();
@@ -880,8 +1023,8 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 
 	// Compile each GLSL stage once. The vertex function constant produces normal and
 	// texture-flipped variants from one Metal library at program-link time.
-	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, out) ||
-		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, out)) {
+	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false, out) ||
+		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, fixFragmentFragCoordY, out)) {
 		return false;
 	}
 	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.

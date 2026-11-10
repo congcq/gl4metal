@@ -201,6 +201,7 @@ struct ProgramObject {
 	std::vector<uint8_t> uniform_data[2];           // CPU copy of the default uniform block, [0] vertex, [1] fragment
 	std::unordered_map<std::string, GLint> frag_outputs;
 	std::vector<ProgramBlock> blocks;
+	bool uses_gl_frag_coord = false; // fragment MSL needs the per-render-pass coordinate parameters
 };
 
 struct MTLContext {
@@ -339,6 +340,8 @@ struct MTLContext {
 	bool default_stencil_has_contents = false;
 	bool pass_uses_default_framebuffer = false;
 	bool discard_default_depth_stencil_on_end = false;
+	// Fragment gl_FragCoord parameters are constant for the lifetime of one render encoder.
+	bool fragcoord_params_bound = false;
 };
 
 extern MTLContext ctx;
