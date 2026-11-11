@@ -60,6 +60,12 @@ struct TextureObject {
 	GLint base_level = 0, max_level = 1000;
 	GLfloat max_anisotropy = 1.0f;
 	GLenum compare_mode = GL_NONE, compare_func = GL_LEQUAL;
+
+	// Lazily allocated read-only copy used when a shader samples this same image
+	// while it is selected as an active framebuffer attachment. Tied to the GL
+	// texture object's lifetime; recreated when the source dimensions/format change.
+	id<MTLTexture> feedback_snapshot = nil;
+	uint64_t feedback_snapshot_pass_serial = UINT64_MAX;
 };
 
 // MARK: - Framebuffers
@@ -363,6 +369,7 @@ struct MTLContext {
 
 	// Compute encoder is appended to preserve all existing MTLContext member offsets.
 	id<MTLComputeCommandEncoder> currentComputeEncoder = nil;
+	uint64_t render_pass_serial = 0; // logical pass identity; feedback blits may split Metal encoders
 };
 
 extern MTLContext ctx;

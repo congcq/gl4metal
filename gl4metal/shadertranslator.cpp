@@ -298,6 +298,101 @@ struct TranslationLookup {
 	std::unordered_map<std::string, std::pair<size_t, size_t>> block_member_indices;
 };
 
+// SPIR-V locations emitted by glslang are not always stage-linked by name when a
+// desktop shader contains compatibility-generated declarations plus conditional
+// VSH/FSH blocks (OptiFine shaderpacks commonly do this). Metal requires the same
+// [[user(locnN)]] index on a vertex output and its matching fragment input. Reflect
+// the vertex interface once, then repair only the fragment-side decorations before
+// SPIRV-Cross emits MSL. This avoids trying to parse preprocessor-inactive GLSL text.
+struct StageVaryingInfo {
+	uint32_t location = 0;
+	uint32_t base_type = 0;
+	uint32_t width = 0;
+	uint32_t vecsize = 0;
+	uint32_t columns = 0;
+	spirv_cross::SmallVector<uint32_t> array;
+	spirv_cross::SmallVector<bool> array_size_literal;
+};
+
+static std::string interfaceResourceName(const spirv_cross::CompilerMSL &compiler,
+	const spirv_cross::Resource &resource) {
+	if (!resource.name.empty()) return resource.name;
+	return compiler.get_name(resource.id);
+}
+
+static bool collectVertexOutputLocations(const std::vector<unsigned int> &spirv,
+	std::unordered_map<std::string, StageVaryingInfo> &locations, std::string &error) {
+	try {
+		spirv_cross::CompilerMSL reflection(spirv);
+		const spirv_cross::ShaderResources resources = reflection.get_shader_resources();
+		locations.reserve(resources.stage_outputs.size());
+		for (const spirv_cross::Resource &resource : resources.stage_outputs) {
+			if (reflection.has_decoration(resource.id, spv::DecorationBuiltIn) ||
+				!reflection.has_decoration(resource.id, spv::DecorationLocation)) continue;
+			const std::string name = interfaceResourceName(reflection, resource);
+			if (name.empty()) continue;
+			const spirv_cross::SPIRType &type = reflection.get_type(resource.type_id);
+			if (type.basetype == spirv_cross::SPIRType::Struct) continue; // interface blocks require member-level matching
+			StageVaryingInfo info;
+			info.location = reflection.get_decoration(resource.id, spv::DecorationLocation);
+			info.base_type = (uint32_t)type.basetype;
+			info.width = type.width;
+			info.vecsize = type.vecsize;
+			info.columns = type.columns;
+			info.array = type.array;
+			info.array_size_literal = type.array_size_literal;
+			const uint32_t outputLocation = info.location;
+			auto inserted = locations.emplace(name, std::move(info));
+			if (!inserted.second && inserted.first->second.location != outputLocation) {
+				error = "duplicate vertex outputs named '" + name + "' have conflicting locations";
+				return false;
+			}
+		}
+	} catch (const std::exception &e) {
+		error = std::string("vertex interface reflection failed: ") + e.what();
+		return false;
+	}
+	return true;
+}
+
+static bool alignFragmentInputsToVertexOutputs(spirv_cross::CompilerMSL &compiler,
+	const spirv_cross::ShaderResources &resources,
+	const std::unordered_map<std::string, StageVaryingInfo> &vertexLocations,
+	std::string &error, size_t &alignedCount) {
+	alignedCount = 0;
+	for (const spirv_cross::Resource &resource : resources.stage_inputs) {
+		if (compiler.has_decoration(resource.id, spv::DecorationBuiltIn)) continue;
+		const std::string name = interfaceResourceName(compiler, resource);
+		auto vertex = vertexLocations.find(name);
+		if (vertex == vertexLocations.end()) continue; // leave unused or unsupported inputs to normal link validation
+		const spirv_cross::SPIRType &fragmentType = compiler.get_type(resource.type_id);
+		if (fragmentType.basetype == spirv_cross::SPIRType::Struct) continue;
+		const StageVaryingInfo &vertexInfo = vertex->second;
+		
+		auto isSameArray = [](const auto &a, const auto &b) {
+			if (a.size() != b.size()) return false;
+			for (size_t i = 0; i < a.size(); ++i) {
+				if (static_cast<uint32_t>(a[i]) != static_cast<uint32_t>(b[i])) return false;
+			}
+			return true;
+		};
+		if ((uint32_t)fragmentType.basetype != vertexInfo.base_type ||
+			fragmentType.width != vertexInfo.width || fragmentType.vecsize != vertexInfo.vecsize ||
+			fragmentType.columns != vertexInfo.columns || !isSameArray(fragmentType.array, vertexInfo.array) ||
+			!isSameArray(fragmentType.array_size_literal, vertexInfo.array_size_literal)) {
+			error = "varying '" + name + "' has incompatible vertex/fragment types";
+			return false;
+		}
+		const uint32_t currentLocation = compiler.has_decoration(resource.id, spv::DecorationLocation)
+			? compiler.get_decoration(resource.id, spv::DecorationLocation) : UINT32_MAX;
+		if (currentLocation != vertexInfo.location) {
+			compiler.set_decoration(resource.id, spv::DecorationLocation, vertexInfo.location);
+			++alignedCount;
+		}
+	}
+	return true;
+}
+
 TranslatedUniform &findOrAdd(TranslatedProgram &out, const std::string &name, TranslationLookup &lookup) {
 	auto found = lookup.uniform_indices.find(name);
 	if (found != lookup.uniform_indices.end()) return out.uniforms[found->second];
@@ -724,7 +819,8 @@ static bool addVertexFlipFunctionConstant(std::string &source, std::string &erro
 // Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
 	const std::unordered_set<std::string> &halfVaryingNames, bool fixFragmentFragCoordY,
-	TranslatedProgram &out, TranslationLookup &lookup) {
+	const std::unordered_map<std::string, StageVaryingInfo> &vertexOutputLocations,
+	bool alignFragmentInputs, TranslatedProgram &out, TranslationLookup &lookup) {
 	try {
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 
@@ -757,6 +853,18 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		// which causes needless Metal bindings and can trigger false feedback-loop skips.
 		auto activeVariables = msl.get_active_interface_variables();
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+		if (stage == FS && alignFragmentInputs && !vertexOutputLocations.empty()) {
+			size_t alignedCount = 0;
+			std::string interfaceError;
+			if (!alignFragmentInputsToVertexOutputs(msl, resources, vertexOutputLocations, interfaceError, alignedCount)) {
+				out.log += "stage interface: " + interfaceError + "\n";
+				return false;
+			}
+			if (alignedCount != 0) {
+				out.log += "stage interface: aligned " + std::to_string(alignedCount) +
+					" fragment varying location(s) to vertex outputs by name\n";
+			}
+		}
 		msl.set_enabled_interface_variables(std::move(activeVariables));
 
 		// Uniform blocks: GL binding points are an independent namespace (36 on this backend).
@@ -1367,6 +1475,24 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 		}
 	}
 
+	// mapIO() handles ordinary linked interfaces, but compatibility-generated
+	// outputs such as OptiFine's unused outColor0 can still leave the two SPIR-V
+	// stages with independent locations. Only repair shaders without explicit
+	// location qualifiers; explicit GLSL interfaces must retain their declared ABI.
+	const std::string vsInterfaceMasked = maskShaderComments(vsText);
+	const std::string fsInterfaceMasked = maskShaderComments(fsText);
+	const bool alignFragmentInputs =
+		!hasLayoutQualifiedStorage(vsInterfaceMasked, "out") &&
+		!hasLayoutQualifiedStorage(fsInterfaceMasked, "in");
+	std::unordered_map<std::string, StageVaryingInfo> vertexOutputLocations;
+	if (alignFragmentInputs) {
+		std::string interfaceError;
+		if (!collectVertexOutputLocations(spirv[VS], vertexOutputLocations, interfaceError)) {
+			out.log += "stage interface: " + interfaceError + "\n";
+			return false;
+		}
+	}
+
 	// Narrow only inter-stage values that are explicitly RelaxedPrecision in both
 	// GLSL stages and whose semantics are normalized coordinates/directions.
 	std::unordered_set<std::string> vertexHalfVaryings;
@@ -1386,8 +1512,11 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 
 	// Compile each GLSL stage once. The vertex function constant produces normal and
 	// texture-flipped variants from one Metal library at program-link time.
-	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false, out, lookup) ||
-		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings, fixFragmentFragCoordY, out, lookup)) {
+	const std::unordered_map<std::string, StageVaryingInfo> noVertexOutputLocations;
+	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false,
+		noVertexOutputLocations, false, out, lookup) ||
+		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings,
+		fixFragmentFragCoordY, vertexOutputLocations, alignFragmentInputs, out, lookup)) {
 		return false;
 	}
 	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.

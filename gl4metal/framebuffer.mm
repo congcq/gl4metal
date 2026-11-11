@@ -9,8 +9,20 @@
 
 #include <mutex>
 #include <new>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <unordered_set>
 
 // MARK: - Render passes
+
+static bool drawBufferTraceEnabled() {
+	static const bool enabled = [] {
+		const char *value = std::getenv("GL4METAL_TRACE_DRAW_BUFFERS");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
 
 // Metal records work into encoders, GL into global state: a render pass is opened by glClear (or the first draw)
 // for the current draw framebuffer and closed when the target changes or the frame is presented.
@@ -163,8 +175,12 @@ void applyViewportAndScissor(void) {
 	[ctx.currentEncoder setScissorRect:sr];
 }
 
-id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask) {
+id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask, bool preservePassSerial) {
 	endRenderEncoder();
+	if (!preservePassSerial) {
+		++ctx.render_pass_serial;
+		if (ctx.render_pass_serial == 0) ++ctx.render_pass_serial; // reserve zero for never-opened state
+	}
 
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 	MTLLoadAction colorLoad = (clearMask & GL_COLOR_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -631,6 +647,38 @@ void glDrawBuffers(GLsizei n, const GLenum *bufs) {
 	// Draw buffer i writes to the colour attachment named by bufs[i] (GL_NONE: not written).
 	for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
 		it->second.draw_buffers[i] = (i < n) ? bufs[i] : GL_NONE;
+	}
+	// Shaderpacks encode target routing in comments such as DRAWBUFFERS:41.
+	// Trace the actual GL state and the texture currently attached at each target.
+	// This is deduplicated by FBO + complete draw-buffer array to avoid per-frame spam.
+	if (drawBufferTraceEnabled()) {
+		std::string stateKey = std::to_string(ctx.draw_fbo);
+		std::string stateList;
+		for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; ++i) {
+			const GLenum drawBuffer = it->second.draw_buffers[i];
+			stateKey += ":" + std::to_string(drawBuffer);
+			if (i >= n) continue;
+			if (!stateList.empty()) stateList += ", ";
+			if (drawBuffer == GL_NONE) {
+				stateList += "GL_NONE";
+			} else {
+				const GLuint textureName = it->second.color[drawBuffer - GL_COLOR_ATTACHMENT0].texture;
+				char enumText[16];
+				std::snprintf(enumText, sizeof(enumText), "0x%04X", (unsigned int)drawBuffer);
+				stateList += enumText;
+				stateList += "(texture=" + std::to_string(textureName) + ")";
+			}
+		}
+		static std::mutex traceMutex;
+		static std::unordered_set<std::string> reportedStates;
+		bool firstReport = false;
+		{
+			std::lock_guard<std::mutex> lock(traceMutex);
+			firstReport = reportedStates.insert(stateKey).second;
+		}
+		if (firstReport) {
+			GL4METAL_LOG("glDrawBuffers: framebuffer=%u count=%d selected=[%s]", ctx.draw_fbo, n, stateList.c_str());
+		}
 	}
 	endRenderEncoder(); // the open pass was built from the old draw buffers
 }

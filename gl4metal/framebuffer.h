@@ -14,7 +14,7 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
-id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask);  // ends the open pass, starts one on glBindFramebuffer's target
+id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask, bool preservePassSerial = false);  // ends the open pass, starts one on glBindFramebuffer's target
 void endRenderEncoder(void);
 void applyViewportAndScissor(void);
 void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil);

@@ -340,16 +340,237 @@ static void putBytes(std::string &key, const void *data, size_t size) {
 	key.append((const char *)data, size);
 }
 
-static bool textureIsAttachedToDrawFramebuffer(GLuint textureName) {
+// Metal's render-pass descriptor contains only the color attachments selected by
+// glDrawBuffers; other images retained on the GL FBO are not bound as Metal render
+// targets. Iris/OptiFine shaderpacks commonly keep additional colortex images
+// attached while sampling them in another pass. Checking every GL attachment here
+// reports a false Metal read/write hazard and drops otherwise renderable passes.
+// Match the resources that beginRenderPass() actually installs on the encoder.
+static bool textureIsAttachedToDrawFramebuffer(GLuint textureName,
+	GLenum *attachmentOut = nullptr, GLint *levelOut = nullptr, GLint *drawBufferOut = nullptr) {
 	if (textureName == 0 || ctx.draw_fbo == 0) return false;
 	auto fbo = ctx.fbo_objects.find(ctx.draw_fbo);
 	if (fbo == ctx.fbo_objects.end()) return false;
 	const FBO &attachments = fbo->second;
-	for (const FBOAttachment &a : attachments.color) if (a.texture == textureName) return true;
-	return attachments.depth.texture == textureName || attachments.stencil.texture == textureName;
+
+	// The i-th fragment output writes to the attachment named by draw_buffers[i].
+	// Ignore GL_NONE and attachments that are present but not selected for drawing.
+	for (GLint outputIndex = 0; outputIndex < GL4METAL_MAX_COLOR_ATTACHMENTS; ++outputIndex) {
+		const GLenum drawBuffer = attachments.draw_buffers[outputIndex];
+		if (drawBuffer < GL_COLOR_ATTACHMENT0 ||
+			drawBuffer >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) continue;
+		const GLenum attachment = drawBuffer;
+		const FBOAttachment &image = attachments.color[attachment - GL_COLOR_ATTACHMENT0];
+		if (image.texture == textureName) {
+			if (attachmentOut) *attachmentOut = attachment;
+			if (levelOut) *levelOut = image.level;
+			if (drawBufferOut) *drawBufferOut = outputIndex;
+			return true;
+		}
+	}
+
+	// Unlike color attachments, depth/stencil are installed independently of
+	// glDrawBuffers. Only classify them as write targets when their tests and
+	// write masks can actually modify the attached image.
+	if (ctx.depth_test_enabled && ctx.depth_write_enabled &&
+		attachments.depth.texture == textureName) {
+		if (attachmentOut) *attachmentOut = GL_DEPTH_ATTACHMENT;
+		if (levelOut) *levelOut = attachments.depth.level;
+		if (drawBufferOut) *drawBufferOut = -1;
+		return true;
+	}
+	const bool stencilWrites = capOn(GL_STENCIL_TEST) && (
+		(ctx.stencil_front.write_mask != 0 &&
+		 (ctx.stencil_front.fail != GL_KEEP || ctx.stencil_front.depth_fail != GL_KEEP || ctx.stencil_front.depth_pass != GL_KEEP)) ||
+		(ctx.stencil_back.write_mask != 0 &&
+		 (ctx.stencil_back.fail != GL_KEEP || ctx.stencil_back.depth_fail != GL_KEEP || ctx.stencil_back.depth_pass != GL_KEEP)));
+	if (stencilWrites && attachments.stencil.texture == textureName) {
+		if (attachmentOut) *attachmentOut = GL_STENCIL_ATTACHMENT;
+		if (levelOut) *levelOut = attachments.stencil.level;
+		if (drawBufferOut) *drawBufferOut = -1;
+		return true;
+	}
+	return false;
 }
 
 static std::unordered_set<uint64_t> reportedFeedbackLoops;
+
+struct FeedbackSnapshotRequest {
+	GLuint textureName = 0;
+	GLenum attachment = GL_NONE;
+	GLint level = 0;
+	GLint drawBufferIndex = -1;
+	GLint unit = -1;
+	std::string samplerName;
+	id<MTLTexture> source = nil;
+	id<MTLTexture> snapshot = nil;
+};
+
+// Resolve feedback before any per-draw state/resources are installed. A blit encoder
+// cannot be interleaved into an active render encoder, so we first collect every read
+// alias, end the pass once, copy all aliases in one blit encoder, then resume the same
+// framebuffer with LOAD. The caller will bind the returned snapshots on the new encoder.
+static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *caller,
+	__strong id<MTLRenderCommandEncoder> &encoder,
+	std::unordered_map<GLuint, id<MTLTexture>> &snapshotsByTexture) {
+	std::vector<FeedbackSnapshotRequest> requests;
+	std::unordered_set<GLuint> seenTextures;
+
+	for (const ProgramUniform &uniform : program.uniforms) {
+		if (uniform.info.kind != TranslatedUniform::Sampler ||
+			(!uniform.info.stage[0].present && !uniform.info.stage[1].present)) continue;
+		if (uniform.info.array_size <= 0 || (size_t)uniform.info.array_size > uniform.units.size()) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: sampler '%s' has an invalid unit array; draw skipped", caller, uniform.info.name.c_str());
+			return false;
+		}
+		if (uniform.info.dim == TranslatedUniform::DimBuffer) continue;
+
+		for (int element = 0; element < uniform.info.array_size; ++element) {
+			const GLint unit = uniform.units[(size_t)element];
+			if (unit < 0 || unit >= GL4METAL_MAX_TEXTURE_UNITS) continue; // validated in the normal binding path
+			auto bound = ctx.bound_textures[unit].find(targetForDim(uniform.info.dim));
+			if (bound == ctx.bound_textures[unit].end() || bound->second == 0) continue;
+
+			const GLuint textureName = bound->second;
+			GLenum attachment = GL_NONE;
+			GLint level = -1;
+			GLint drawBufferIndex = -1;
+			if (!textureIsAttachedToDrawFramebuffer(textureName, &attachment, &level, &drawBufferIndex)) continue;
+			if (!seenTextures.insert(textureName).second) continue; // one snapshot per GL texture, even if bound on several units
+
+			// Snapshot ordinary single-sample 2D color images. Copying the complete mip
+			// chain below preserves explicit-LOD reads even if the attached level is not 0.
+			// Depth/stencil and multisample aliases need a different copy interpretation;
+			// never silently substitute a wrong image for those cases.
+			if (attachment < GL_COLOR_ATTACHMENT0 ||
+				attachment >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS || level < 0) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: unsupported feedback image (texture=%u attachment=0x%X level=%d); draw skipped",
+					caller, textureName, attachment, level);
+				return false;
+			}
+			auto textureObject = ctx.texture_objects.find(textureName);
+			if (textureObject == ctx.texture_objects.end() || !textureObject->second.texture) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: feedback texture %u has no Metal storage; draw skipped", caller, textureName);
+				return false;
+			}
+			id<MTLTexture> source = textureObject->second.texture;
+			if (source.textureType != MTLTextureType2D || source.sampleCount != 1 ||
+				source.storageMode == MTLStorageModeMemoryless ||
+				(source.usage & MTLTextureUsageShaderRead) == 0 ||
+				source.pixelFormat == MTLPixelFormatInvalid || source.width == 0 || source.height == 0) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: feedback texture %u cannot be snapshotted (type=%lu samples=%lu usage=0x%lx storage=%lu); draw skipped",
+					caller, textureName, (unsigned long)source.textureType, (unsigned long)source.sampleCount,
+					(unsigned long)source.usage, (unsigned long)source.storageMode);
+				return false;
+			}
+
+			TextureObject &object = textureObject->second;
+			id<MTLTexture> snapshot = object.feedback_snapshot;
+			if (!snapshot || snapshot.textureType != MTLTextureType2D ||
+				snapshot.width != source.width || snapshot.height != source.height ||
+				snapshot.mipmapLevelCount != source.mipmapLevelCount ||
+				snapshot.pixelFormat != source.pixelFormat || snapshot.sampleCount != 1 ||
+				(snapshot.usage & MTLTextureUsageShaderRead) == 0) {
+				MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+					width:source.width height:source.height mipmapped:(source.mipmapLevelCount > 1)];
+				descriptor.mipmapLevelCount = source.mipmapLevelCount;
+				descriptor.storageMode = MTLStorageModePrivate;
+				descriptor.usage = MTLTextureUsageShaderRead;
+				snapshot = [ctx.device newTextureWithDescriptor:descriptor];
+				if (!snapshot) {
+					gl4metalSetError(GL_OUT_OF_MEMORY);
+					GL4METAL_LOG("%s: failed to allocate %lux%lu feedback snapshot for texture %u (format=%lu); draw skipped",
+						caller, (unsigned long)source.width, (unsigned long)source.height, textureName, (unsigned long)source.pixelFormat);
+					return false;
+				}
+				snapshot.label = [NSString stringWithFormat:@"GL4Metal feedback snapshot texture %u", textureName];
+				object.feedback_snapshot = snapshot;
+			}
+
+			snapshotsByTexture.emplace(textureName, snapshot);
+			if (object.feedback_snapshot_pass_serial != ctx.render_pass_serial) {
+				FeedbackSnapshotRequest request;
+				request.textureName = textureName;
+				request.attachment = attachment;
+				request.level = level;
+				request.drawBufferIndex = drawBufferIndex;
+				request.unit = unit;
+				request.samplerName = uniform.info.name;
+				request.source = source;
+				request.snapshot = snapshot;
+				requests.push_back(std::move(request));
+			}
+		}
+	}
+
+	if (requests.empty()) return true;
+	if (!ctx.currentCommandBuffer) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("%s: feedback snapshot requested without an active Metal command buffer; draw skipped", caller);
+		return false;
+	}
+
+	// Finish earlier writes to the active render targets before reading them in a blit.
+	endRenderEncoder();
+	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
+	if (!blit) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("%s: failed to create Metal blit encoder for %zu feedback snapshot(s)", caller, requests.size());
+		encoder = beginRenderPass(0, true); // restore the same logical pass for subsequent GL commands
+		return false;
+	}
+	for (const FeedbackSnapshotRequest &request : requests) {
+		// Copy every mip level, not just the attached level: the shader may issue
+		// explicit-LOD samples from other levels of the same GL texture object.
+		for (NSUInteger level = 0; level < request.source.mipmapLevelCount; ++level) {
+			const NSUInteger width = std::max<NSUInteger>(1, request.source.width >> level);
+			const NSUInteger height = std::max<NSUInteger>(1, request.source.height >> level);
+			const MTLSize size = MTLSizeMake(width, height, 1);
+			[blit copyFromTexture:request.source sourceSlice:0 sourceLevel:level
+				sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+				toTexture:request.snapshot destinationSlice:0 destinationLevel:level
+				destinationOrigin:MTLOriginMake(0, 0, 0)];
+		}
+	}
+	[blit endEncoding];
+	for (const FeedbackSnapshotRequest &request : requests) {
+		auto textureObject = ctx.texture_objects.find(request.textureName);
+		if (textureObject != ctx.texture_objects.end()) {
+			textureObject->second.feedback_snapshot_pass_serial = ctx.render_pass_serial;
+		}
+	}
+
+	// Re-open every selected color/depth attachment with LOAD so the snapshot operation
+	// is transparent to subsequent draws in the same GL render pass. No pipeline or
+	// per-draw resource bindings have been issued yet at this point.
+	encoder = beginRenderPass(0, true);
+	if (!encoder) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("%s: failed to resume framebuffer %u after feedback snapshot", caller, ctx.draw_fbo);
+		return false;
+	}
+
+	for (const FeedbackSnapshotRequest &request : requests) {
+		const uint64_t key = ((uint64_t)ctx.draw_fbo << 32) | request.textureName;
+		bool firstReport = false;
+		{
+			std::lock_guard<std::mutex> lock(feedbackLoopSetMutex);
+			firstReport = reportedFeedbackLoops.insert(key).second;
+		}
+		if (firstReport) {
+			GL4METAL_LOG("draw: snapshotting feedback image (program=%u framebuffer=%u texture=%u sampler='%s' unit=%d attachment=0x%X level=%d drawBufferIndex=%d snapshot=%p size=%lux%lu format=%lu)",
+				ctx.current_program, ctx.draw_fbo, request.textureName, request.samplerName.c_str(), request.unit,
+				request.attachment, request.level, request.drawBufferIndex, (__bridge void *)request.snapshot,
+				(unsigned long)request.source.width, (unsigned long)request.source.height, (unsigned long)request.source.pixelFormat);
+		}
+	}
+	return true;
+}
+
 static std::mutex vertexSamplerTraceMutex;
 static std::unordered_set<std::string> reportedVertexSamplerBindings;
 static std::mutex fragmentSamplerTraceMutex;
@@ -971,6 +1192,14 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 
+	// Resolve active sampler/attachment aliases before setting any render state. The
+	// snapshot helper may end and recreate the encoder, so it must run before pipeline,
+	// vertex, uniform, or sampler bindings are recorded on the current encoder.
+	std::unordered_map<GLuint, id<MTLTexture>> feedbackSnapshots;
+	if (!prepareFeedbackSnapshots(p, caller, enc, feedbackSnapshots)) {
+		return;
+	}
+
 	// Fixed-function state.
 	MTLCullMode cull = MTLCullModeNone;
 	if (capOn(GL_CULL_FACE) && triangles) {
@@ -1172,17 +1401,13 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 	}
 
-	// Textures: the sampler uniform holds a texture unit, the unit holds a texture.
-	// A feedback-loop texture cannot safely be replaced with the generic 1x1 fallback: a
-	// vertex-stage texelFetch/read (Iris uses this for iris_overlay) may address beyond it.
-	// Since OpenGL defines sampling from the active render attachment as undefined here,
-	// skip this draw rather than issuing a Metal draw with an unsafe substitute.
-	bool hasTextureFeedbackLoop = false;
+	// Textures: ordinary samplers bind their GL image; active attachment aliases bind
+	// the just-copied snapshot prepared above, never a too-small generic fallback.
 	for (const ProgramUniform &u : p.uniforms) {
 		if (u.info.kind != TranslatedUniform::Sampler) {
 			continue;
 		}
-		if (u.info.array_size <= 0 ||
+		if (u.info.array_size <= 0 || (size_t)u.info.array_size > u.units.size() ||
 			(u.info.stage[0].present && (u.info.stage[0].slot >= 16 || (uint64_t)u.info.stage[0].slot + (uint64_t)u.info.array_size > 16)) ||
 			(u.info.stage[1].present && (u.info.stage[1].slot >= 16 || (uint64_t)u.info.stage[1].slot + (uint64_t)u.info.array_size > 16))) {
 			gl4metalSetError(GL_INVALID_OPERATION);
@@ -1211,20 +1436,14 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				if (bound != ctx.bound_textures[unit].end() && bound->second != 0) {
 					const GLuint textureName = bound->second;
 					textureNameForTrace = textureName;
-					if (textureIsAttachedToDrawFramebuffer(textureName)) {
-						const uint64_t key = ((uint64_t)ctx.draw_fbo << 32) | textureName;
-						bool firstReport = false;
-						{
-							std::lock_guard<std::mutex> lock(feedbackLoopSetMutex);
-							firstReport = reportedFeedbackLoops.insert(key).second;
+					auto feedbackSnapshot = feedbackSnapshots.find(textureName);
+					auto to = ctx.texture_objects.find(textureName);
+					if (feedbackSnapshot != feedbackSnapshots.end()) {
+						texture = feedbackSnapshot->second;
+						if (to != ctx.texture_objects.end() && !isBufferSampler) {
+							sampler = samplerFor(to->second, (GLuint)unit);
 						}
-						if (firstReport) {
-							GL4METAL_LOG("draw: skipping texture feedback loop (program=%u, framebuffer=%u, texture=%u); sampling the active render attachment is undefined",
-								ctx.current_program, ctx.draw_fbo, textureName);
-						}
-						hasTextureFeedbackLoop = true;
 					} else {
-						auto to = ctx.texture_objects.find(textureName);
 						if (to != ctx.texture_objects.end() && isBufferSampler &&
 							to->second.buffer_sampler_type != 0 &&
 							to->second.buffer_sampler_type != u.info.sampler_gl_type) {
@@ -1304,9 +1523,6 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				if (!isBufferSampler) [enc setFragmentSamplerState:sampler atIndex:index];
 			}
 		}
-	}
-	if (hasTextureFeedbackLoop) {
-		return; // Do not sample a render attachment, including through a too-small fallback texture.
 	}
 
 	auto markDefaultFramebufferAttachmentsWritten = [&]() {
