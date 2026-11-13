@@ -792,10 +792,6 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		for (GLuint image_unit = 0; image_unit < GL4METAL_MAX_IMAGE_UNITS; ++image_unit) {
 			ImageUnitBinding &binding = ctx.image_unit_bindings[image_unit];
 			if (binding.texture == tex_id) {
-				if (const char *trace_value = std::getenv("GL4METAL_TRACE_IMAGE_BINDINGS"); trace_value && trace_value[0] == '1') {
-					GL4METAL_LOG("glDeleteTextures: ctx=%p texture=%u detached from image unit %u",
-						(void *)&ctx, tex_id, image_unit);
-				}
 				binding = ImageUnitBinding();
 			}
 		}
