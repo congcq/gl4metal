@@ -5,6 +5,6 @@
 #import "framebuffer.h"
 
 void flushCommandBuffer(bool waitUntilCompleted); // commits the open command buffer
-void installCommandBufferErrorHandler(id<MTLCommandBuffer> commandBuffer);
+void reportCommandBufferErrorIfNeeded(id<MTLCommandBuffer> commandBuffer);
 
 #endif // SYNC_H

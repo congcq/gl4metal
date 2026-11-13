@@ -13,6 +13,6 @@ bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length, __
 
 static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAttrib &va, id<MTLBuffer> source, NSUInteger &convertedStride, __strong id<MTLBuffer> &converted);
 
-static static GLenum targetForDim(TranslatedUniform::Dim dim);
+static GLenum targetForDim(TranslatedUniform::Dim dim);
 
 #endif // DRAW_H

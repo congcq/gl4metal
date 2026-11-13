@@ -2,15 +2,21 @@
 
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h> // GetDefaultResources() (library: glslang-default-resource-limits)
+#include <glslang/Include/intermediate.h>
+#include <glslang/MachineIndependent/localintermediate.h>
 #include <SPIRV/GlslangToSpv.h>
 #include <spirv_msl.hpp>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cctype>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <utility>
 #include <vector>
 #include <regex>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -23,9 +29,11 @@ namespace {
 enum Stage { VS = 0, FS = 1 };
 
 void initGlslang() {
-	// C++11 function-local static initialization is synchronized across linker threads.
-	static const bool initialized = [] { return glslang::InitializeProcess(); }();
-	(void)initialized;
+	glslang::InitializeProcess();
+}
+
+void finalizeGlslang() {
+	glslang::FinalizeProcess();
 }
 
 // glslang's Vulkan dialect reserves `sampler` (separate samplers), GLSL 330 doesn't: Minecraft's shaders use it as the
@@ -292,6 +300,140 @@ void setupShader(glslang::TShader &shader, EShLanguage stage, const char *const 
 	shader.setAutoMapBindings(true);
 }
 
+static const std::unordered_set<std::string> &mslReservedIdentifiers() {
+	static const std::unordered_set<std::string> reserved = {
+		// C++ keywords used by Metal Shading Language.
+		"alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break", "case",
+		"catch", "char", "char8_t", "char16_t", "char32_t", "class", "compl", "concept", "const", "consteval",
+		"constexpr", "constinit", "const_cast", "continue", "co_await", "co_return", "co_yield", "decltype", "default",
+		"delete", "do", "double", "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false", "float",
+		"for", "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "not",
+		"not_eq", "nullptr", "operator", "or", "or_eq", "private", "protected", "public", "register",
+		"reinterpret_cast", "requires", "return", "short", "signed", "sizeof", "static", "static_assert", "static_cast",
+		"struct", "switch", "template", "this", "thread_local", "throw", "true", "try", "typedef", "typeid", "typename",
+		"union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq",
+		"module", "import", "final", "override",
+		// Metal language qualifiers, stage keywords and Objective-C's id token.
+		"kernel", "vertex", "fragment", "compute", "device", "constant", "threadgroup", "thread",
+		"threadgroup_imageblock", "ray_data", "object_data", "visible_function_table", "intersection_function_table", "id",
+		// Metal scalar/vector/matrix, resource and atomic type names.
+		"half", "half2", "half3", "half4", "float2", "float3", "float4", "double2", "double3", "double4",
+		"bool2", "bool3", "bool4", "char2", "char3", "char4", "uchar", "uchar2", "uchar3", "uchar4",
+		"short2", "short3", "short4", "ushort", "ushort2", "ushort3", "ushort4", "int2", "int3", "int4",
+		"uint", "uint2", "uint3", "uint4", "long2", "long3", "long4", "ulong", "ulong2", "ulong3", "ulong4",
+		"float2x2", "float2x3", "float2x4", "float3x2", "float3x3", "float3x4", "float4x2", "float4x3", "float4x4",
+		"half2x2", "half2x3", "half2x4", "half3x2", "half3x3", "half3x4", "half4x2", "half4x3", "half4x4",
+		"packed_float2", "packed_float3", "packed_float4", "packed_half2", "packed_half3", "packed_half4",
+		"atomic_int", "atomic_uint", "sampler", "texture1d", "texture2d", "texture3d", "texturecube",
+		// MSL standard-library math, geometric, relational and packing functions.
+		"abs", "acos", "acosh", "all", "any", "as_type", "asin", "asinh", "atan", "atan2", "atanh", "ceil",
+		"clamp", "copysign", "cos", "cosh", "cospi", "cross", "degrees", "determinant", "distance", "distance_squared",
+		"dot", "exp", "exp2", "exp10", "fabs", "faceforward", "fdim", "floor", "fma", "fmax", "fmin", "fmod",
+		"fract", "frexp", "fwidth", "hypot", "ilogb", "inverse", "isfinite", "isinf", "isnan", "ldexp", "length",
+		"length_squared", "log", "log2", "log10", "log1p", "logb", "mad", "max", "min", "mix", "modf", "normalize",
+		"outer_product", "pow", "pown", "powr", "radians", "reflect", "refract", "remainder", "remquo", "rint",
+		"round", "rsqrt", "select", "sign", "sin", "sincos", "sinh", "sinpi", "smoothstep", "sqrt", "step", "tan",
+		"tanh", "tgamma", "transpose", "trunc", "bias"
+	};
+	return reserved;
+}
+
+static bool isReservedMslIdentifier(const std::string &name,
+	const std::unordered_set<std::string> &reserved) {
+	if (reserved.find(name) != reserved.end()) return true;
+	// glslang may preserve a function's mangled signature in SPIR-V OpName,
+	// e.g. "tanh(f1;". MSL needs the base identifier, not the mangled spelling.
+	const size_t signatureStart = name.find('(');
+	return signatureStart != std::string::npos &&
+		reserved.find(name.substr(0, signatureStart)) != reserved.end();
+}
+
+static std::string mslIdentifierBase(const std::string &name) {
+	const size_t signatureStart = name.find('(');
+	return name.substr(0, signatureStart);
+}
+
+static std::string makeUniqueMslIdentifier(const std::string &oldName, uint32_t spirvSymbolId,
+	std::unordered_set<std::string> &usedNames) {
+	std::string baseName = "gl4metal_msl_" + oldName + "_" + std::to_string(spirvSymbolId);
+	std::string candidate = baseName;
+	uint32_t suffix = 1;
+	while (usedNames.find(candidate) != usedNames.end()) {
+		candidate = baseName + "_" + std::to_string(suffix++);
+	}
+	usedNames.insert(candidate);
+	return candidate;
+}
+
+static void sanitizeMslStructTypeMembers(spirv_cross::CompilerMSL &compiler, spirv_cross::TypeID structTypeId,
+	const std::unordered_set<std::string> &reserved, std::unordered_set<spirv_cross::TypeID> &visitedTypes,
+	std::unordered_set<std::string> &usedNames, size_t &renamedCount) {
+	if (!visitedTypes.insert(structTypeId).second) return;
+	const spirv_cross::SPIRType &structType = compiler.get_type(structTypeId);
+	if (structType.basetype != spirv_cross::SPIRType::Struct) return;
+	for (uint32_t memberIndex = 0; memberIndex < structType.member_types.size(); ++memberIndex) {
+		const std::string oldMemberName = compiler.get_member_name(structTypeId, memberIndex);
+		if (!oldMemberName.empty() && reserved.find(oldMemberName) != reserved.end()) {
+			const std::string newMemberName = makeUniqueMslIdentifier(oldMemberName,
+				structTypeId ^ (memberIndex + 0x40000000u), usedNames);
+			compiler.set_member_name(structTypeId, memberIndex, newMemberName);
+			++renamedCount;
+		}
+		const spirv_cross::TypeID memberTypeId = structType.member_types[memberIndex];
+		if (compiler.get_type(memberTypeId).basetype == spirv_cross::SPIRType::Struct) {
+			sanitizeMslStructTypeMembers(compiler, memberTypeId, reserved, visitedTypes, usedNames, renamedCount);
+		}
+	}
+}
+
+template <typename ResourceList>
+static void sanitizeMslStructResourceMembers(spirv_cross::CompilerMSL &compiler,
+	const ResourceList &resourceList, const std::unordered_set<std::string> &reserved,
+	std::unordered_set<spirv_cross::TypeID> &visitedTypes, std::unordered_set<std::string> &usedNames,
+	size_t &renamedCount) {
+	for (const spirv_cross::Resource &resource : resourceList) {
+		const spirv_cross::SPIRType &resourceType = compiler.get_type(resource.base_type_id);
+		if (resourceType.basetype == spirv_cross::SPIRType::Struct) {
+			sanitizeMslStructTypeMembers(compiler, resource.base_type_id, reserved, visitedTypes, usedNames, renamedCount);
+		}
+	}
+}
+
+static size_t sanitizeMslIdentifiers(spirv_cross::CompilerMSL &compiler,
+	const spirv_cross::ShaderResources &resources, const char *stageName, std::string &log) {
+	const std::unordered_set<std::string> &reserved = mslReservedIdentifiers();
+	std::unordered_set<std::string> usedNames;
+	const uint32_t spirvIdBound = compiler.get_current_id_bound();
+	for (uint32_t spirvSymbolId = 1; spirvSymbolId < spirvIdBound; ++spirvSymbolId) {
+		const std::string symbolName = compiler.get_name(spirvSymbolId);
+		if (!symbolName.empty()) usedNames.insert(symbolName);
+	}
+
+	size_t renamedCount = 0;
+	for (uint32_t spirvSymbolId = 1; spirvSymbolId < spirvIdBound; ++spirvSymbolId) {
+		const std::string symbolName = compiler.get_name(spirvSymbolId);
+		if (symbolName.empty() || !isReservedMslIdentifier(symbolName, reserved)) continue;
+		const std::string safeName = makeUniqueMslIdentifier(mslIdentifierBase(symbolName), spirvSymbolId, usedNames);
+		compiler.set_name(spirvSymbolId, safeName);
+		++renamedCount;
+	}
+
+	std::unordered_set<spirv_cross::TypeID> visitedTypes;
+	// Resource reflection and GL-facing names have already been copied into TranslatedProgram.
+	// Only SPIR-V OpMemberName values are changed here, immediately before MSL emission.
+	sanitizeMslStructResourceMembers(compiler, resources.uniform_buffers, reserved, visitedTypes, usedNames, renamedCount);
+	sanitizeMslStructResourceMembers(compiler, resources.storage_buffers, reserved, visitedTypes, usedNames, renamedCount);
+	sanitizeMslStructResourceMembers(compiler, resources.stage_inputs, reserved, visitedTypes, usedNames, renamedCount);
+	sanitizeMslStructResourceMembers(compiler, resources.stage_outputs, reserved, visitedTypes, usedNames, renamedCount);
+	sanitizeMslStructResourceMembers(compiler, resources.push_constant_buffers, reserved, visitedTypes, usedNames, renamedCount);
+
+	if (renamedCount != 0) {
+		log += std::to_string(renamedCount) + " " + stageName +
+			" MSL identifier(s) renamed to avoid Metal built-in/keyword collisions\n";
+	}
+	return renamedCount;
+}
+
 struct TranslationLookup {
 	std::unordered_map<std::string, size_t> uniform_indices;
 	std::unordered_map<std::string, size_t> block_indices;
@@ -418,6 +560,69 @@ int arraySizeOf(const spirv_cross::SPIRType &type) {
 	}
 	return 1;
 }
+
+// SPIRV-Cross identifies explicit MSL resource remaps by
+// (execution stage, descriptor set, SPIR-V binding). Desktop GL sampler uniforms
+// do not have to own unique descriptor bindings: their actual texture units are
+// assigned later through glUniform1i. glslang can therefore emit multiple active
+// resources with the same (set, binding), which makes SPIRV-Cross reuse one MSL
+// texture/sampler location for otherwise distinct uniforms. Give only colliding
+// resources a unique internal SPIR-V binding key before registering MSL remaps.
+// This does not change GL texture units or the Metal slots stored in reflection.
+static bool makeMslResourceBindingKeysUnique(
+	spirv_cross::CompilerMSL &msl,
+	const std::vector<const spirv_cross::Resource *> &mappedResources,
+	const char *stageName,
+	std::string &log) {
+	auto makeKey = [](uint32_t descriptorSet, uint32_t binding) -> uint64_t {
+		return (static_cast<uint64_t>(descriptorSet) << 32) | static_cast<uint64_t>(binding);
+	};
+	auto descriptorSetOf = [&msl](const spirv_cross::Resource &resource) -> uint32_t {
+		return msl.has_decoration(resource.id, spv::DecorationDescriptorSet)
+			? msl.get_decoration(resource.id, spv::DecorationDescriptorSet) : 0;
+	};
+	auto bindingOf = [&msl](const spirv_cross::Resource &resource) -> uint32_t {
+		return msl.has_decoration(resource.id, spv::DecorationBinding)
+			? msl.get_decoration(resource.id, spv::DecorationBinding) : 0;
+	};
+
+	std::unordered_set<uint32_t> seenResourceIds;
+	std::unordered_set<uint64_t> seenKeys;
+	uint32_t maximumBinding = 0;
+	for (const spirv_cross::Resource *resource : mappedResources) {
+		if (!resource || !seenResourceIds.insert(resource->id).second) continue;
+		maximumBinding = std::max(maximumBinding, bindingOf(*resource));
+	}
+
+	uint64_t nextBinding = static_cast<uint64_t>(maximumBinding) + 1;
+	seenResourceIds.clear();
+	for (const spirv_cross::Resource *resource : mappedResources) {
+		if (!resource || !seenResourceIds.insert(resource->id).second) continue;
+
+		const uint32_t descriptorSet = descriptorSetOf(*resource);
+		const uint32_t originalBinding = bindingOf(*resource);
+		const uint64_t key = makeKey(descriptorSet, originalBinding);
+		if (seenKeys.insert(key).second) continue;
+
+		if (nextBinding > std::numeric_limits<uint32_t>::max()) {
+			log += std::string(stageName) +
+				": cannot create a unique internal SPIR-V resource binding (binding space exhausted)\n";
+			return false;
+		}
+
+		const uint32_t remappedBinding = static_cast<uint32_t>(nextBinding++);
+		msl.set_decoration(resource->id, spv::DecorationBinding, remappedBinding);
+		seenKeys.insert(makeKey(descriptorSet, remappedBinding));
+
+		const std::string resourceName = resource->name.empty() ? "<unnamed>" : resource->name;
+		log += std::string(stageName) + ": duplicate SPIR-V resource key (set=" +
+			std::to_string(descriptorSet) + ", binding=" + std::to_string(originalBinding) +
+			") for '" + resourceName + "'; internal binding remapped to " +
+			std::to_string(remappedBinding) + "\n";
+	}
+	return true;
+}
+
 
 static bool isMslIdentifierChar(char c) {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -815,6 +1020,224 @@ static bool addVertexFlipFunctionConstant(std::string &source, std::string &erro
 	return true;
 }
 
+// Metal requires a fragment color output to provide enough components for the
+// render-target pixel format. Desktop GL permits scalar/vec2/vec3 user outputs;
+// widen those MSL fields to vec4 and explicitly supply the missing components.
+// The missing-channel defaults are (0, 0, 0, 1), keeping alpha opaque for RGB
+// outputs and preserving normal GUI/text blending.
+static bool mslFragmentOutputScalarType(const spirv_cross::SPIRType &type, std::string &baseType) {
+	switch (type.basetype) {
+		case spirv_cross::SPIRType::Float: baseType = "float"; return type.width == 32;
+		case spirv_cross::SPIRType::Half:  baseType = "half";  return type.width == 16;
+		case spirv_cross::SPIRType::Int:   baseType = "int";   return type.width == 32;
+		case spirv_cross::SPIRType::UInt:  baseType = "uint";  return type.width == 32;
+		default: return false;
+	}
+}
+
+static std::string mslOutputComponentConstant(const std::string &baseType, bool one) {
+	if (baseType == "float") return one ? "1.0" : "0.0";
+	if (baseType == "half") return one ? "half(1.0)" : "half(0.0)";
+	if (baseType == "uint") return one ? "1u" : "0u";
+	return one ? "1" : "0";
+}
+
+static size_t widenMslFragmentColorOutputs(std::string &source,
+	const spirv_cross::CompilerMSL &compiler, const spirv_cross::ShaderResources &resources,
+	std::string &notes) {
+	struct OutputPatch {
+		std::string fieldName;
+		std::string baseType;
+		uint32_t width = 0;
+		uint32_t location = 0;
+	};
+	std::vector<OutputPatch> patches;
+	patches.reserve(resources.stage_outputs.size());
+
+	for (const spirv_cross::Resource &resource : resources.stage_outputs) {
+		if (compiler.has_decoration(resource.id, spv::DecorationBuiltIn) ||
+			!compiler.has_decoration(resource.id, spv::DecorationLocation)) continue;
+		const spirv_cross::SPIRType &type = compiler.get_type(resource.type_id);
+		if (type.columns != 1 || !type.array.empty() || type.vecsize == 0 || type.vecsize >= 4) continue;
+		std::string baseType;
+		if (!mslFragmentOutputScalarType(type, baseType)) continue;
+		std::string fieldName = compiler.get_name(resource.id);
+		if (fieldName.empty()) fieldName = resource.name;
+		if (fieldName.empty()) continue;
+		patches.push_back({fieldName, baseType, type.vecsize,
+			compiler.get_decoration(resource.id, spv::DecorationLocation)});
+	}
+
+	if (patches.empty()) return 0;
+
+	// SPIRV-Cross's MSL entry point returns a main0_out structure initialized as
+	// `main0_out out = {};`. Seed each widened field with GL's missing-component
+	// defaults before any whole-vector or component-wise stores. This also makes
+	// partial stores deterministic without changing shader control flow.
+	const size_t outputStructPosition = source.find("main0_out main0(");
+	if (outputStructPosition == std::string::npos) return 0;
+	const size_t functionBodyStart = source.find('{', outputStructPosition);
+	if (functionBodyStart == std::string::npos) return 0;
+	const std::string outputInit = "main0_out out = {};";
+	const size_t outputInitPosition = source.find(outputInit, functionBodyStart);
+	if (outputInitPosition == std::string::npos) return 0;
+
+	std::vector<std::string> initializers;
+	initializers.reserve(patches.size());
+	size_t widened = 0;
+	for (const OutputPatch &patch : patches) {
+		const std::string colorTag = "[[color(" + std::to_string(patch.location) + ")";
+		const size_t tagPosition = source.find(colorTag);
+		if (tagPosition == std::string::npos) continue;
+		const size_t lineStartFound = source.rfind('\n', tagPosition);
+		const size_t declarationStart = lineStartFound == std::string::npos ? 0 : lineStartFound + 1;
+		std::string declaration = source.substr(declarationStart, tagPosition - declarationStart);
+		while (!declaration.empty() && (declaration.back() == ' ' || declaration.back() == '\t' || declaration.back() == '\r')) declaration.pop_back();
+
+		const size_t nameEnd = declaration.size();
+		size_t nameStart = nameEnd;
+		while (nameStart > 0 && (std::isalnum((unsigned char)declaration[nameStart - 1]) || declaration[nameStart - 1] == '_')) --nameStart;
+		if (nameStart == nameEnd) continue;
+		const std::string emittedFieldName = declaration.substr(nameStart, nameEnd - nameStart);
+		if (emittedFieldName != patch.fieldName) continue;
+		size_t typeEnd = nameStart;
+		while (typeEnd > 0 && std::isspace((unsigned char)declaration[typeEnd - 1])) --typeEnd;
+		size_t typeStart = typeEnd;
+		while (typeStart > 0 && (std::isalnum((unsigned char)declaration[typeStart - 1]) || declaration[typeStart - 1] == '_')) --typeStart;
+		if (typeStart == typeEnd) continue;
+		const std::string oldType = declaration.substr(typeStart, typeEnd - typeStart);
+		const std::string expectedType = patch.width == 1
+			? patch.baseType : patch.baseType + std::to_string(patch.width);
+		if (oldType != expectedType) continue;
+
+		// Replace only the MSL output field's type token.
+		const size_t absoluteTypeStart = declarationStart + typeStart;
+		source.replace(absoluteTypeStart, oldType.size(), patch.baseType + "4");
+
+		// The output variable is readable in GLSL. Once its MSL storage is widened,
+		// every whole-vector READ must still have the original width (for example,
+		// `out.sky_map * float3` must become `out.sky_map.xyz * float3`). Writes are
+		// handled separately: whole writes are widened below, while compound writes
+		// target only the original-width swizzle and leave the default alpha intact.
+		const size_t currentOutputInitPosition = source.find(outputInit);
+		if (currentOutputInitPosition == std::string::npos) continue;
+		const std::string assignmentPrefix = "out." + patch.fieldName;
+		const std::string maskedForReads = maskShaderComments(source);
+		const size_t refreshedOutputStructPosition = source.find("main0_out main0(");
+		const size_t functionBodyOpen = refreshedOutputStructPosition == std::string::npos ?
+			std::string::npos : maskedForReads.find('{', refreshedOutputStructPosition);
+		if (functionBodyOpen == std::string::npos) continue;
+		int bodyDepth = 0;
+		size_t functionBodyClose = std::string::npos;
+		for (size_t bodyPos = functionBodyOpen; bodyPos < maskedForReads.size(); ++bodyPos) {
+			if (maskedForReads[bodyPos] == '{') ++bodyDepth;
+			else if (maskedForReads[bodyPos] == '}' && --bodyDepth == 0) {
+				functionBodyClose = bodyPos;
+				break;
+			}
+		}
+		std::vector<size_t> readWidthInsertions;
+		const std::string originalWidthSwizzle = patch.width == 1 ? ".x" :
+			(patch.width == 2 ? ".xy" : ".xyz");
+		for (size_t readPos = currentOutputInitPosition + outputInit.size();
+			functionBodyClose != std::string::npos &&
+			(readPos = maskedForReads.find(assignmentPrefix, readPos)) != std::string::npos &&
+			readPos < functionBodyClose; ) {
+			const bool leftBoundary = readPos == 0 ||
+				(!isMslIdentifierChar(maskedForReads[readPos - 1]) && maskedForReads[readPos - 1] != '.');
+			const size_t afterName = readPos + assignmentPrefix.size();
+			if (!leftBoundary || (afterName < functionBodyClose && isMslIdentifierChar(maskedForReads[afterName]))) {
+				readPos = afterName;
+				continue;
+			}
+			size_t nextToken = afterName;
+			while (nextToken < functionBodyClose && std::isspace((unsigned char)maskedForReads[nextToken])) ++nextToken;
+			if (nextToken < functionBodyClose && (maskedForReads[nextToken] == '.' || maskedForReads[nextToken] == '[')) {
+				readPos = afterName; // already component/index access
+				continue;
+			}
+			if (nextToken < functionBodyClose && maskedForReads[nextToken] == '=' &&
+				(nextToken + 1 >= functionBodyClose || maskedForReads[nextToken + 1] != '=')) {
+				readPos = afterName; // plain whole-field assignment; widen its RHS below
+				continue;
+			}
+			// Compound assignment reads and writes the old-width value. Putting the
+			// swizzle on its LHS keeps the fourth output component untouched. Ordinary
+			// expression uses get the same swizzle as a read.
+			readWidthInsertions.push_back(afterName);
+			readPos = afterName;
+		}
+		for (auto insertion = readWidthInsertions.rbegin(); insertion != readWidthInsertions.rend(); ++insertion) {
+			source.insert(*insertion, originalWidthSwizzle);
+		}
+
+		// Widen all whole-field stores. Component stores need no conversion; the
+		// initializer inserted below supplies their untouched channels. Reads in RHS
+		// expressions now carry the original-width swizzle, preventing float4/float3
+		// mixtures such as `float4((out.sky_map * fog[1]) + fog[0], 1.0)`.
+		const size_t refreshedOutputInitPosition = source.find(outputInit);
+		size_t searchPosition = refreshedOutputInitPosition == std::string::npos ? 0 :
+			refreshedOutputInitPosition + outputInit.size();
+		bool wholeStoreFound = false;
+		while ((searchPosition = source.find(assignmentPrefix, searchPosition)) != std::string::npos) {
+			const size_t afterName = searchPosition + assignmentPrefix.size();
+			if (afterName < source.size() && (std::isalnum((unsigned char)source[afterName]) ||
+				source[afterName] == '_' || source[afterName] == '[' || source[afterName] == '.')) {
+				searchPosition = afterName;
+				continue;
+			}
+			size_t equalPosition = afterName;
+			while (equalPosition < source.size() && std::isspace((unsigned char)source[equalPosition])) ++equalPosition;
+			if (equalPosition >= source.size() || source[equalPosition] != '=' ||
+				(equalPosition + 1 < source.size() && source[equalPosition + 1] == '=')) {
+				searchPosition = afterName;
+				continue;
+			}
+			const size_t expressionStart = equalPosition + 1;
+			const size_t semicolon = source.find(';', expressionStart);
+			if (semicolon == std::string::npos) break;
+			std::string expression = source.substr(expressionStart, semicolon - expressionStart);
+			while (!expression.empty() && std::isspace((unsigned char)expression.front())) expression.erase(expression.begin());
+			while (!expression.empty() && std::isspace((unsigned char)expression.back())) expression.pop_back();
+			if (expression.empty()) {
+				searchPosition = semicolon + 1;
+				continue;
+			}
+			std::string widenedExpression = patch.baseType + "4((" + expression + ")";
+			for (uint32_t component = patch.width; component < 4; ++component) {
+				widenedExpression += ", " + mslOutputComponentConstant(patch.baseType, component == 3);
+			}
+			widenedExpression += ")";
+			source.replace(expressionStart, semicolon - expressionStart, " " + widenedExpression);
+			searchPosition = expressionStart + widenedExpression.size() + 1;
+			wholeStoreFound = true;
+		}
+
+		std::string defaultValue = patch.baseType + "4(";
+		for (uint32_t component = 0; component < 4; ++component) {
+			if (component != 0) defaultValue += ", ";
+			defaultValue += mslOutputComponentConstant(patch.baseType, component == 3);
+		}
+		defaultValue += ")";
+		initializers.push_back("\n    out." + patch.fieldName + " = " + defaultValue + ";");
+		++widened;
+		notes += "fragment output '" + patch.fieldName + "' at location " +
+			std::to_string(patch.location) + " widened from " + expectedType + " to " +
+			patch.baseType + "4; whole-vector stores=" + (wholeStoreFound ? "rewritten" : "none") +
+			", partial stores retain GL defaults\n";
+	}
+
+	if (widened != 0) {
+		std::string initializerBlock;
+		for (const std::string &initializer : initializers) initializerBlock += initializer;
+		const size_t finalOutputInitPosition = source.find(outputInit);
+		if (finalOutputInitPosition != std::string::npos) {
+			source.insert(finalOutputInitPosition + outputInit.size(), initializerBlock);
+		}
+	}
+	return widened;
+}
+
 // The vertex stage is compiled once. A function constant supplies the render-to-texture
 // Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
@@ -840,8 +1263,18 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		if (!halfVaryingNames.empty()) {
 			msl.set_variable_type_remap_callback([&halfVaryingNames](
 				const spirv_cross::SPIRType &type, const std::string &name, std::string &replacementType) {
-				if (halfVaryingNames.find(name) == halfVaryingNames.end() ||
-					type.basetype != spirv_cross::SPIRType::Float || type.columns != 1 ||
+				bool isRelaxedVarying = halfVaryingNames.find(name) != halfVaryingNames.end();
+				if (!isRelaxedVarying && name.compare(0, 13, "gl4metal_msl_") == 0) {
+					const std::string renamedSuffix = name.substr(13);
+					for (const std::string &originalName : halfVaryingNames) {
+						if (renamedSuffix.compare(0, originalName.size(), originalName) == 0 &&
+							renamedSuffix.size() > originalName.size() && renamedSuffix[originalName.size()] == '_') {
+							isRelaxedVarying = true;
+							break;
+						}
+					}
+				}
+				if (!isRelaxedVarying || type.basetype != spirv_cross::SPIRType::Float || type.columns != 1 ||
 					type.vecsize < 2 || type.vecsize > 4) return;
 				replacementType = type.vecsize == 2 ? "half2" : (type.vecsize == 3 ? "half3" : "half4");
 			});
@@ -853,6 +1286,18 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		// which causes needless Metal bindings and can trigger false feedback-loop skips.
 		auto activeVariables = msl.get_active_interface_variables();
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+
+		// Uniform buffers and sampled images share SPIR-V's (set, binding) key
+		// space even though Metal places them in different resource namespaces.
+		// OpenGL sampler uniforms may carry the same default binding, so uniquify
+		// all resources participating in the explicit SPIRV-Cross remap table.
+		std::vector<const spirv_cross::Resource *> mappedResources;
+		mappedResources.reserve(resources.uniform_buffers.size() + resources.sampled_images.size());
+		for (const spirv_cross::Resource &resource : resources.uniform_buffers) mappedResources.push_back(&resource);
+		for (const spirv_cross::Resource &resource : resources.sampled_images) mappedResources.push_back(&resource);
+		if (!makeMslResourceBindingKeysUnique(msl, mappedResources,
+			stage == VS ? "vertex" : "fragment", out.log)) return false;
+
 		if (stage == FS && alignFragmentInputs && !vertexOutputLocations.empty()) {
 			size_t alignedCount = 0;
 			std::string interfaceError;
@@ -984,7 +1429,9 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 		}
 
-		// Combined image samplers become a texture + sampler pair sharing one dense slot per stage.
+		// Combined image samplers use one dense, stage-local texture/sampler slot.
+		// The GL texture unit is only a lookup key into bound_textures; it is not a
+		// Metal binding index. Keep the per-stage Metal slot budget at 16.
 		std::vector<std::pair<uint32_t, const spirv_cross::Resource *>> samplers;
 		for (const spirv_cross::Resource &r : resources.sampled_images) {
 			samplers.emplace_back(msl.get_decoration(r.id, spv::DecorationBinding), &r);
@@ -997,6 +1444,10 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		for (const auto &entry : samplers) {
 			const spirv_cross::Resource &r = *entry.second;
 			int count = arraySizeOf(msl.get_type(r.type_id));
+			if (count <= 0) {
+				out.log += "sampler '" + r.name + "' has an invalid array size\n";
+				return false;
+			}
 
 			spirv_cross::MSLResourceBinding b;
 			b.stage = model;
@@ -1004,7 +1455,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			b.binding = entry.first;
 			b.msl_texture = slot;
 			b.msl_sampler = slot;
-			b.count = (uint32_t)count; // reserve the complete texture/sampler range for array uniforms
+			b.count = (uint32_t)count;
 			msl.add_msl_resource_binding(b);
 
 			TranslatedUniform &u = findOrAdd(out, r.name, lookup);
@@ -1025,6 +1476,13 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			u.stage[stage].present = true;
 			u.stage[stage].slot = slot;
 			slot += (uint32_t)count;
+		}
+		const uint32_t stageTextureLimit = stage == VS
+			? GL4METAL_MAX_VERTEX_TEXTURE_UNITS : GL4METAL_MAX_FRAGMENT_TEXTURE_UNITS;
+		if (slot > stageTextureLimit) {
+			out.log += "shader stage exceeds its Metal texture/sampler slot limit (" +
+			std::to_string(stageTextureLimit) + ")\n";
+			return false;
 		}
 
 		if (stage == VS) {
@@ -1047,7 +1505,16 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 		}
 
+		sanitizeMslIdentifiers(msl, resources, stage == VS ? "vertex" : "fragment", out.log);
 		std::string compiledMsl = msl.compile();
+		if (stage == FS) {
+			std::string outputNotes;
+			const size_t widenedOutputs = widenMslFragmentColorOutputs(compiledMsl, msl, resources, outputNotes);
+			if (widenedOutputs != 0) {
+				out.log += "fragment output compatibility: widened " + std::to_string(widenedOutputs) +
+					" sub-vec4 output(s) for Metal RGBA attachments\n" + outputNotes;
+			}
+		}
 		const size_t clampedReads = clampMslTexture2DReadCoordinates(compiledMsl);
 		if (clampedReads != 0) {
 			out.log += std::to_string(clampedReads) + " out-of-range-safe texture2d.read coordinate guard(s) added to " +
@@ -1174,6 +1641,19 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 		auto activeVariables = msl.get_active_interface_variables();
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+
+		// All resource classes below are entered into SPIRV-Cross's explicit MSL
+		// remap table. Avoid duplicate (set, binding) keys across buffer and
+		// texture resources before assigning their independent Metal namespace slots.
+		std::vector<const spirv_cross::Resource *> mappedResources;
+		mappedResources.reserve(resources.storage_buffers.size() + resources.uniform_buffers.size() +
+			resources.sampled_images.size() + resources.storage_images.size());
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) mappedResources.push_back(&resource);
+		for (const spirv_cross::Resource &resource : resources.uniform_buffers) mappedResources.push_back(&resource);
+		for (const spirv_cross::Resource &resource : resources.sampled_images) mappedResources.push_back(&resource);
+		for (const spirv_cross::Resource &resource : resources.storage_images) mappedResources.push_back(&resource);
+		if (!makeMslResourceBindingKeysUnique(msl, mappedResources, "compute", out.log)) return false;
+
 		msl.set_enabled_interface_variables(std::move(activeVariables));
 
 		// In Metal, buffer, texture and sampler namespaces are separate. Keep SSBOs
@@ -1357,27 +1837,39 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 			uniform.stage[2].present = true;
 			uniform.stage[2].slot = nextTextureSlot;
 			nextTextureSlot += (uint32_t)count;
-			if (nextTextureSlot > 32) {
-				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
+			if (nextTextureSlot > GL4METAL_MAX_COMPUTE_TEXTURE_UNITS) {
+				out.log += "compute shader exceeds the 16 Metal sampler-state slots\n";
 				return false;
 			}
 		}
 
 		for (const spirv_cross::Resource &resource : resources.storage_images) {
 			const spirv_cross::SPIRType &imageType = msl.get_type(resource.type_id);
-			if (imageType.image.dim != spv::Dim2D || imageType.image.arrayed || !imageType.array.empty()) {
-				out.log += "compute storage images currently support non-array image2D only\n";
+			// Metal can expose a GL image3D as texture3d with read/write access. The
+			// GL_TEXTURE_3D allocation path is already private + ShaderRead/ShaderWrite.
+			// 2D-array/cube storage images remain explicitly unsupported until their GL
+			// texture allocation and view-binding paths are implemented as well.
+			const bool is2D = imageType.image.dim == spv::Dim2D && !imageType.image.arrayed;
+			const bool is3D = imageType.image.dim == spv::Dim3D && !imageType.image.arrayed;
+			if ((!is2D && !is3D) || imageType.image.ms) {
+				out.log += "compute storage image '" + resource.name +
+				"' has unsupported dimension (supported: image2D and image3D; no arrayed or multisample images)\n";
 				return false;
 			}
-			if (nextTextureSlot >= 32) {
-				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
-				return false;
-			}
+			const uint32_t resourceCount = (uint32_t)arraySizeOf(imageType);
 			const uint32_t spirvBinding = msl.get_decoration(resource.id, spv::DecorationBinding);
 			auto sourceBinding = sourceBindings.storageImages.find(resource.name);
 			const uint32_t bindingPoint = sourceBinding == sourceBindings.storageImages.end() ? 0 : sourceBinding->second;
-			if (bindingPoint >= GL4METAL_MAX_TEXTURE_UNITS) {
-				out.log += "compute storage-image binding exceeds GL4Metal's 32 image units\n";
+			if (resourceCount == 0 || resourceCount > GL4METAL_MAX_IMAGE_UNITS) {
+				out.log += "compute storage image array has an invalid element count\n";
+				return false;
+			}
+			if (bindingPoint >= GL4METAL_MAX_IMAGE_UNITS || resourceCount > GL4METAL_MAX_IMAGE_UNITS - bindingPoint) {
+				out.log += "compute storage-image binding range exceeds GL4Metal's 32 image units\n";
+				return false;
+			}
+			if (resourceCount > 32u - nextTextureSlot) {
+				out.log += "compute shader exceeds the 32 Metal texture binding slots\n";
 				return false;
 			}
 			spirv_cross::MSLResourceBinding binding;
@@ -1385,16 +1877,21 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
 			binding.binding = spirvBinding;
 			binding.msl_texture = nextTextureSlot;
+			binding.count = resourceCount;
 			msl.add_msl_resource_binding(binding);
 
-			TranslatedImage image;
-			image.name = resource.name;
-			image.binding = bindingPoint;
-			image.slot = nextTextureSlot++;
-			image.format = glImageFormatForSpirv(imageType.image.format);
-			image.read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
-			image.write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
-			out.storage_images.push_back(std::move(image));
+			for (uint32_t element = 0; element < resourceCount; ++element) {
+				TranslatedImage image;
+				image.name = resourceCount > 1 ? resource.name + "[" + std::to_string(element) + "]" : resource.name;
+				image.binding = bindingPoint + element;
+				image.slot = nextTextureSlot + element;
+				image.format = glImageFormatForSpirv(imageType.image.format);
+				image.is_3d = is3D;
+				image.read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
+				image.write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
+				out.storage_images.push_back(std::move(image));
+			}
+			nextTextureSlot += resourceCount;
 		}
 
 		out.workgroup_size[0] = msl.get_execution_mode_argument(spv::ExecutionModeLocalSize, 0);
@@ -1405,6 +1902,7 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 			return false;
 		}
 
+		sanitizeMslIdentifiers(msl, resources, "compute", out.log);
 		out.msl[2] = msl.compile();
 		return true;
 	} catch (const std::exception &e) {
@@ -1415,7 +1913,146 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 } // namespace
 
+
+bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t maxThreadgroupBytes, std::string &notes, bool force) {
+	if (maxThreadgroupBytes == 0 || mslSource.empty()) return false;
+
+	// SPIRV-Cross represents GLSL shared vec3 arrays as nested spvUnsafeArray
+	// wrappers. MSL float3 has a 16-byte array stride; packed_float3 is 12 bytes.
+	// Workgroup storage is private to one threadgroup, so changing only this
+	// storage representation does not alter an externally visible buffer ABI.
+	static const std::regex declarationPattern(
+		R"(threadgroup\s+spvUnsafeArray\s*<\s*spvUnsafeArray\s*<\s*float3\s*,\s*([0-9]+)\s*>\s*,\s*([0-9]+)\s*>\s*([A-Za-z_][A-Za-z0-9_]*)\s*;)" );
+
+	struct Candidate {
+		std::string declaration;
+		std::string arrayName;
+		std::size_t innerCount = 0;
+		std::size_t outerCount = 0;
+	};
+	std::vector<Candidate> candidates;
+	for (std::sregex_iterator it(mslSource.begin(), mslSource.end(), declarationPattern), end; it != end; ++it) {
+		const std::smatch &match = *it;
+		Candidate candidate;
+		candidate.declaration = match.str();
+		candidate.innerCount = (std::size_t)std::strtoull(match[1].str().c_str(), nullptr, 10);
+		candidate.outerCount = (std::size_t)std::strtoull(match[2].str().c_str(), nullptr, 10);
+		candidate.arrayName = match[3].str();
+		if (candidate.innerCount == 0 || candidate.outerCount == 0 ||
+			candidate.innerCount > std::numeric_limits<std::size_t>::max() / candidate.outerCount) continue;
+		candidates.push_back(std::move(candidate));
+	}
+	if (candidates.empty()) return false;
+
+	// Avoid changing storage layout for kernels that already fit. If Metal later
+	// reports an aggregate overflow caused by additional declarations, the caller
+	// retries with force=true and compacts every eligible float3 array.
+	std::size_t estimatedCandidateBytes = 0;
+	for (const Candidate &candidate : candidates) {
+		const std::size_t elementCount = candidate.innerCount * candidate.outerCount;
+		if (elementCount > std::numeric_limits<std::size_t>::max() / 16u ||
+			elementCount * 16u > std::numeric_limits<std::size_t>::max() - estimatedCandidateBytes) return false;
+		estimatedCandidateBytes += elementCount * 16u;
+	}
+	if (!force && estimatedCandidateBytes <= maxThreadgroupBytes) return false;
+
+	std::string optimized = mslSource;
+	std::size_t originalCandidateBytes = 0;
+	std::size_t packedCandidateBytes = 0;
+	std::size_t copyCounter = 0;
+	std::vector<std::string> optimizedNames;
+
+	for (const Candidate &candidate : candidates) {
+		const std::size_t elementCount = candidate.innerCount * candidate.outerCount;
+		if (elementCount > std::numeric_limits<std::size_t>::max() / 16u) continue;
+		const std::size_t originalBytes = elementCount * 16u;
+		const std::size_t packedBytes = elementCount * 12u;
+		if (originalBytes > std::numeric_limits<std::size_t>::max() - originalCandidateBytes ||
+			packedBytes > std::numeric_limits<std::size_t>::max() - packedCandidateBytes) continue;
+
+		// Only compact arrays whose row values are copied into a normal MSL
+		// spvUnsafeArray. Rewrite that aggregate copy to explicit element-wise
+		// conversion, avoiding an invalid packed/unpacked aggregate assignment.
+		const std::string copyPatternText =
+			"spvUnsafeArray\\s*<\\s*float3\\s*,\\s*" + std::to_string(candidate.innerCount) +
+			">\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*" + candidate.arrayName +
+			R"(\s*\[\s*([^\]]+)\s*\]\s*;)";
+		const std::regex copyPattern(copyPatternText);
+
+		// Packed vectors support the same arithmetic as aligned vectors, but make
+		// conversions explicit when SPIRV-Cross initializes a normal float3 local
+		// directly from one shared-array element.
+		const std::regex scalarCopyPattern(
+			"(\\bfloat3\\s+[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*)" + candidate.arrayName +
+			R"(((?:\s*\[[^\]]+\]){2})\s*;)" );
+		optimized = std::regex_replace(optimized, scalarCopyPattern,
+			"$1float3(" + candidate.arrayName + "$2);");
+
+		std::vector<std::smatch> copyMatches;
+		for (std::sregex_iterator copyIt(optimized.begin(), optimized.end(), copyPattern), copyEnd; copyIt != copyEnd; ++copyIt) {
+			copyMatches.push_back(*copyIt);
+		}
+
+		// If an aggregate row copy exists, all matching copies are rewritten into
+		// element-wise float3 constructors. This keeps the helper-function argument
+		// ABI identical to the original unpacked spvUnsafeArray<float3, N> type.
+		std::string rewritten;
+		if (!copyMatches.empty()) {
+			std::size_t cursor = 0;
+			for (const std::smatch &copyMatch : copyMatches) {
+				const std::size_t matchPosition = (std::size_t)copyMatch.position();
+				rewritten.append(optimized, cursor, matchPosition - cursor);
+				const std::string localName = copyMatch[1].str();
+				const std::string rowExpression = copyMatch[2].str();
+				const std::size_t lineStart = optimized.rfind('\n', matchPosition);
+				const std::size_t indentStart = lineStart == std::string::npos ? 0 : lineStart + 1;
+				const std::string indentation = optimized.substr(indentStart, matchPosition - indentStart);
+				std::string loopName;
+				do {
+					loopName = "gl4metal_threadgroup_copy_index_" + std::to_string(copyCounter++);
+				} while (optimized.find(loopName) != std::string::npos || rewritten.find(loopName) != std::string::npos);
+				rewritten += "spvUnsafeArray<float3, " + std::to_string(candidate.innerCount) + "> " + localName + ";\n";
+				rewritten += indentation + "for (uint " + loopName + " = 0u; " + loopName + " < " +
+					std::to_string(candidate.innerCount) + "u; ++" + loopName + ") {\n";
+				rewritten += indentation + "    " + localName + "[" + loopName + "] = float3(" + candidate.arrayName +
+					"[" + rowExpression + "][" + loopName + "]);\n";
+				rewritten += indentation + "}\n";
+				cursor = matchPosition + (std::size_t)copyMatch.length();
+			}
+			rewritten.append(optimized, cursor, std::string::npos);
+			optimized.swap(rewritten);
+		}
+
+		std::string packedDeclaration = candidate.declaration;
+		const std::size_t typePosition = packedDeclaration.find("float3");
+		if (typePosition == std::string::npos) continue;
+		packedDeclaration.replace(typePosition, 6, "packed_float3");
+		const std::size_t declarationPosition = optimized.find(candidate.declaration);
+		if (declarationPosition == std::string::npos) continue;
+		optimized.replace(declarationPosition, candidate.declaration.size(), packedDeclaration);
+		originalCandidateBytes += originalBytes;
+		packedCandidateBytes += packedBytes;
+		optimizedNames.push_back(candidate.arrayName);
+	}
+
+	if (optimizedNames.empty() || packedCandidateBytes >= originalCandidateBytes) return false;
+	mslSource.swap(optimized);
+	std::size_t savedBytes = originalCandidateBytes - packedCandidateBytes;
+	std::ostringstream note;
+	note << "packed " << optimizedNames.size() << " threadgroup float3 array(s) (" << originalCandidateBytes
+		 << " -> " << packedCandidateBytes << " bytes for these arrays, saved " << savedBytes
+		 << "); workgroup size and all barrier locations are unchanged; device limit=" << maxThreadgroupBytes << " bytes";
+	if (packedCandidateBytes <= maxThreadgroupBytes) {
+		note << "; compacted target arrays now fit within the reported limit (other declarations remain compiler-validated)";
+	} else {
+		note << "; other threadgroup declarations may still exceed the device limit";
+	}
+	notes = note.str();
+	return true;
+}
+
 bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out) {
+	out = TranslatedProgram();
 	initGlslang();
 
 	std::string vsText = patchVersion(vertexGLSL);
@@ -1523,6 +2160,7 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 	// Preserve their original desktop-GL type for glGetActiveUniform / GL_UNIFORM_TYPE.
 	// Likewise keep the exact samplerBuffer variant for integer/unsigned buffer samplers.
 	applySourceUniformTypes(out, vertexGLSL, fragmentGLSL);
+	finalizeGlslang();
 	return true;
 }
 
@@ -1565,5 +2203,6 @@ bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &
 	const ComputeSourceBindings sourceBindings = collectComputeSourceBindings(computeGLSL);
 	if (!compileComputeStage(std::move(spirv), out, lookup, sourceBindings)) return false;
 	applySourceUniformTypes(out, computeGLSL, std::string());
+	finalizeGlslang();
 	return true;
 }

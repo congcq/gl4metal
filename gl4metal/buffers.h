@@ -10,4 +10,6 @@
 
 #import "gl4metal.h"
 
+void pruneCompletedBufferUses(void);
+
 #endif /* BUFFERS_H */

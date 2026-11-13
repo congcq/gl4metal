@@ -1,10 +1,8 @@
 #pragma once
 
-// GLSL (OpenGL 3.3 core) -> SPIR-V (glslang) -> MSL (SPIRV-Cross), done for a whole program at link time so that
-// TProgram::mapIO() can give matching locations to vertex outputs and fragment inputs.
-// Plain C++ on purpose: no Metal/ObjC types, only shadertranslator.cpp includes glslang and SPIRV-Cross.
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -12,13 +10,17 @@
 // Metal buffer argument index of the "default uniform block" (GL's loose uniforms) in both stages.
 // Vertex buffers occupy the low indices (0...15), so the uniform data lives at the top of the argument table.
 #define GL4METAL_UNIFORM_BUFFER_INDEX 30
-// Shared GL-to-Metal binding budgets used by both the plain-C++ translator and ObjC++ backend.
-#ifndef GL4METAL_MAX_TEXTURE_UNITS
-#  define GL4METAL_MAX_TEXTURE_UNITS 32
-#endif
-#ifndef GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
-#  define GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 16
-#endif
+// Iris uses GL_MAX_TEXTURE_IMAGE_UNITS as a logical dynamic-sampler allocator
+// capacity. Those logical units are virtualized to dense MSL slots at draw time.
+// Keep 96 fragment-side logical units plus 16 vertex-side logical units in the
+// combined GL namespace; actual active MSL sampler slots remain 16 per stage.
+#define GL4METAL_MAX_TEXTURE_UNITS 112
+#define GL4METAL_MAX_FRAGMENT_TEXTURE_UNIT_BINDINGS 96
+#define GL4METAL_MAX_IMAGE_UNITS 32
+#define GL4METAL_MAX_COMPUTE_TEXTURE_UNITS 16
+#define GL4METAL_MAX_FRAGMENT_TEXTURE_UNITS 16
+#define GL4METAL_MAX_VERTEX_TEXTURE_UNITS 16
+#define GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 16
 // Reserved fragment-stage buffer slot for the dynamic GL gl_FragCoord coordinate fixup.
 #define GL4METAL_FRAGCOORD_BUFFER_INDEX 15
 
@@ -40,7 +42,7 @@ struct TranslatedUniform {
 		uint32_t array_stride = 0;
 		uint32_t matrix_stride = 0;
 		bool row_major = false;
-		uint32_t slot = 0;          // samplers: [[texture(slot)]] and [[sampler(slot)]]
+		uint32_t slot = 0;          // samplers: paired [[texture(slot)]] / [[sampler(slot)]]
 	} stage[3];                     // 0 = vertex, 1 = fragment, 2 = compute
 };
 
@@ -74,9 +76,10 @@ struct TranslatedStorageBuffer {
 
 struct TranslatedImage {
 	std::string name;
-	uint32_t binding = 0; // GL image unit from layout(binding=...)
-	uint32_t slot = 0;    // MSL [[texture(slot)]]
+	uint32_t binding = 0; // first GL image unit from layout(binding=...)
+	uint32_t slot = 0;    // first MSL [[texture(slot)]]
 	uint32_t format = 0;  // GL sized image format, 0 when the GLSL format is unqualified
+	bool is_3d = false;   // image3D uses a layered GL_TEXTURE_3D / MTLTextureType3D binding
 	bool read_only = false;
 	bool write_only = false;
 };
@@ -97,3 +100,8 @@ struct TranslatedProgram {
 
 bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out);
 bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out);
+
+// Compact nested threadgroup float3 arrays to packed_float3 where the MSL
+// array is used as private workgroup storage. This preserves float precision
+// and barriers while reducing the per-element storage stride from 16 to 12 bytes.
+bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t maxThreadgroupBytes, std::string &notes, bool force = false);

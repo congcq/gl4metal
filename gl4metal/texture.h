@@ -13,4 +13,9 @@ void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer);
 void refreshTextureBufferViews(GLuint bufferObject);
 GLint maxTextureBufferTexels(void);
 
+// Internal implementation hooks used by GL_ARB_clear_texture entry points.
+void gl4metalClearTexImageImpl(GLuint texture, GLint level, GLenum format, GLenum type, const void *data);
+void gl4metalClearTexSubImageImpl(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
+	GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *data);
+
 #endif /* TEXTURE_H */

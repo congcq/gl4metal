@@ -10,8 +10,6 @@
 #import "sync.h"
 #import "texture.h"
 
-#include <mutex>
-#include <unordered_set>
 
 // MARK: - Buffer objects
 
@@ -19,14 +17,15 @@ static bool isBufferTarget(GLenum target) {
 	return target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER ||
 		target == GL_UNIFORM_BUFFER || target == GL_SHADER_STORAGE_BUFFER || target == GL_COPY_READ_BUFFER ||
 		target == GL_COPY_WRITE_BUFFER || target == GL_PIXEL_PACK_BUFFER ||
-		target == GL_PIXEL_UNPACK_BUFFER || target == GL_TEXTURE_BUFFER;
+		target == GL_PIXEL_UNPACK_BUFFER || target == GL_TEXTURE_BUFFER ||
+		target == GL_DISPATCH_INDIRECT_BUFFER;
 }
 
-// A buffer used by an encoded draw cannot be mutated in place while its command buffer
-// is pending. Track the last command buffer per GL object and rename only that object's
-// Metal storage when a CPU write overlaps in-flight GPU work.
-static std::mutex bufferUseMutex;
-static std::unordered_set<const void *> bufferCleanupRegistered;
+// GL4Metal's MTLContext is single-thread-affine just like the current OpenGL context.
+// Keep last-use tracking on the GL submission thread; never mutate MTLContext from a
+// Metal completion callback. This avoids callback/context teardown races and removes a
+// mutex from the per-draw hot path.
+static uint32_t bufferUsePruneCounter = 0;
 
 static bool commandBufferPending(id<MTLCommandBuffer> commandBuffer) {
 	if (!commandBuffer) return false;
@@ -34,29 +33,28 @@ static bool commandBufferPending(id<MTLCommandBuffer> commandBuffer) {
 	return status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError;
 }
 
+// Metal completion handlers are intentionally not used for GL state. Metal may invoke
+// them on an arbitrary queue, including during GL context teardown. Prune completed
+// command buffers lazily on the GL submission thread instead.
+void pruneCompletedBufferUses(void) {
+	for (auto it = ctx.buffer_last_use.begin(); it != ctx.buffer_last_use.end();) {
+		if (!commandBufferPending(it->second)) it = ctx.buffer_last_use.erase(it);
+		else ++it;
+	}
+}
+
 void markBuffersUsed(const GLuint *buf_ids, size_t objectCount) {
 	id<MTLCommandBuffer> activeBuffer = ctx.currentCommandBuffer;
 	if (!activeBuffer || !buf_ids || objectCount == 0) return;
-	const void *bufferToken = (__bridge const void *)activeBuffer;
-	bool installCleanup = false;
-	{
-		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		for (size_t index = 0; index < objectCount; ++index) {
-			const GLuint buf_id = buf_ids[index];
-			if (buf_id != 0) ctx.buffer_last_use[buf_id] = activeBuffer;
-		}
-		installCleanup = bufferCleanupRegistered.insert(bufferToken).second;
+	for (size_t index = 0; index < objectCount; ++index) {
+		const GLuint buf_id = buf_ids[index];
+		if (buf_id != 0) ctx.buffer_last_use[buf_id] = activeBuffer;
 	}
-	if (installCleanup) {
-		[activeBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-			const void *completedToken = (__bridge const void *)completed;
-			std::lock_guard<std::mutex> lock(bufferUseMutex);
-			for (auto it = ctx.buffer_last_use.begin(); it != ctx.buffer_last_use.end();) {
-				if (it->second == completed) it = ctx.buffer_last_use.erase(it);
-				else ++it;
-			}
-			bufferCleanupRegistered.erase(completedToken);
-		}];
+	// Prune infrequently instead of scanning the whole map on every draw. When the
+	// table becomes large, prune immediately to keep memory bounded.
+	if (++bufferUsePruneCounter >= 128 || ctx.buffer_last_use.size() > 2048) {
+		bufferUsePruneCounter = 0;
+		pruneCompletedBufferUses();
 	}
 }
 
@@ -65,7 +63,6 @@ void markBufferUsed(GLuint buf_id) {
 }
 
 static bool bufferHasPendingGPUUse(GLuint buf_id) {
-	std::lock_guard<std::mutex> lock(bufferUseMutex);
 	auto it = ctx.buffer_last_use.find(buf_id);
 	if (it == ctx.buffer_last_use.end()) return false;
 	if (commandBufferPending(it->second)) return true;
@@ -91,10 +88,7 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
 		memcpy(replacement.contents, buffer.contents, (size_t)buffer.length);
 	}
 	ctx.buffer_objects[buf_id] = replacement;
-	{
-		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		ctx.buffer_last_use.erase(buf_id);
-	}
+	ctx.buffer_last_use.erase(buf_id);
 	buffer = replacement;
 	refreshTextureBufferViews(buf_id);
 	// Rebuilding linear texture-buffer views may grow the replacement again to add
@@ -111,15 +105,12 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
 
 static void waitForBufferGPUUse(GLuint buf_id) {
 	id<MTLCommandBuffer> lastUse = nil;
-	{
-		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		auto it = ctx.buffer_last_use.find(buf_id);
-		if (it == ctx.buffer_last_use.end()) return;
-		lastUse = it->second;
-		if (!commandBufferPending(lastUse)) {
-			ctx.buffer_last_use.erase(it);
-			return;
-		}
+	auto useIt = ctx.buffer_last_use.find(buf_id);
+	if (useIt == ctx.buffer_last_use.end()) return;
+	lastUse = useIt->second;
+	if (!commandBufferPending(lastUse)) {
+		ctx.buffer_last_use.erase(useIt);
+		return;
 	}
 	// If this is the still-open command buffer, submit it before waiting. Do not flush
 	// unrelated work when the buffer was last used by an already committed command buffer.
@@ -127,18 +118,16 @@ static void waitForBufferGPUUse(GLuint buf_id) {
 		flushCommandBuffer(false);
 	}
 	[lastUse waitUntilCompleted];
-	{
-		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		auto it = ctx.buffer_last_use.find(buf_id);
-		if (it != ctx.buffer_last_use.end() && it->second == lastUse) ctx.buffer_last_use.erase(it);
-	}
+	auto it = ctx.buffer_last_use.find(buf_id);
+	if (it != ctx.buffer_last_use.end() && it->second == lastUse) ctx.buffer_last_use.erase(it);
 }
+
 
 void glGenBuffers(GLsizei n, GLuint *buffers) {
 	for (GLsizei i = 0; i < n; i++) {
 		GLuint buf_id = ++ctx.next_buffer_id; // names start at 1, 0 is "no buffer"
 		ctx.buffer_objects[buf_id] = nil;     // name exists, storage comes with glBufferData
-		ctx.buffer_sizes[buf_id] = 0;
+		gl4metalSetBufferLogicalSize(buf_id, 0);
 		buffers[i] = buf_id;
 	}
 }
@@ -185,12 +174,9 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 			}
 		}
 		invalidateConvertedVertexBuffers(buf_id);
-		{
-			std::lock_guard<std::mutex> lock(bufferUseMutex);
-			ctx.buffer_last_use.erase(buf_id);
-		}
+		ctx.buffer_last_use.erase(buf_id);
 		ctx.buffer_objects.erase(buf_id); // deleted buffer references were detached from texture-buffer objects above
-		ctx.buffer_sizes.erase(buf_id);
+		gl4metalEraseBufferLogicalSize(buf_id);
 	}
 }
 
@@ -206,7 +192,7 @@ void glBindBuffer(GLenum target, GLuint buffer) {
 	}
 	if (buffer != 0 && ctx.buffer_objects.find(buffer) == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil; // GL allows binding a name that was never generated
-		ctx.buffer_sizes[buffer] = 0;
+		gl4metalSetBufferLogicalSize(buffer, 0);
 	}
 	ctx.bound_buffers[target] = buffer;
 	if (target == GL_ELEMENT_ARRAY_BUFFER) {
@@ -230,7 +216,7 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 	}
 	if (buffer != 0 && ctx.buffer_objects.find(buffer) == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil; // names are materialized on first bind, storage is allocated separately
-		ctx.buffer_sizes[buffer] = 0;
+		gl4metalSetBufferLogicalSize(buffer, 0);
 	}
 	if (uniformTarget) {
 		UniformBufferBinding newBinding;
@@ -285,7 +271,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 	auto object = ctx.buffer_objects.find(buffer);
 	if (object == ctx.buffer_objects.end()) {
 		ctx.buffer_objects[buffer] = nil;
-		ctx.buffer_sizes[buffer] = 0;
+		gl4metalSetBufferLogicalSize(buffer, 0);
 		object = ctx.buffer_objects.find(buffer);
 	}
 	if (object == ctx.buffer_objects.end() || !object->second) {
@@ -357,12 +343,9 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		return;
 	}
 	invalidateConvertedVertexBuffers(buf_id);
-	{
-		std::lock_guard<std::mutex> lock(bufferUseMutex);
-		ctx.buffer_last_use.erase(buf_id);
-	}
+	ctx.buffer_last_use.erase(buf_id);
 	ctx.buffer_objects[buf_id] = buffer;
-	ctx.buffer_sizes[buf_id] = (NSUInteger)size;
+	gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
 	refreshTextureBufferViews(buf_id);
 }
 

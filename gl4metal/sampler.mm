@@ -1,169 +1,213 @@
 #import "sampler.h"
 
-std::recursive_mutex gl4metalSamplerObjectMutex;
+// Sampler-object state uses one mutex. Public entry points acquire it once
+// and use unlocked helpers below, avoiding nested locking in parameter queries.
+std::mutex &gl4metalSamplerObjectMutex = *new std::mutex();
 
-static SamplerObject *findSampler(GLuint sampler) {
-	auto it = ctx.sampler_objects.find(sampler);
+static SamplerObject *findSamplerUnlocked(GLuint samplerName) {
+	auto it = ctx.sampler_objects.find(samplerName);
 	return it == ctx.sampler_objects.end() ? nullptr : &it->second;
 }
 
+static bool samplerParameteriUnlocked(GLuint samplerName, GLenum pname, GLint param);
+static bool samplerParameterfUnlocked(GLuint samplerName, GLenum pname, GLfloat param);
+static bool getSamplerParameterivUnlocked(GLuint samplerName, GLenum pname, GLint *params);
+
 void glGenSamplers(GLsizei count, GLuint *samplers) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
+	if (count < 0 || (count > 0 && !samplers)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	for (GLsizei i = 0; i < count; i++) {
-		GLuint name = ++ctx.next_sampler_id;
-		ctx.sampler_objects[name] = SamplerObject();
-		samplers[i] = name;
+		GLuint samplerName = ++ctx.next_sampler_id;
+		ctx.sampler_objects[samplerName] = SamplerObject();
+		samplers[i] = samplerName;
 	}
 }
 
 void glDeleteSamplers(GLsizei count, const GLuint *samplers) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
+	if (count < 0 || (count > 0 && !samplers)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	for (GLsizei i = 0; i < count; i++) {
-		GLuint name = samplers[i];
-		if (name == 0) {
-			continue;
-		}
+		GLuint samplerName = samplers[i];
+		if (samplerName == 0) continue;
 		for (GLuint &bound : ctx.bound_samplers) {
-			if (bound == name) {
-				bound = 0;
-			}
+			if (bound == samplerName) bound = 0;
 		}
-		ctx.sampler_objects.erase(name);
+		ctx.sampler_objects.erase(samplerName);
 	}
 }
 
-GLboolean glIsSampler(GLuint sampler) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	return sampler != 0 && findSampler(sampler) != nullptr;
+GLboolean glIsSampler(GLuint samplerName) {
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	return samplerName != 0 && findSamplerUnlocked(samplerName) != nullptr;
 }
 
-void glBindSampler(GLuint unit, GLuint sampler) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	if (unit >= GL4METAL_MAX_TEXTURE_UNITS || (sampler != 0 && !findSampler(sampler))) {
+void glBindSampler(GLuint unit, GLuint samplerName) {
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	if (unit >= (GLuint)GL4METAL_MAX_TEXTURE_UNITS ||
+		(samplerName != 0 && !findSamplerUnlocked(samplerName))) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glBindSampler: invalid unit %u or sampler %u (GL_INVALID_VALUE)", unit, sampler);
+		GL4METAL_LOG("glBindSampler: invalid unit %u or sampler %u (GL_INVALID_VALUE)", unit, samplerName);
 		return;
 	}
-	ctx.bound_samplers[unit] = sampler;
+	ctx.bound_samplers[unit] = samplerName;
 }
 
-// MARK: - Sampler parameters
+// MARK: - Sampler parameters (unlocked helpers)
 
-void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	SamplerObject *so = findSampler(sampler);
-	if (!so) {
+static bool samplerParameteriUnlocked(GLuint samplerName, GLenum pname, GLint param) {
+	SamplerObject *sampler = findSamplerUnlocked(samplerName);
+	if (!sampler) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glSamplerParameteri: invalid sampler %u", sampler);
-		return;
+		GL4METAL_LOG("glSamplerParameteri: invalid sampler %u", samplerName);
+		return false;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_FILTER:   so->min_filter = (GLenum)param; break;
-		case GL_TEXTURE_MAG_FILTER:   so->mag_filter = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_S:       so->wrap_s = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_T:       so->wrap_t = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_R:       so->wrap_r = (GLenum)param; break;
-		case GL_TEXTURE_COMPARE_MODE: so->compare_mode = (GLenum)param; break;
-		case GL_TEXTURE_COMPARE_FUNC: so->compare_func = (GLenum)param; break;
+		case GL_TEXTURE_MIN_FILTER:   sampler->min_filter = (GLenum)param; return true;
+		case GL_TEXTURE_MAG_FILTER:   sampler->mag_filter = (GLenum)param; return true;
+		case GL_TEXTURE_WRAP_S:       sampler->wrap_s = (GLenum)param; return true;
+		case GL_TEXTURE_WRAP_T:       sampler->wrap_t = (GLenum)param; return true;
+		case GL_TEXTURE_WRAP_R:       sampler->wrap_r = (GLenum)param; return true;
+		case GL_TEXTURE_COMPARE_MODE: sampler->compare_mode = (GLenum)param; return true;
+		case GL_TEXTURE_COMPARE_FUNC: sampler->compare_func = (GLenum)param; return true;
 		case GL_TEXTURE_MIN_LOD:
 		case GL_TEXTURE_MAX_LOD:
 		case GL_TEXTURE_LOD_BIAS:
 		case 0x84FE: // GL_TEXTURE_MAX_ANISOTROPY_EXT
-			glSamplerParameterf(sampler, pname, (GLfloat)param);
-			break;
+			return samplerParameterfUnlocked(samplerName, pname, (GLfloat)param);
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glSamplerParameteri: unhandled pname 0x%X", pname);
-			break;
+			return false;
 	}
 }
 
-void glSamplerParameteriv(GLuint sampler, GLenum pname, const GLint *param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glSamplerParameteri(sampler, pname, param[0]); // vector-valued pnames (border colour) are not supported
-}
-
-void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	SamplerObject *so = findSampler(sampler);
-	if (!so) {
+static bool samplerParameterfUnlocked(GLuint samplerName, GLenum pname, GLfloat param) {
+	SamplerObject *sampler = findSamplerUnlocked(samplerName);
+	if (!sampler) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glSamplerParameterf: invalid sampler %u", sampler);
-		return;
+		GL4METAL_LOG("glSamplerParameterf: invalid sampler %u", samplerName);
+		return false;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_LOD:  so->min_lod = param; break;
-		case GL_TEXTURE_MAX_LOD:  so->max_lod = param; break;
-		case GL_TEXTURE_LOD_BIAS: so->lod_bias = param; break;
-		case 0x84FE:              so->max_anisotropy = std::max(param, 1.0f); break; // GL_TEXTURE_MAX_ANISOTROPY_EXT
+		case GL_TEXTURE_MIN_LOD:  sampler->min_lod = param; return true;
+		case GL_TEXTURE_MAX_LOD:  sampler->max_lod = param; return true;
+		case GL_TEXTURE_LOD_BIAS: sampler->lod_bias = param; return true;
+		case 0x84FE:              sampler->max_anisotropy = std::max(param, 1.0f); return true;
 		default:
-			glSamplerParameteri(sampler, pname, (GLint)param); // enum-valued parameters passed as float
-			break;
+			// Enum-valued parameters may legally arrive through the float overload.
+			return samplerParameteriUnlocked(samplerName, pname, (GLint)param);
 	}
 }
 
-void glSamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat *param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glSamplerParameterf(sampler, pname, param[0]);
+void glSamplerParameteri(GLuint samplerName, GLenum pname, GLint param) {
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	samplerParameteriUnlocked(samplerName, pname, param);
 }
 
-void glSamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glSamplerParameteri(sampler, pname, param[0]);
+void glSamplerParameteriv(GLuint samplerName, GLenum pname, const GLint *param) {
+	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	// Vector-valued pnames (for example border colour) are not supported.
+	samplerParameteriUnlocked(samplerName, pname, param[0]);
 }
 
-void glSamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *param) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glSamplerParameteri(sampler, pname, (GLint)param[0]);
+void glSamplerParameterf(GLuint samplerName, GLenum pname, GLfloat param) {
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	samplerParameterfUnlocked(samplerName, pname, param);
+}
+
+void glSamplerParameterfv(GLuint samplerName, GLenum pname, const GLfloat *param) {
+	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	samplerParameterfUnlocked(samplerName, pname, param[0]);
+}
+
+void glSamplerParameterIiv(GLuint samplerName, GLenum pname, const GLint *param) {
+	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	samplerParameteriUnlocked(samplerName, pname, param[0]);
+}
+
+void glSamplerParameterIuiv(GLuint samplerName, GLenum pname, const GLuint *param) {
+	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	samplerParameteriUnlocked(samplerName, pname, (GLint)param[0]);
 }
 
 // MARK: - Sampler queries
 
-void glGetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	SamplerObject *so = findSampler(sampler);
-	if (!so) {
+static bool getSamplerParameterivUnlocked(GLuint samplerName, GLenum pname, GLint *params) {
+	SamplerObject *sampler = findSamplerUnlocked(samplerName);
+	if (!sampler) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glGetSamplerParameteriv: invalid sampler %u (GL_INVALID_VALUE)", sampler);
+		GL4METAL_LOG("glGetSamplerParameteriv: invalid sampler %u (GL_INVALID_VALUE)", samplerName);
 		*params = 0;
-		return;
+		return false;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_FILTER:   *params = (GLint)so->min_filter; break;
-		case GL_TEXTURE_MAG_FILTER:   *params = (GLint)so->mag_filter; break;
-		case GL_TEXTURE_WRAP_S:       *params = (GLint)so->wrap_s; break;
-		case GL_TEXTURE_WRAP_T:       *params = (GLint)so->wrap_t; break;
-		case GL_TEXTURE_WRAP_R:       *params = (GLint)so->wrap_r; break;
-		case GL_TEXTURE_COMPARE_MODE: *params = (GLint)so->compare_mode; break;
-		case GL_TEXTURE_COMPARE_FUNC: *params = (GLint)so->compare_func; break;
-		case GL_TEXTURE_MIN_LOD:      *params = (GLint)so->min_lod; break;
-		case GL_TEXTURE_MAX_LOD:      *params = (GLint)so->max_lod; break;
-		case GL_TEXTURE_LOD_BIAS:     *params = (GLint)so->lod_bias; break;
+		case GL_TEXTURE_MIN_FILTER:   *params = (GLint)sampler->min_filter; break;
+		case GL_TEXTURE_MAG_FILTER:   *params = (GLint)sampler->mag_filter; break;
+		case GL_TEXTURE_WRAP_S:       *params = (GLint)sampler->wrap_s; break;
+		case GL_TEXTURE_WRAP_T:       *params = (GLint)sampler->wrap_t; break;
+		case GL_TEXTURE_WRAP_R:       *params = (GLint)sampler->wrap_r; break;
+		case GL_TEXTURE_COMPARE_MODE: *params = (GLint)sampler->compare_mode; break;
+		case GL_TEXTURE_COMPARE_FUNC: *params = (GLint)sampler->compare_func; break;
+		case GL_TEXTURE_MIN_LOD:      *params = (GLint)sampler->min_lod; break;
+		case GL_TEXTURE_MAX_LOD:      *params = (GLint)sampler->max_lod; break;
+		case GL_TEXTURE_LOD_BIAS:     *params = (GLint)sampler->lod_bias; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetSamplerParameteriv: unhandled pname 0x%X", pname);
 			*params = 0;
-			break;
+			return false;
+	}
+	return true;
+}
+
+void glGetSamplerParameteriv(GLuint samplerName, GLenum pname, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	getSamplerParameterivUnlocked(samplerName, pname, params);
+}
+
+void glGetSamplerParameterfv(GLuint samplerName, GLenum pname, GLfloat *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	SamplerObject *sampler = findSamplerUnlocked(samplerName);
+	if (!sampler) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		*params = 0.0f;
+		return;
+	}
+	switch (pname) {
+		case GL_TEXTURE_MIN_LOD:  *params = sampler->min_lod; return;
+		case GL_TEXTURE_MAX_LOD:  *params = sampler->max_lod; return;
+		case GL_TEXTURE_LOD_BIAS: *params = sampler->lod_bias; return;
+		default: {
+			GLint value = 0;
+			if (getSamplerParameterivUnlocked(samplerName, pname, &value)) *params = (GLfloat)value;
+			else *params = 0.0f;
+			return;
+		}
 	}
 }
 
-void glGetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	SamplerObject *so = findSampler(sampler);
-	if (so && pname == GL_TEXTURE_MIN_LOD)  { *params = so->min_lod; return; }
-	if (so && pname == GL_TEXTURE_MAX_LOD)  { *params = so->max_lod; return; }
-	if (so && pname == GL_TEXTURE_LOD_BIAS) { *params = so->lod_bias; return; }
+void glGetSamplerParameterIiv(GLuint samplerName, GLenum pname, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
+	getSamplerParameterivUnlocked(samplerName, pname, params);
+}
+
+void glGetSamplerParameterIuiv(GLuint samplerName, GLenum pname, GLuint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	GLint value = 0;
-	glGetSamplerParameteriv(sampler, pname, &value);
-	*params = (GLfloat)value;
-}
-
-void glGetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glGetSamplerParameteriv(sampler, pname, params);
-}
-
-void glGetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params) {
-	std::lock_guard<std::recursive_mutex> lock(gl4metalSamplerObjectMutex);
-	glGetSamplerParameteriv(sampler, pname, (GLint *)params);
+	if (getSamplerParameterivUnlocked(samplerName, pname, &value)) *params = (GLuint)value;
+	else *params = 0;
 }

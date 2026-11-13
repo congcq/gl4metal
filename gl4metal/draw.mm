@@ -9,12 +9,12 @@
 // These caches are process-wide / context-wide and may be reached by more than one
 // JVM thread. std::unordered_map and std::unordered_set do not support concurrent
 // mutation, even when the keys differ.
-static std::mutex convertedVertexBufferCacheMutex;
-static std::mutex samplerCacheMutex;
-static std::mutex pipelineCacheMutex;
-static std::mutex feedbackLoopSetMutex;
-static std::mutex fallbackTextureMutex;
-static std::mutex fallbackSamplerMutex;
+static std::mutex *convertedVertexBufferCacheMutex = new std::mutex();
+static std::mutex *samplerCacheMutex = new std::mutex();
+static std::mutex *pipelineCacheMutex = new std::mutex();
+static std::mutex *feedbackLoopSetMutex = new std::mutex();
+static std::mutex *fallbackTextureMutex = new std::mutex();
+static std::mutex *fallbackSamplerMutex = new std::mutex();
 
 // Large default uniform blocks use one shared upload arena per in-flight command
 // buffer instead of allocating a new MTLBuffer for every draw. Each slice is aligned
@@ -26,10 +26,10 @@ struct DrawUniformUploadArena {
 };
 
 static DrawUniformUploadArena drawUniformUploadArena;
-static std::mutex drawUniformUploadArenaMutex;
+static std::mutex *drawUniformUploadArenaMutex = new std::mutex();
 
 void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
-	std::lock_guard<std::mutex> lock(drawUniformUploadArenaMutex);
+	std::lock_guard<std::mutex> lock(*drawUniformUploadArenaMutex);
 	if (!commandBuffer || drawUniformUploadArena.commandBuffer == commandBuffer) {
 		drawUniformUploadArena.commandBuffer = nil;
 		drawUniformUploadArena.buffer = nil;
@@ -37,22 +37,19 @@ void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
 	}
 }
 
-bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
-	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
-	if (!source || length == 0 || !ctx.device || !ctx.currentCommandBuffer ||
-		length > ctx.device.maxBufferLength) return false;
-
-	constexpr NSUInteger alignment = 256;
-	std::lock_guard<std::mutex> lock(drawUniformUploadArenaMutex);
+static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment,
+	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset, void **destinationContents) {
+	if (length == 0 || !ctx.device || !ctx.currentCommandBuffer || length > ctx.device.maxBufferLength) return false;
+	if (alignment == 0) alignment = 1;
+	std::lock_guard<std::mutex> lock(*drawUniformUploadArenaMutex);
 	id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
 	if (drawUniformUploadArena.commandBuffer != commandBuffer) {
 		drawUniformUploadArena.commandBuffer = commandBuffer;
 		drawUniformUploadArena.buffer = nil;
 		drawUniformUploadArena.used = 0;
 	}
-
 	if (drawUniformUploadArena.used > std::numeric_limits<NSUInteger>::max() - (alignment - 1)) return false;
-	NSUInteger offset = (drawUniformUploadArena.used + (alignment - 1)) & ~(alignment - 1);
+	NSUInteger offset = ((drawUniformUploadArena.used + alignment - 1) / alignment) * alignment;
 	if (offset > ctx.device.maxBufferLength || length > ctx.device.maxBufferLength - offset) return false;
 	NSUInteger requiredEnd = offset + length;
 	if (!drawUniformUploadArena.buffer || requiredEnd > drawUniformUploadArena.buffer.length) {
@@ -61,21 +58,29 @@ bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
 			capacity = std::max(capacity, drawUniformUploadArena.buffer.length * 2);
 		}
 		capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
-		if (capacity < requiredEnd) return false;
+		if (capacity < length) return false;
 		id<MTLBuffer> expanded = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
 		if (!expanded) return false;
-		// Earlier encoder bindings retain the previous arena buffer until their command
-		// buffer completes; new allocations can safely continue in the replacement.
+		// Encoders already reference the old arena buffer; command-buffer retention
+		// keeps it alive while subsequent allocations continue in the replacement.
 		drawUniformUploadArena.buffer = expanded;
 		drawUniformUploadArena.used = 0;
 		offset = 0;
 		requiredEnd = length;
 	}
-
 	destinationBuffer = drawUniformUploadArena.buffer;
 	destinationOffset = offset;
-	memcpy((uint8_t *)destinationBuffer.contents + destinationOffset, source, (size_t)length);
+	if (destinationContents) *destinationContents = (uint8_t *)destinationBuffer.contents + destinationOffset;
 	drawUniformUploadArena.used = requiredEnd;
+	return destinationBuffer.contents != nullptr;
+}
+
+bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
+	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
+	if (!source || length == 0) return false;
+	void *destination = nullptr;
+	if (!allocateDrawTransientBuffer(length, 256, destinationBuffer, destinationOffset, &destination)) return false;
+	memcpy(destination, source, (size_t)length);
 	return true;
 }
 
@@ -267,7 +272,7 @@ static uint32_t loadExtendedIntegerComponent(const uint8_t *src, GLenum type) {
 static std::unordered_map<GLuint, std::unordered_map<std::string, id<MTLBuffer>>> convertedVertexBufferCache;
 
 void invalidateConvertedVertexBuffers(GLuint buffer) {
-	std::lock_guard<std::mutex> lock(convertedVertexBufferCacheMutex);
+	std::lock_guard<std::mutex> lock(*convertedVertexBufferCacheMutex);
 	convertedVertexBufferCache.erase(buffer);
 }
 
@@ -290,7 +295,7 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 	cacheKey.append((const char *)&va.stride, sizeof(va.stride));
 	cacheKey.append((const char *)&sourceOffset, sizeof(sourceOffset));
 	cacheKey.append((const char *)&sourceLength, sizeof(sourceLength));
-	std::lock_guard<std::mutex> lock(convertedVertexBufferCacheMutex);
+	std::lock_guard<std::mutex> lock(*convertedVertexBufferCacheMutex);
 	auto &perBuffer = convertedVertexBufferCache[bufferId];
 	auto cached = perBuffer.find(cacheKey);
 	if (cached != perBuffer.end() && cached->second) {
@@ -349,7 +354,7 @@ static void putBytes(std::string &key, const void *data, size_t size) {
 static bool textureIsAttachedToDrawFramebuffer(GLuint textureName,
 	GLenum *attachmentOut = nullptr, GLint *levelOut = nullptr, GLint *drawBufferOut = nullptr) {
 	if (textureName == 0 || ctx.draw_fbo == 0) return false;
-	auto fbo = ctx.fbo_objects.find(ctx.draw_fbo);
+	auto fbo = GL4METAL_FBO_FIND(ctx.draw_fbo);
 	if (fbo == ctx.fbo_objects.end()) return false;
 	const FBO &attachments = fbo->second;
 
@@ -558,7 +563,7 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 		const uint64_t key = ((uint64_t)ctx.draw_fbo << 32) | request.textureName;
 		bool firstReport = false;
 		{
-			std::lock_guard<std::mutex> lock(feedbackLoopSetMutex);
+			std::lock_guard<std::mutex> lock(*feedbackLoopSetMutex);
 			firstReport = reportedFeedbackLoops.insert(key).second;
 		}
 		if (firstReport) {
@@ -571,25 +576,25 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 	return true;
 }
 
-static std::mutex vertexSamplerTraceMutex;
+static std::mutex *vertexSamplerTraceMutex = new std::mutex();
 static std::unordered_set<std::string> reportedVertexSamplerBindings;
-static std::mutex fragmentSamplerTraceMutex;
+static std::mutex *fragmentSamplerTraceMutex = new std::mutex();
 static std::unordered_set<std::string> reportedFragmentSamplerBindings;
-static std::mutex vertexFetchTraceMutex;
+static std::mutex *vertexFetchTraceMutex = new std::mutex();
 static std::unordered_set<std::string> reportedVertexFetchBindings;
 
 static bool firstVertexSamplerTrace(const std::string &key) {
-	std::lock_guard<std::mutex> lock(vertexSamplerTraceMutex);
+	std::lock_guard<std::mutex> lock(*vertexSamplerTraceMutex);
 	return reportedVertexSamplerBindings.insert(key).second;
 }
 
 static bool firstFragmentSamplerTrace(const std::string &key) {
-	std::lock_guard<std::mutex> lock(fragmentSamplerTraceMutex);
+	std::lock_guard<std::mutex> lock(*fragmentSamplerTraceMutex);
 	return reportedFragmentSamplerBindings.insert(key).second;
 }
 
 static bool firstVertexFetchTrace(const std::string &key) {
-	std::lock_guard<std::mutex> lock(vertexFetchTraceMutex);
+	std::lock_guard<std::mutex> lock(*vertexFetchTraceMutex);
 	return reportedVertexFetchBindings.insert(key).second;
 }
 
@@ -600,7 +605,7 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	GLfloat minLod = t.min_lod, maxLod = t.max_lod, anisotropy = t.max_anisotropy;
 	GLenum compareMode = t.compare_mode, compareFunc = t.compare_func;
 	{
-		std::lock_guard<std::recursive_mutex> objectLock(gl4metalSamplerObjectMutex);
+		std::lock_guard<std::mutex> objectLock(gl4metalSamplerObjectMutex);
 		const GLuint samplerName = ctx.bound_samplers[textureUnit];
 		if (samplerName != 0) {
 			auto found = ctx.sampler_objects.find(samplerName);
@@ -613,7 +618,6 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 			}
 		}
 	}
-	std::lock_guard<std::mutex> cacheLock(samplerCacheMutex);
 	// Reuse thread-local key storage; samplerFor is called for every active sampler on every draw.
 	static thread_local std::string samplerKeyScratch;
 	std::string &key = samplerKeyScratch;
@@ -633,9 +637,10 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	putBytes(key, &compareMode, sizeof(compareMode));
 	putBytes(key, &compareFunc, sizeof(compareFunc));
 
-	auto it = ctx.sampler_cache.find(key);
-	if (it != ctx.sampler_cache.end()) {
-		return it->second;
+	{
+		std::lock_guard<std::mutex> cacheLock(*samplerCacheMutex);
+		auto it = ctx.sampler_cache.find(key);
+		if (it != ctx.sampler_cache.end()) return it->second;
 	}
 
 	bool mipmapped = minFilter == GL_NEAREST_MIPMAP_NEAREST || minFilter == GL_LINEAR_MIPMAP_NEAREST ||
@@ -665,8 +670,11 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 			minFilter, magFilter, wrapS, wrapT, wrapR);
 		return nil;
 	}
-	ctx.sampler_cache.emplace(key, sampler);
-	return sampler;
+	{
+		std::lock_guard<std::mutex> cacheLock(*samplerCacheMutex);
+		auto inserted = ctx.sampler_cache.emplace(key, sampler);
+		return inserted.first->second;
+	}
 }
 
 // What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1).
@@ -694,7 +702,7 @@ static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
 static id<MTLTexture> fallbackTexture(const TranslatedUniform &uniform) {
 	const TranslatedUniform::Dim dim = uniform.dim;
 	if (!ctx.device) return nil;
-	std::lock_guard<std::mutex> lock(fallbackTextureMutex);
+	std::lock_guard<std::mutex> lock(*fallbackTextureMutex);
 	if (dim == TranslatedUniform::DimBuffer) {
 		static id<MTLTexture> bufferFallbacks[3] = { nil, nil, nil }; // float, signed int, unsigned int
 		const NSUInteger formatIndex = uniform.sampler_gl_type == 0x8DD0u ? 1 :
@@ -745,7 +753,7 @@ static id<MTLTexture> fallbackTexture(const TranslatedUniform &uniform) {
 
 static id<MTLSamplerState> fallbackSampler() {
 	if (!ctx.device) return nil;
-	std::lock_guard<std::mutex> lock(fallbackSamplerMutex);
+	std::lock_guard<std::mutex> lock(*fallbackSamplerMutex);
 	static id<MTLSamplerState> sampler = nil;
 	if (!sampler) {
 		MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
@@ -808,7 +816,8 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	key.clear();
 	if (key.capacity() < 1024) key.reserve(1024);
 	auto put = [&key](uint64_t v) { putBytes(key, &v, sizeof(v)); };
-	put(programId);
+	put(p.vertex_stage_cache_id);
+	put(p.fragment_stage_cache_id);
 	put(flip ? 1 : 0);
 	for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
 		put((uint64_t)ctx.pass_color_format[i]);
@@ -840,7 +849,7 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	}
 
 	{
-		std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
+		std::lock_guard<std::mutex> cacheLock(*pipelineCacheMutex);
 		auto cached = ctx.pipeline_cache.find(key);
 		if (cached != ctx.pipeline_cache.end()) {
 			return cached->second; // may be nil: a combination that already failed was reported once
@@ -915,9 +924,14 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	// cache mutex so unrelated variants can compile concurrently on worker threads.
 	// A racing thread may have populated the same key; use that canonical entry.
 	{
-		std::lock_guard<std::mutex> cacheLock(pipelineCacheMutex);
+		std::lock_guard<std::mutex> cacheLock(*pipelineCacheMutex);
 		auto inserted = ctx.pipeline_cache.emplace(key, pipeline);
 		if (!inserted.second) return inserted.first->second;
+		if (ctx.pipeline_cache.size() > 512) {
+			auto victim = ctx.pipeline_cache.begin();
+			if (victim == inserted.first) ++victim;
+			if (victim != ctx.pipeline_cache.end()) ctx.pipeline_cache.erase(victim);
+		}
 	}
 	return pipeline;
 }
@@ -1274,8 +1288,8 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 	}
 
-	// Record all GL buffers consumed by this draw in one locked batch. CPU updates can
-	// rename only in-flight storage without taking a mutex once per vertex attribute/UBO.
+	// Record all GL buffers consumed by this draw in one GL-thread batch. CPU updates can
+	// rename only in-flight storage without a mutex or per-attribute map operation.
 	auto markActiveDrawBuffers = [&](GLuint elementBuffer) {
 		std::array<GLuint, 48> names{}; // 16 vertex streams + 28 combined-stage UBOs + one EBO
 		size_t count = 0;
@@ -1401,15 +1415,18 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 	}
 
-	// Textures: ordinary samplers bind their GL image; active attachment aliases bind
-	// the just-copied snapshot prepared above, never a too-small generic fallback.
+	// Textures: direct Metal bindings are the fastest compatible path here. The
+	// GL combined unit index selects the source texture; the MSL slot stays dense
+	// and stage-local (0...15), independent of the GL unit number.
 	for (const ProgramUniform &u : p.uniforms) {
 		if (u.info.kind != TranslatedUniform::Sampler) {
 			continue;
 		}
 		if (u.info.array_size <= 0 || (size_t)u.info.array_size > u.units.size() ||
-			(u.info.stage[0].present && (u.info.stage[0].slot >= 16 || (uint64_t)u.info.stage[0].slot + (uint64_t)u.info.array_size > 16)) ||
-			(u.info.stage[1].present && (u.info.stage[1].slot >= 16 || (uint64_t)u.info.stage[1].slot + (uint64_t)u.info.array_size > 16))) {
+			(u.info.stage[0].present && (u.info.stage[0].slot >= GL4METAL_MAX_VERTEX_TEXTURE_UNITS ||
+			 (uint64_t)u.info.stage[0].slot + (uint64_t)u.info.array_size > GL4METAL_MAX_VERTEX_TEXTURE_UNITS)) ||
+			(u.info.stage[1].present && (u.info.stage[1].slot >= GL4METAL_MAX_FRAGMENT_TEXTURE_UNITS ||
+			 (uint64_t)u.info.stage[1].slot + (uint64_t)u.info.array_size > GL4METAL_MAX_FRAGMENT_TEXTURE_UNITS))) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("%s: sampler '%s' has invalid MSL texture/sampler slot range (VS=%u FS=%u count=%d); draw skipped",
 				caller, u.info.name.c_str(), u.info.stage[0].slot, u.info.stage[1].slot, u.info.array_size);

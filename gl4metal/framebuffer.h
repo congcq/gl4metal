@@ -20,4 +20,9 @@ void applyViewportAndScissor(void);
 void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil);
 void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba);
 
+// Internal hooks used by GL_ARB_invalidate_subdata entry points.
+void gl4metalInvalidateFramebufferImpl(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+void gl4metalInvalidateSubFramebufferImpl(GLenum target, GLsizei numAttachments, const GLenum *attachments,
+	GLint x, GLint y, GLsizei width, GLsizei height);
+
 #endif /* FRAMEBUFFER_H */

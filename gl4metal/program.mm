@@ -4,6 +4,9 @@
 #import "sync.h"
 
 #include <mutex>
+#include <atomic>
+#include <cstdlib>
+#include <sstream>
 
 // MARK: - Helpers
 
@@ -29,21 +32,58 @@ static bool dumpEnabled() {
 	return dump && dump[0] == '1';
 }
 
+// Metal reports static threadgroup-memory overflow only when it creates the
+// compute pipeline. Include the generated declarations on this failure path so
+// the exact GLSL shared variables can be identified without dumping every shader.
+static std::string threadgroupDeclarationsForLog(const std::string &mslSource) {
+	std::istringstream input(mslSource);
+	std::string line;
+	std::string declarations;
+	while (std::getline(input, line)) {
+		if (line.find("threadgroup ") != std::string::npos) {
+			declarations += "    ";
+			declarations += line;
+			declarations += '\n';
+		}
+	}
+	return declarations;
+}
+
 // Compute pipelines are expensive to compile and independent of GL object names.
-// Cache by the complete generated MSL source so shader-pack reloads can reuse them.
+// Keep both successes and failures: Iris may link the same failing compute program
+// more than once during one shader-pack reload. The cache is intentionally process-
+// lifetime so late JVM/Metal teardown cannot lock a destroyed static mutex.
+struct ComputePipelineCacheEntry {
+	__strong id<MTLComputePipelineState> pipeline = nil;
+	std::string error;
+};
+
+struct ComputePipelineCache {
+	std::mutex mutex;
+	std::unordered_map<std::string, ComputePipelineCacheEntry> entries;
+};
+
+static ComputePipelineCache &computePipelineCache() {
+	static ComputePipelineCache *cache = new ComputePipelineCache();
+	return *cache;
+}
+
 static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslSource, std::string &errorText) {
 	if (!ctx.device) {
 		errorText = "Metal device is not initialized";
 		return nil;
 	}
-	static std::mutex cacheMutex;
-	static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
+	ComputePipelineCache &cache = computePipelineCache();
 	{
-		std::lock_guard<std::mutex> lock(cacheMutex);
-		auto cached = cache.find(mslSource);
-		if (cached != cache.end()) return cached->second;
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto cached = cache.entries.find(mslSource);
+		if (cached != cache.entries.end()) {
+			errorText = cached->second.error;
+			return cached->second.pipeline;
+		}
 	}
 
+	ComputePipelineCacheEntry compiled;
 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 	options.languageVersion = MTLLanguageVersion2_2;
 	NSError *libraryError = nil;
@@ -51,30 +91,168 @@ static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslS
 	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
 	id<MTLFunction> computeFunction = [library newFunctionWithName:@"main0"];
 	if (!computeFunction) {
-		errorText = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal library compilation failed") : "no main0 compute entry point";
-		return nil;
-	}
-	NSError *pipelineError = nil;
-	id<MTLComputePipelineState> pipeline = [ctx.device newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
-	if (!pipeline) {
-		errorText = pipelineError ? (pipelineError.localizedDescription.UTF8String ?: "Metal compute pipeline creation failed") : "unknown Metal compute pipeline error";
-		return nil;
-	}
-	{
-		std::lock_guard<std::mutex> lock(cacheMutex);
-		auto inserted = cache.emplace(mslSource, pipeline);
-		if (!inserted.second) return inserted.first->second;
-		if (cache.size() > 64) {
-			auto victim = cache.begin();
-			if (victim == inserted.first) ++victim;
-			if (victim != cache.end()) cache.erase(victim);
+		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal library compilation failed") :
+			(source ? "no main0 compute entry point" : "compute MSL is not valid UTF-8");
+	} else {
+		NSError *pipelineError = nil;
+		compiled.pipeline = [ctx.device newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
+		if (!compiled.pipeline) {
+			compiled.error = pipelineError ? (pipelineError.localizedDescription.UTF8String ?: "Metal compute pipeline creation failed") :
+				"unknown Metal compute pipeline error";
 		}
 	}
-	return pipeline;
+
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto inserted = cache.entries.emplace(mslSource, compiled);
+		if (!inserted.second) compiled = inserted.first->second;
+		if (cache.entries.size() > 64) {
+			auto victim = cache.entries.begin();
+			if (victim == inserted.first) ++victim;
+			if (victim != cache.entries.end()) cache.entries.erase(victim);
+		}
+	}
+	errorText = compiled.error;
+	return compiled.pipeline;
 }
 
-// Active-uniform type mapping for GL reflection. The runtime uniform-location table
-// remains limited to default-block uniforms; named-block members are introspection-only.
+struct VertexStageCacheEntry {
+	__strong id<MTLFunction> normalFunction = nil;
+	__strong id<MTLFunction> flippedFunction = nil;
+	uint64_t cacheId = 0;
+	std::string error;
+};
+
+struct VertexStageCache {
+	std::mutex mutex;
+	std::unordered_map<std::string, VertexStageCacheEntry> entries;
+	uint64_t nextCacheId = 1;
+};
+
+static VertexStageCache &vertexStageCache() {
+	static VertexStageCache *cache = new VertexStageCache();
+	return *cache;
+}
+
+static bool vertexStageFunctionsForMSL(const std::string &mslSource, VertexStageCacheEntry &outEntry) {
+	VertexStageCache &cache = vertexStageCache();
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto cached = cache.entries.find(mslSource);
+		if (cached != cache.entries.end()) {
+			outEntry = cached->second;
+			return outEntry.normalFunction && outEntry.flippedFunction;
+		}
+	}
+
+	VertexStageCacheEntry compiled;
+	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+	options.languageVersion = MTLLanguageVersion2_2;
+	NSError *libraryError = nil;
+	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	if (!library) {
+		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal vertex library compilation failed") :
+			(source ? "no Metal vertex library" : "vertex MSL is not valid UTF-8");
+	} else {
+		MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+		bool flipY = false;
+		[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
+		NSError *normalError = nil;
+		compiled.normalFunction = [library newFunctionWithName:@"main0" constantValues:constants error:&normalError];
+		flipY = true;
+		[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
+		NSError *flippedError = nil;
+		compiled.flippedFunction = [library newFunctionWithName:@"main0" constantValues:constants error:&flippedError];
+		if (!compiled.normalFunction || !compiled.flippedFunction) {
+			NSString *details = normalError ? normalError.localizedDescription :
+				(flippedError ? flippedError.localizedDescription : @"Metal did not create both specialized vertex functions");
+			compiled.error = details.UTF8String ?: "vertex function specialization failed";
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto existing = cache.entries.find(mslSource);
+		if (existing != cache.entries.end()) {
+			compiled = existing->second;
+		} else {
+			compiled.cacheId = cache.nextCacheId++;
+			if (compiled.cacheId == 0) compiled.cacheId = cache.nextCacheId++;
+			cache.entries.emplace(mslSource, compiled);
+			if (cache.entries.size() > 96) {
+				auto victim = cache.entries.begin();
+				if (victim->first == mslSource) ++victim;
+				if (victim != cache.entries.end()) cache.entries.erase(victim);
+			}
+		}
+	}
+	outEntry = compiled;
+	return outEntry.normalFunction && outEntry.flippedFunction;
+}
+
+struct FragmentStageCacheEntry {
+	__strong id<MTLFunction> function = nil;
+	uint64_t cacheId = 0;
+	std::string error;
+};
+
+struct FragmentStageCache {
+	std::mutex mutex;
+	std::unordered_map<std::string, FragmentStageCacheEntry> entries;
+	uint64_t nextCacheId = 1;
+};
+
+static FragmentStageCache &fragmentStageCache() {
+	static FragmentStageCache *cache = new FragmentStageCache();
+	return *cache;
+}
+
+static bool fragmentStageFunctionForMSL(const std::string &mslSource, FragmentStageCacheEntry &outEntry) {
+	FragmentStageCache &cache = fragmentStageCache();
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto cached = cache.entries.find(mslSource);
+		if (cached != cache.entries.end()) {
+			outEntry = cached->second;
+			return outEntry.function != nil;
+		}
+	}
+
+	FragmentStageCacheEntry compiled;
+	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
+	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+	options.languageVersion = MTLLanguageVersion2_2;
+	NSError *libraryError = nil;
+	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	compiled.function = [library newFunctionWithName:@"main0"];
+	if (!compiled.function) {
+		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal fragment library compilation failed") :
+			(library ? "no main0 fragment entry point" : (source ? "no Metal fragment library" : "fragment MSL is not valid UTF-8"));
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(cache.mutex);
+		auto existing = cache.entries.find(mslSource);
+		if (existing != cache.entries.end()) {
+			compiled = existing->second;
+		} else {
+			compiled.cacheId = cache.nextCacheId++;
+			if (compiled.cacheId == 0) compiled.cacheId = cache.nextCacheId++;
+			cache.entries.emplace(mslSource, compiled);
+			if (cache.entries.size() > 96) {
+				auto victim = cache.entries.begin();
+				if (victim->first == mslSource) ++victim;
+				if (victim != cache.entries.end()) cache.entries.erase(victim);
+			}
+		}
+	}
+	outEntry = compiled;
+	return outEntry.function != nil;
+}
+
+// Active-uniform type mapping for ordinary uniforms and samplers. Opaque image
+// uniforms use the exact GL_IMAGE_* type carried by ProgramUniform::opaque_gl_type.
 static GLenum activeUniformGLType(const TranslatedUniform &u) {
 	if (u.kind == TranslatedUniform::Sampler) {
 		if (u.sampler_gl_type != 0) return (GLenum)u.sampler_gl_type;
@@ -124,15 +302,55 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 		GL4METAL_LOG("glLinkProgram(%u): compute translation failed:\n%s", programName, translated.log.c_str());
 		return false;
 	}
+	std::string pipelineError;
+	const NSUInteger deviceLimit = ctx.device ? ctx.device.maxThreadgroupMemoryLength : 0;
+	std::string compactionNotes;
+	std::string compactedMSL = translated.msl[2];
+	const bool precompacted = compactMetalThreadgroupFloat3Arrays(
+		compactedMSL, (std::size_t)deviceLimit, compactionNotes, false);
+	if (precompacted) {
+		translated.msl[2].swap(compactedMSL);
+		translated.log += "threadgroup storage optimization: " + compactionNotes + "\n";
+	}
+	id<MTLComputePipelineState> computePipeline = computePipelineForMSL(translated.msl[2], pipelineError);
+	if (!computePipeline && !precompacted &&
+		(pipelineError.find("Threadgroup memory size") != std::string::npos ||
+		 pipelineError.find("threadgroup memory") != std::string::npos)) {
+		// Metal's error is authoritative for aggregate storage: retry once with all
+		// eligible nested float3 arrays packed, even if each array alone is below the
+		// device limit but other threadgroup declarations contribute to the total.
+		compactedMSL = translated.msl[2];
+		compactionNotes.clear();
+		if (compactMetalThreadgroupFloat3Arrays(compactedMSL, (std::size_t)deviceLimit, compactionNotes, true)) {
+			translated.msl[2].swap(compactedMSL);
+			translated.log += "threadgroup storage fallback optimization: " + compactionNotes + "\n";
+			std::string compactPipelineError;
+			computePipeline = computePipelineForMSL(translated.msl[2], compactPipelineError);
+			if (!computePipeline) pipelineError += "\npacked threadgroup representation also failed:\n" + compactPipelineError;
+			else pipelineError.clear();
+		}
+	}
 	if (dumpEnabled()) {
 		if (!translated.log.empty()) GL4METAL_LOG("compute program %u translation notes:\n%s", programName, translated.log.c_str());
 		GL4METAL_LOG("---- MSL compute, program %u ----\n%s\n---- end MSL ----", programName, translated.msl[2].c_str());
 	}
 
-	std::string pipelineError;
-	id<MTLComputePipelineState> computePipeline = computePipelineForMSL(translated.msl[2], pipelineError);
 	if (!computePipeline) {
 		program.info_log = "compute Metal pipeline compilation failed:\n" + pipelineError + "\n";
+		if (pipelineError.find("Threadgroup memory size") != std::string::npos ||
+			pipelineError.find("threadgroup memory") != std::string::npos) {
+			const NSUInteger deviceLimit = ctx.device ? ctx.device.maxThreadgroupMemoryLength : 0;
+			program.info_log += "device static/dynamic threadgroup-memory limit: " +
+				std::to_string((unsigned long long)deviceLimit) + " bytes\n";
+			program.info_log += "GL4Metal attempted a semantics-preserving packed_float3 representation for eligible threadgroup arrays; workgroup size and barrier positions were not changed. Other shared-memory layouts are not rewritten automatically.\n";
+			const std::string declarations = threadgroupDeclarationsForLog(translated.msl[2]);
+			if (!declarations.empty()) {
+				program.info_log += "generated MSL threadgroup declarations:\n" + declarations;
+			}
+		}
+		if (dumpEnabled()) {
+			program.info_log += "generated MSL compute source:\n" + translated.msl[2] + "\n";
+		}
 		GL4METAL_LOG("glLinkProgram(%u): %s", programName, program.info_log.c_str());
 		return false;
 	}
@@ -143,7 +361,12 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 	program.compute_workgroup_size[2] = translated.workgroup_size[2];
 	program.storage_buffers = translated.storage_buffers;
 	program.storage_images = translated.storage_images;
-	program.uniforms.reserve(translated.uniforms.size());
+	program.image_units.clear();
+	program.image_units.reserve(program.storage_images.size());
+	for (const TranslatedImage &imageInfo : program.storage_images) {
+		program.image_units.push_back((GLint)imageInfo.binding);
+	}
+	program.uniforms.reserve(translated.uniforms.size() + translated.storage_images.size());
 	GLint nextLocation = 0;
 	for (const TranslatedUniform &uniformInfo : translated.uniforms) {
 		ProgramUniform uniform;
@@ -156,6 +379,54 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 		nextLocation += uniformInfo.array_size;
 		program.uniforms.push_back(std::move(uniform));
 	}
+
+	// Storage images are opaque OpenGL uniforms too. They were previously kept only in
+	// storage_images for MSL binding, so Iris could not discover them through
+	// GL_ACTIVE_UNIFORMS / glGetUniformLocation and consequently never called
+	// glBindImageTexture. Build one location-bearing ProgramUniform per image resource;
+	// flattened array elements share one uniform and consecutive locations.
+	for (size_t imageIndex = 0; imageIndex < program.storage_images.size();) {
+		const TranslatedImage &firstImage = program.storage_images[imageIndex];
+		std::string imageBaseName = firstImage.name;
+		uint32_t arrayCount = 1;
+		const size_t bracket = imageBaseName.rfind('[');
+		if (bracket != std::string::npos && !imageBaseName.empty() && imageBaseName.back() == ']') {
+			const std::string indexText = imageBaseName.substr(bracket + 1, imageBaseName.size() - bracket - 2);
+			char *endPtr = nullptr;
+			const unsigned long parsedIndex = std::strtoul(indexText.c_str(), &endPtr, 10);
+			if (endPtr && *endPtr == '\0' && parsedIndex == 0) {
+				const std::string candidateBase = imageBaseName.substr(0, bracket);
+				uint32_t candidateCount = 0;
+				while (imageIndex + candidateCount < program.storage_images.size()) {
+					const std::string expectedName = candidateBase + "[" + std::to_string(candidateCount) + "]";
+					if (program.storage_images[imageIndex + candidateCount].name != expectedName) break;
+					++candidateCount;
+				}
+				if (candidateCount != 0) {
+					imageBaseName = candidateBase;
+					arrayCount = candidateCount;
+				}
+			}
+		}
+
+		ProgramUniform imageUniform;
+		imageUniform.info.name = imageBaseName;
+		imageUniform.info.kind = TranslatedUniform::Int; // GL image-unit values are set/read as GLint
+		imageUniform.info.vecsize = 1;
+		imageUniform.info.columns = 1;
+		imageUniform.info.array_size = (int)arrayCount;
+		imageUniform.base_location = nextLocation;
+		imageUniform.is_image = true;
+		imageUniform.opaque_gl_type = firstImage.is_3d ? 0x904Eu : 0x904Du; // GL_IMAGE_3D / GL_IMAGE_2D
+		imageUniform.image_index = (uint32_t)imageIndex;
+		for (uint32_t element = 0; element < arrayCount; ++element) {
+			program.locations.emplace_back((GLint)program.uniforms.size(), (GLint)element);
+		}
+		nextLocation += (GLint)arrayCount;
+		program.uniforms.push_back(std::move(imageUniform));
+		imageIndex += arrayCount;
+	}
+
 	program.uniform_data[2].assign(translated.block_size[2], 0);
 	for (const TranslatedBlock &blockInfo : translated.blocks) {
 		ProgramBlock block;
@@ -166,14 +437,16 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 	for (const ProgramUniform &uniform : program.uniforms) {
 		ActiveUniformInfo active;
 		active.name = activeUniformName(uniform.info);
-		active.type = activeUniformGLType(uniform.info);
+		active.type = uniform.is_image ? uniform.opaque_gl_type : activeUniformGLType(uniform.info);
 		active.size = uniform.info.array_size;
 		active.block_index = -1;
-		const TranslatedUniform::Stage &stage = uniform.info.stage[2];
-		active.offset = (GLint)stage.offset;
-		active.array_stride = (GLint)stage.array_stride;
-		active.matrix_stride = (GLint)stage.matrix_stride;
-		active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+		if (!uniform.is_image) {
+			const TranslatedUniform::Stage &stage = uniform.info.stage[2];
+			active.offset = (GLint)stage.offset;
+			active.array_stride = (GLint)stage.array_stride;
+			active.matrix_stride = (GLint)stage.matrix_stride;
+			active.row_major = stage.row_major ? GL_TRUE : GL_FALSE;
+		}
 		program.active_uniforms.push_back(std::move(active));
 	}
 	for (size_t blockIndex = 0; blockIndex < program.blocks.size(); ++blockIndex) {
@@ -270,71 +543,40 @@ static void addUniqueBufferName(std::vector<GLuint> &bufferNames, GLuint buffer_
 
 // MARK: - Compute entry points
 
-void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer,
-	GLenum access, GLenum format) {
-	if (unit >= GL4METAL_MAX_TEXTURE_UNITS) {
-		gl4metalSetError(GL_INVALID_VALUE);
-		return;
-	}
-	if (access != GL_READ_ONLY && access != GL_WRITE_ONLY && access != GL_READ_WRITE) {
-		gl4metalSetError(GL_INVALID_ENUM);
-		return;
-	}
-	if (texture == 0) {
-		ctx.image_unit_bindings[unit] = ImageUnitBinding();
-		return;
-	}
-	if (level != 0 || layered != GL_FALSE || layer != 0) {
-		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glBindImageTexture: only non-layered 2D level 0 images are supported on iOS");
-		return;
-	}
-	auto textureFound = ctx.texture_objects.find(texture);
-	if (textureFound == ctx.texture_objects.end() || textureFound->second.target != GL_TEXTURE_2D ||
-		!textureFound->second.texture || textureFound->second.width <= 0 || textureFound->second.height <= 0) {
-		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glBindImageTexture: texture %u is not an allocated GL_TEXTURE_2D", texture);
-		return;
-	}
-	if (format != textureFound->second.internalformat) {
-		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glBindImageTexture: image format 0x%X does not match texture %u internal format 0x%X",
-			format, texture, textureFound->second.internalformat);
-		return;
-	}
-	ImageUnitBinding binding;
-	binding.texture = texture;
-	binding.level = level;
-	binding.layered = layered;
-	binding.layer = layer;
-	binding.access = access;
-	binding.format = format;
-	ctx.image_unit_bindings[unit] = binding;
-}
 
-void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
+void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z,
+	id<MTLBuffer> indirectBuffer, NSUInteger indirectOffset, GLuint indirectBufferName) {
+	const bool indirect = indirectBuffer != nil;
+	const NSUInteger maxWorkGroupInvocations = gl4metalMaxComputeWorkGroupInvocations();
+	if (maxWorkGroupInvocations == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glDispatchCompute: compute shaders are unavailable on the current Metal device");
+		return;
+	}
 	ProgramObject *program = findProgram(ctx.current_program);
 	if (!program || !program->linked || !program->is_compute || !program->compute_pipeline) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glDispatchCompute: current program is not a linked compute program");
 		return;
 	}
-	if (num_groups_x > 65535 || num_groups_y > 65535 || num_groups_z > 65535) {
-		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glDispatchCompute: workgroup count exceeds the iOS limit of 65535 per dimension");
-		return;
+	if (!indirect) {
+		if (num_groups_x > 65535 || num_groups_y > 65535 || num_groups_z > 65535) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			GL4METAL_LOG("glDispatchCompute: workgroup count exceeds the iOS limit of 65535 per dimension");
+			return;
+		}
+		if (num_groups_x == 0 || num_groups_y == 0 || num_groups_z == 0) return;
 	}
-	if (num_groups_x == 0 || num_groups_y == 0 || num_groups_z == 0) return;
 
 	const uint64_t localThreadCount = (uint64_t)program->compute_workgroup_size[0] *
 		(uint64_t)program->compute_workgroup_size[1] * (uint64_t)program->compute_workgroup_size[2];
-	if (localThreadCount == 0 || localThreadCount > GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS ||
+	if (localThreadCount == 0 || localThreadCount > maxWorkGroupInvocations ||
 		localThreadCount > program->compute_pipeline.maxTotalThreadsPerThreadgroup) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glDispatchCompute: local workgroup size (%u,%u,%u) exceeds GL4Metal/iOS limit (%lu)",
 			program->compute_workgroup_size[0], program->compute_workgroup_size[1],
 			program->compute_workgroup_size[2], (unsigned long)std::min<NSUInteger>(
-				program->compute_pipeline.maxTotalThreadsPerThreadgroup, GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS));
+				program->compute_pipeline.maxTotalThreadsPerThreadgroup, maxWorkGroupInvocations));
 		return;
 	}
 
@@ -363,7 +605,8 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
 	uniformBufferBindings.reserve(program->blocks.size());
 	sampledTextureBindings.reserve(program->uniforms.size());
 	imageTextureBindings.reserve(program->storage_images.size());
-	usedBufferNames.reserve(program->storage_buffers.size() + program->blocks.size() + program->uniforms.size());
+	usedBufferNames.reserve(program->storage_buffers.size() + program->blocks.size() + program->uniforms.size() + (indirect ? 1u : 0u));
+	if (indirect) addUniqueBufferName(usedBufferNames, indirectBufferName);
 
 	// Resolve every buffer and check its logical GL range before creating an encoder.
 	for (const TranslatedStorageBuffer &storageInfo : program->storage_buffers) {
@@ -470,22 +713,48 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
 	}
 
 	// Image binding points are GL image units; Metal texture slots are remapped
-	// independently by the translator after all sampled textures.
-	for (const TranslatedImage &imageInfo : program->storage_images) {
-		if (imageInfo.binding >= GL4METAL_MAX_TEXTURE_UNITS || imageInfo.slot >= 32) {
+	// independently by the translator after all sampled textures. image3D maps to
+	// a layered MTLTextureType3D; image2D remains a non-layered MTLTextureType2D.
+	for (size_t imageIndex = 0; imageIndex < program->storage_images.size(); ++imageIndex) {
+		const TranslatedImage &imageInfo = program->storage_images[imageIndex];
+		const GLint imageUnit = imageIndex < program->image_units.size()
+			? program->image_units[imageIndex] : -1;
+		if (imageUnit < 0 || imageUnit >= GL4METAL_MAX_IMAGE_UNITS || imageInfo.slot >= 32) {
 			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: image '%s' has invalid image unit %d or Metal slot %u",
+				imageInfo.name.c_str(), imageUnit, imageInfo.slot);
 			return;
 		}
-		const ImageUnitBinding &binding = ctx.image_unit_bindings[imageInfo.binding];
+		const ImageUnitBinding &binding = ctx.image_unit_bindings[(GLuint)imageUnit];
 		auto textureObject = ctx.texture_objects.find(binding.texture);
-		if (binding.texture == 0 || textureObject == ctx.texture_objects.end() ||
-			textureObject->second.target != GL_TEXTURE_2D || !textureObject->second.texture ||
-			textureObject->second.texture.textureType != MTLTextureType2D || binding.level != 0 ||
-			binding.layered != GL_FALSE || binding.layer != 0 || binding.format != textureObject->second.internalformat ||
-			(imageInfo.format != 0 && binding.format != imageInfo.format)) {
+		const GLenum expectedTarget = imageInfo.is_3d ? GL_TEXTURE_3D : GL_TEXTURE_2D;
+		const MTLTextureType expectedType = imageInfo.is_3d ? MTLTextureType3D : MTLTextureType2D;
+		const bool invalidLayerMode = imageInfo.is_3d
+			? binding.layered != GL_TRUE
+			: binding.layer != 0;
+		// GL ignores the layered flag for a plain GL_TEXTURE_2D image binding;
+		// its only valid layer index is zero. image3D requires a layered binding.
+		const bool invalidTextureBinding = binding.texture == 0 || textureObject == ctx.texture_objects.end() ||
+			textureObject->second.target != expectedTarget || !textureObject->second.texture ||
+			textureObject->second.texture.textureType != expectedType || binding.level != 0 ||
+			invalidLayerMode || binding.format != (textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.internalformat) ||
+			(imageInfo.format != 0 && binding.format != imageInfo.format);
+		if (invalidTextureBinding) {
 			gl4metalSetError(GL_INVALID_OPERATION);
-			GL4METAL_LOG("glDispatchCompute: storage image '%s' has no compatible image2D binding on unit %u",
-				imageInfo.name.c_str(), imageInfo.binding);
+			static std::atomic<uint64_t> imageBindingFailureCount{0};
+			const uint64_t failureNumber = imageBindingFailureCount.fetch_add(1, std::memory_order_relaxed);
+			if (failureNumber < 8 || (failureNumber & (failureNumber - 1)) == 0) {
+				const GLenum actualTarget = textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.target;
+				const MTLTextureType actualType = (textureObject == ctx.texture_objects.end() || !textureObject->second.texture)
+					? MTLTextureType2D : textureObject->second.texture.textureType;
+				const GLenum actualFormat = textureObject == ctx.texture_objects.end() ? 0 : textureObject->second.internalformat;
+				GL4METAL_LOG("glDispatchCompute: ctx=%p image '%s' binding mismatch unit=%u texture=%u target=0x%X type=%u level=%d layered=%u layer=%d access=0x%X format=0x%X storage=0x%X expected=%s; occurrence=%llu",
+					(void *)&ctx, imageInfo.name.c_str(), (GLuint)imageUnit, binding.texture, actualTarget,
+					(unsigned)actualType, binding.level, (unsigned)binding.layered,
+					binding.layer, binding.access, binding.format, actualFormat,
+					imageInfo.is_3d ? "layered GL_TEXTURE_3D" : "GL_TEXTURE_2D",
+					(unsigned long long)(failureNumber + 1));
+			}
 			return;
 		}
 		if ((imageInfo.read_only && binding.access == GL_WRITE_ONLY) ||
@@ -507,13 +776,10 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
 		imageTextureBindings.push_back(resolved);
 	}
 
-	// Close render work before compute work. Encoders remain asynchronous in the same
-	// command buffer, allowing Metal's hazard tracking to order dependent resources.
-	endRenderEncoder();
-	if (ctx.currentComputeEncoder) {
-		[ctx.currentComputeEncoder endEncoding];
-		ctx.currentComputeEncoder = nil;
-	}
+	// Close a render pass before compute work. If the previous GL command was
+	// another compute dispatch, keep its encoder open: Metal permits changing the
+	// pipeline and rebinding resources between dispatches in the same encoder.
+	if (ctx.currentEncoder) endRenderEncoder();
 	if (!ctx.currentCommandBuffer && ctx.commandQueue) {
 		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
 	}
@@ -521,13 +787,16 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		return;
 	}
-	id<MTLComputeCommandEncoder> computeEncoder = [ctx.currentCommandBuffer computeCommandEncoder];
+	id<MTLComputeCommandEncoder> computeEncoder = ctx.currentComputeEncoder;
 	if (!computeEncoder) {
-		gl4metalSetError(GL_OUT_OF_MEMORY);
-		GL4METAL_LOG("glDispatchCompute: Metal could not create a compute command encoder");
-		return;
+		computeEncoder = [ctx.currentCommandBuffer computeCommandEncoder];
+		if (!computeEncoder) {
+			gl4metalSetError(GL_OUT_OF_MEMORY);
+			GL4METAL_LOG("glDispatchCompute: Metal could not create a compute command encoder");
+			return;
+		}
+		ctx.currentComputeEncoder = computeEncoder;
 	}
-	ctx.currentComputeEncoder = computeEncoder;
 	[computeEncoder setComputePipelineState:program->compute_pipeline];
 	for (const ComputeBufferBinding &binding : storageBufferBindings) {
 		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
@@ -559,23 +828,19 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
 		[computeEncoder setTexture:binding.texture atIndex:binding.slot];
 	}
 	if (!usedBufferNames.empty()) markBuffersUsed(usedBufferNames.data(), usedBufferNames.size());
-	[computeEncoder dispatchThreadgroups:MTLSizeMake(num_groups_x, num_groups_y, num_groups_z)
-		threadsPerThreadgroup:MTLSizeMake(program->compute_workgroup_size[0],
-			program->compute_workgroup_size[1], program->compute_workgroup_size[2])];
-	[computeEncoder endEncoding];
-	ctx.currentComputeEncoder = nil;
+	const MTLSize threadsPerGroup = MTLSizeMake(program->compute_workgroup_size[0],
+		program->compute_workgroup_size[1], program->compute_workgroup_size[2]);
+	if (indirect) {
+		[computeEncoder dispatchThreadgroupsWithIndirectBuffer:indirectBuffer
+			indirectBufferOffset:indirectOffset threadsPerThreadgroup:threadsPerGroup];
+	} else {
+		[computeEncoder dispatchThreadgroups:MTLSizeMake(num_groups_x, num_groups_y, num_groups_z)
+			threadsPerThreadgroup:threadsPerGroup];
+	}
+	// Leave the encoder active for the next dispatch. It is ended by a memory
+	// barrier, a graphics/transfer transition, or command-buffer submission.
 }
 
-void glMemoryBarrier(GLbitfield barriers) {
-	(void)barriers; // Metal's tracked-resource hazards cover the implemented image/SSBO/texture accesses.
-	if (ctx.currentComputeEncoder) {
-		[ctx.currentComputeEncoder endEncoding];
-		ctx.currentComputeEncoder = nil;
-	}
-	endRenderEncoder();
-	// Deliberately do not commit or wait: command-buffer ordering provides the
-	// dependency while keeping the frame pipeline asynchronous.
-}
 
 // MARK: - Program objects
 
@@ -662,11 +927,14 @@ void glLinkProgram(GLuint program) {
 	p.vertex_function = nil;
 	p.fragment_function = nil;
 	p.vertex_function_flipped = nil;
+	p.vertex_stage_cache_id = 0;
+	p.fragment_stage_cache_id = 0;
 	p.compute_pipeline = nil;
 	p.compute_workgroup_size[0] = p.compute_workgroup_size[1] = p.compute_workgroup_size[2] = 1;
 	p.is_compute = false;
 	p.storage_buffers.clear();
 	p.storage_images.clear();
+	p.image_units.clear();
 	p.attribs.clear();
 	p.uniforms.clear();
 	p.active_uniforms.clear();
@@ -732,56 +1000,21 @@ void glLinkProgram(GLuint program) {
 					 program, tp.msl[0].c_str(), program, tp.msl[1].c_str());
 	}
 
-	// MSL -> MTLFunction. Compile one vertex library and specialize its static Y-flip
-	// function constant into two functions. The old path compiled the same vertex
-	// shader twice as separate Metal libraries for default-FB and texture-FB draws.
-	auto makeCompileOptions = []() -> MTLCompileOptions * {
-		MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-		options.languageVersion = MTLLanguageVersion2_2; // matches set_msl_version(2, 2) in the translator
-		// Leave Metal's default fast-math mode enabled, as in the previous compilation path.
-		return options;
-	};
-
-	id<MTLLibrary> vertexLibrary = nil;
-	id<MTLFunction> vertexFunction = nil;
-	id<MTLFunction> flippedFunction = nil;
-	{
-		MTLCompileOptions *options = makeCompileOptions();
-		NSError *libraryError = nil;
-		NSString *source = [NSString stringWithUTF8String:tp.msl[0].c_str()];
-		vertexLibrary = [ctx.device newLibraryWithSource:source options:options error:&libraryError];
-		if (vertexLibrary) {
-			MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-			bool flipY = false;
-			[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
-			NSError *normalError = nil;
-			vertexFunction = [vertexLibrary newFunctionWithName:@"main0" constantValues:constants error:&normalError];
-			flipY = true;
-			[constants setConstantValue:&flipY type:MTLDataTypeBool atIndex:0];
-			NSError *flippedError = nil;
-			flippedFunction = [vertexLibrary newFunctionWithName:@"main0" constantValues:constants error:&flippedError];
-			if (!vertexFunction || !flippedFunction) {
-				NSString *details = normalError ? normalError.localizedDescription :
-					(flippedError ? flippedError.localizedDescription : @"Metal did not create both specialized vertex functions");
-				p.info_log += std::string("vertex stage function specialization failed:\n") + details.UTF8String + "\n";
-			}
-		} else {
-			p.info_log += std::string("vertex stage failed to compile as Metal:\n") +
-				(libraryError ? libraryError.localizedDescription.UTF8String : "no Metal library") + "\n";
-		}
+	// MSL -> MTLFunction. Cache stage functions by exact generated source so
+	// identical Minecraft/Iris stages shared by multiple GL program objects are
+	// compiled only once. Function-constant Y-flip variants share one Metal library.
+	VertexStageCacheEntry vertexEntry;
+	FragmentStageCacheEntry fragmentEntry;
+	const bool vertexReady = vertexStageFunctionsForMSL(tp.msl[0], vertexEntry);
+	const bool fragmentReady = fragmentStageFunctionForMSL(tp.msl[1], fragmentEntry);
+	id<MTLFunction> vertexFunction = vertexEntry.normalFunction;
+	id<MTLFunction> flippedFunction = vertexEntry.flippedFunction;
+	id<MTLFunction> fragmentFunction = fragmentEntry.function;
+	if (!vertexReady) {
+		p.info_log += "vertex stage failed to compile/specialize as Metal:\n" + vertexEntry.error + "\n";
 	}
-
-	id<MTLFunction> fragmentFunction = nil;
-	{
-		MTLCompileOptions *options = makeCompileOptions();
-		NSError *error = nil;
-		NSString *source = [NSString stringWithUTF8String:tp.msl[1].c_str()];
-		id<MTLLibrary> library = [ctx.device newLibraryWithSource:source options:options error:&error];
-		fragmentFunction = [library newFunctionWithName:@"main0"]; // SPIRV-Cross renames main() to main0()
-		if (!fragmentFunction) {
-			p.info_log += std::string("fragment stage failed to compile as Metal:\n") +
-				(error ? error.localizedDescription.UTF8String : "no main0 entry point") + "\n";
-		}
+	if (!fragmentReady) {
+		p.info_log += "fragment stage failed to compile as Metal:\n" + fragmentEntry.error + "\n";
 	}
 	if (!vertexFunction || !fragmentFunction || !flippedFunction) {
 		GL4METAL_LOG("glLinkProgram(%u): %s", program, p.info_log.c_str());
@@ -883,6 +1116,8 @@ void glLinkProgram(GLuint program) {
 	p.vertex_function = vertexFunction;
 	p.fragment_function = fragmentFunction;
 	p.vertex_function_flipped = flippedFunction;
+	p.vertex_stage_cache_id = vertexEntry.cacheId;
+	p.fragment_stage_cache_id = fragmentEntry.cacheId;
 	p.uses_gl_frag_coord = tp.uses_gl_frag_coord;
 	p.linked = GL_TRUE;
 

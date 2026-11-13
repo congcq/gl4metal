@@ -1,5 +1,7 @@
 #import "uniform.h"
 
+#include <atomic>
+
 // MARK: - Helpers
 // glUniform* writes into the CPU copy of the current program's default uniform block (std140 layout taken from the
 // SPIR-V reflection). The copy is uploaded when a draw is issued: setVertexBytes/setFragmentBytes at
@@ -73,6 +75,25 @@ static void writeVector(GLint location, GLsizei count, int comps, SrcKind kind, 
 	if (u->info.kind == TranslatedUniform::Sampler) { // glUniform1i(sampler, textureUnit)
 		for (GLsizei i = 0; i < count && element + i < u->info.array_size; i++) {
 			u->units[(size_t)(element + i)] = (GLint)srcValue(kind, data, (size_t)i);
+		}
+		return;
+	}
+	if (u->is_image) {
+		if (comps != 1 || kind != SrcInt) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: image uniforms require glUniform1i/glUniform1iv", caller);
+			return;
+		}
+		for (GLsizei i = 0; i < count && element + i < u->info.array_size; ++i) {
+			const size_t imageUnitIndex = (size_t)u->image_index + (size_t)(element + i);
+			const GLint imageUnit = (GLint)srcValue(kind, data, (size_t)i);
+			if (imageUnit < 0 || imageUnit >= GL4METAL_MAX_IMAGE_UNITS || imageUnitIndex >= p->image_units.size()) {
+				gl4metalSetError(GL_INVALID_VALUE);
+				GL4METAL_LOG("%s: image uniform '%s' references invalid image unit %d (limit=%d)",
+					caller, u->info.name.c_str(), imageUnit, GL4METAL_MAX_IMAGE_UNITS);
+				return;
+			}
+			p->image_units[imageUnitIndex] = imageUnit;
 		}
 		return;
 	}
@@ -194,6 +215,11 @@ static void readUniform(GLuint program, GLint location, int count, double *out) 
 	ProgramObject &p = it->second;
 	const ProgramUniform &u = p.uniforms[(size_t)p.locations[(size_t)location].first];
 	GLint element = p.locations[(size_t)location].second;
+	if (u.is_image) {
+		const size_t imageUnitIndex = (size_t)u.image_index + (size_t)element;
+		if (imageUnitIndex < p.image_units.size()) out[0] = p.image_units[imageUnitIndex];
+		return;
+	}
 	if (u.info.kind == TranslatedUniform::Sampler) {
 		out[0] = u.units[(size_t)element];
 		return;
@@ -227,8 +253,9 @@ static int componentsAt(GLuint program, GLint location) {
 	if (it == ctx.program_objects.end() || location < 0 || (size_t)location >= it->second.locations.size()) {
 		return 0;
 	}
-	const TranslatedUniform &u = it->second.uniforms[(size_t)it->second.locations[(size_t)location].first].info;
-	return u.kind == TranslatedUniform::Sampler ? 1 : u.vecsize * u.columns;
+	const ProgramUniform &programUniform = it->second.uniforms[(size_t)it->second.locations[(size_t)location].first];
+	const TranslatedUniform &u = programUniform.info;
+	return (programUniform.is_image || u.kind == TranslatedUniform::Sampler) ? 1 : u.vecsize * u.columns;
 }
 
 // MARK: - Uniform locations and queries
@@ -241,14 +268,15 @@ GLint glGetUniformLocation(GLuint program, const GLchar *name) {
 	// "name" and "name[0]" address the first element, "name[n]" element n.
 	std::string base(name);
 	GLint element = 0;
-	size_t bracket = base.find('[');
+	const size_t bracket = base.find('[');
 	if (bracket != std::string::npos) {
 		element = atoi(base.c_str() + bracket + 1);
 		base.resize(bracket);
 	}
-	for (const ProgramUniform &u : it->second.uniforms) {
-		if (u.info.name == base) {
-			return element >= 0 && element < u.info.array_size ? u.base_location + element : -1;
+	for (const ProgramUniform &uniform : it->second.uniforms) {
+		if (uniform.info.name == base) {
+			const GLint result = element >= 0 && element < uniform.info.array_size ? uniform.base_location + element : -1;
+			return result;
 		}
 	}
 	return -1; // inactive (not referenced by the shaders)

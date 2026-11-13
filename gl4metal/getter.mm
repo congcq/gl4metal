@@ -138,7 +138,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 3;
 			break;
 		case GL_NUM_EXTENSIONS:
-			*data = 1; // GL_ARB_draw_buffers_blend
+			*data = gl4metalSupportsComputeShaders() ? 5 : 3;
 			break;
 		case GL_CONTEXT_FLAGS:
 			*data = GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT;
@@ -151,12 +151,19 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = GL4METAL_MAX_COLOR_ATTACHMENTS;
 			break;
 		case GL_MAX_TEXTURE_IMAGE_UNITS:
+			// Iris uses this query as its logical sampler-unit allocator capacity. GL4Metal
+			// virtualizes GL texture units independently from dense MSL argument slots;
+			// draw/link validation still enforces the actual 16 active fragment samplers.
+			*data = GL4METAL_MAX_FRAGMENT_TEXTURE_UNIT_BINDINGS;
+			break;
 		case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
+			*data = GL4METAL_MAX_VERTEX_TEXTURE_UNITS;
+			break;
 		case GL_MAX_VERTEX_ATTRIBS:
 			*data = 16;
 			break;
 		case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
-			*data = 32;
+			*data = GL4METAL_MAX_TEXTURE_UNITS;
 			break;
 		case GL_MAX_TEXTURE_SIZE:
 		case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
@@ -164,7 +171,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = maxMetalTextureDimension2D(ctx.device);
 			break;
 		case GL_MAX_3D_TEXTURE_SIZE:
-			*data = 0; // GL_TEXTURE_3D storage/upload is not implemented yet.
+			*data = GL4METAL_MAX_3D_TEXTURE_SIZE; // Metal feature tables specify 2048 for 3D textures.
 			break;
 		case GL_MAX_ARRAY_TEXTURE_LAYERS:
 			*data = 0; // GL_TEXTURE_2D_ARRAY storage/upload is not implemented yet.
@@ -205,39 +212,65 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 4096;
 			break;
 		case GL_MAX_IMAGE_UNITS:
-			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
+			break;
+		case GL_MAX_VERTEX_IMAGE_UNIFORMS:
+		case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
+		case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
+		case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
+		case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
+			*data = 0; // image load/store is currently implemented for compute only
+			break;
+		case GL_MAX_COMBINED_IMAGE_UNIFORMS:
+			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
+			break;
+		case GL_MAX_IMAGE_SAMPLES:
+			*data = 0; // multisample storage images are not implemented
 			break;
 		case GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS:
-			*data = GL4METAL_MAX_TEXTURE_UNITS + GL4METAL_MAX_COLOR_ATTACHMENTS;
+			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_COLOR_ATTACHMENTS : 0;
 			break;
 		case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
-			*data = ctx.device ? (GLint)std::min<NSUInteger>(ctx.device.maxThreadgroupMemoryLength, (NSUInteger)std::numeric_limits<GLint>::max()) : 16384;
+			*data = gl4metalSupportsComputeShaders()
+				? (GLint)std::min<NSUInteger>(ctx.device.maxThreadgroupMemoryLength, (NSUInteger)std::numeric_limits<GLint>::max())
+				: 0;
 			break;
 		case GL_MAX_COMPUTE_UNIFORM_COMPONENTS:
-			*data = 1024;
+			*data = gl4metalSupportsComputeShaders() ? 1024 : 0;
+			break;
+		case GL_MAX_COMPUTE_ATOMIC_COUNTERS:
+		case GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS:
+			// Atomic-counter resources are not exposed by the current MSL translator.
+			*data = 0;
 			break;
 		case GL_MAX_COMBINED_COMPUTE_UNIFORM_COMPONENTS:
-			*data = 4096;
+			*data = gl4metalSupportsComputeShaders() ? 4096 : 0;
 			break;
 		case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS:
-			*data = GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS; // conservative cross-device iOS cap
+			*data = (GLint)gl4metalMaxComputeWorkGroupInvocations();
 			break;
 		case GL_MAX_COMPUTE_UNIFORM_BLOCKS:
-			*data = 14;
+			*data = gl4metalSupportsComputeShaders() ? 14 : 0;
 			break;
 		case GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS:
-			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_COMPUTE_TEXTURE_UNITS : 0;
 			break;
 		case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
-			*data = GL4METAL_MAX_TEXTURE_UNITS;
+			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
 			break;
 		case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS:
 		case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS:
 		case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS:
-			*data = GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+			// GL_ARB_shader_storage_buffer_object and its buffer-storage companion
+			// APIs are not advertised by this build yet. Do not claim SSBO capacity.
+			*data = 0;
 			break;
 		case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT:
 			*data = 4;
+			break;
+		case GL_MAX_SHADER_STORAGE_BLOCK_SIZE:
+			*data = ctx.device ? (GLint)std::min<NSUInteger>(ctx.device.maxBufferLength,
+				(NSUInteger)std::numeric_limits<GLint>::max()) : 0;
 			break;
 		case GL_MAX_VARYING_COMPONENTS:
 			*data = 60;
@@ -312,6 +345,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_SHADER_STORAGE_BUFFER_BINDING:
 			*data = (GLint)boundBuffer(GL_SHADER_STORAGE_BUFFER);
 			break;
+		case GL_DISPATCH_INDIRECT_BUFFER_BINDING:
+			*data = (GLint)boundBuffer(GL_DISPATCH_INDIRECT_BUFFER);
+			break;
 		case GL_PIXEL_UNPACK_BUFFER_BINDING:
 			*data = (GLint)boundBuffer(GL_PIXEL_UNPACK_BUFFER);
 			break;
@@ -329,6 +365,11 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			break;
 		case GL_TEXTURE_BINDING_2D: {
 			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_2D);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
+		case GL_TEXTURE_BINDING_3D: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_3D);
 			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
 			break;
 		}
@@ -350,10 +391,15 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_UNPACK_ROW_LENGTH:  *data = ctx.unpack_row_length; break;
 		case GL_UNPACK_SKIP_PIXELS: *data = ctx.unpack_skip_pixels; break;
 		case GL_UNPACK_SKIP_ROWS:   *data = ctx.unpack_skip_rows; break;
+		case GL_UNPACK_IMAGE_HEIGHT: *data = ctx.unpack_image_height; break;
+		case GL_UNPACK_SKIP_IMAGES: *data = ctx.unpack_skip_images; break;
+		case GL_UNPACK_SWAP_BYTES: *data = ctx.unpack_swap_bytes; break;
 		case GL_PACK_ALIGNMENT:    *data = ctx.pack_alignment; break;
 		case GL_PACK_ROW_LENGTH:   *data = ctx.pack_row_length; break;
 		case GL_PACK_SKIP_PIXELS:  *data = ctx.pack_skip_pixels; break;
 		case GL_PACK_SKIP_ROWS:    *data = ctx.pack_skip_rows; break;
+		case GL_PACK_IMAGE_HEIGHT: *data = ctx.pack_image_height; break;
+		case GL_PACK_SKIP_IMAGES:  *data = ctx.pack_skip_images; break;
 		case GL_PACK_SWAP_BYTES:   *data = ctx.pack_swap_bytes; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
@@ -389,6 +435,11 @@ void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
 			data[component] = ctx.color_masks[index][component];
 		return;
 	}
+	if (target == GL_IMAGE_BINDING_LAYERED) {
+		if (index >= GL4METAL_MAX_IMAGE_UNITS) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		data[0] = ctx.image_unit_bindings[index].layered;
+		return;
+	}
 	gl4metalSetError(GL_INVALID_ENUM);
 	GL4METAL_LOG("glGetBooleani_v: unhandled target 0x%X", target);
 }
@@ -411,8 +462,12 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 	}
 	const bool uniformBindingQuery = target == GL_UNIFORM_BUFFER_BINDING || target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE;
 	const bool storageBindingQuery = target == GL_SHADER_STORAGE_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_START || target == GL_SHADER_STORAGE_BUFFER_SIZE;
+	const bool imageBindingQuery = target == GL_IMAGE_BINDING_NAME || target == GL_IMAGE_BINDING_LEVEL ||
+		target == GL_IMAGE_BINDING_LAYERED || target == GL_IMAGE_BINDING_LAYER ||
+		target == GL_IMAGE_BINDING_ACCESS || target == GL_IMAGE_BINDING_FORMAT;
 	if ((uniformBindingQuery && index >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) ||
 		(storageBindingQuery && index >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) ||
+		(imageBindingQuery && index >= GL4METAL_MAX_IMAGE_UNITS) ||
 		((target == GL_MAX_COMPUTE_WORK_GROUP_COUNT || target == GL_MAX_COMPUTE_WORK_GROUP_SIZE) && index >= 3)) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glGetIntegeri_v: index %u is out of range (GL_INVALID_VALUE)", index);
@@ -444,11 +499,22 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 			}
 			break;
 		}
-		case GL_MAX_COMPUTE_WORK_GROUP_COUNT: *data = 65535; break;
+		case GL_IMAGE_BINDING_NAME:   *data = (GLint)ctx.image_unit_bindings[index].texture; break;
+		case GL_IMAGE_BINDING_LEVEL:  *data = ctx.image_unit_bindings[index].level; break;
+		case GL_IMAGE_BINDING_LAYERED:*data = ctx.image_unit_bindings[index].layered; break;
+		case GL_IMAGE_BINDING_LAYER:  *data = ctx.image_unit_bindings[index].layer; break;
+		case GL_IMAGE_BINDING_ACCESS: *data = (GLint)ctx.image_unit_bindings[index].access; break;
+		case GL_IMAGE_BINDING_FORMAT: *data = (GLint)ctx.image_unit_bindings[index].format; break;
+		case GL_MAX_COMPUTE_WORK_GROUP_COUNT:
+			*data = gl4metalSupportsComputeShaders() ? 65535 : 0;
+			break;
 		case GL_MAX_COMPUTE_WORK_GROUP_SIZE: {
-			const MTLSize limits = ctx.device ? ctx.device.maxThreadsPerThreadgroup : MTLSizeMake(512, 512, 64);
+			if (!gl4metalSupportsComputeShaders()) { *data = 0; break; }
+			const MTLSize limits = ctx.device.maxThreadsPerThreadgroup;
 			const NSUInteger values[3] = { limits.width, limits.height, limits.depth };
-			*data = (GLint)std::min<NSUInteger>(values[index], (NSUInteger)std::numeric_limits<GLint>::max());
+			const NSUInteger glMinimumCaps[3] = { 1024, 1024, 64 };
+			*data = (GLint)std::min<NSUInteger>(std::min(values[index], glMinimumCaps[index]),
+				(NSUInteger)std::numeric_limits<GLint>::max());
 			break;
 		}
 		default:
@@ -466,7 +532,7 @@ void glGetInteger64i_v(GLenum target, GLuint index, GLint64 *data) {
 
 static NSUInteger currentDrawFramebufferSampleCount() {
 	if (ctx.draw_fbo == 0) return 1;
-	auto fbo = ctx.fbo_objects.find(ctx.draw_fbo);
+	auto fbo = GL4METAL_FBO_FIND(ctx.draw_fbo);
 	if (fbo == ctx.fbo_objects.end()) return 1;
 	auto sampleCountForAttachment = [](const FBOAttachment &attachment) -> NSUInteger {
 		if (attachment.renderbuffer != 0) {
@@ -668,7 +734,9 @@ const GLubyte *glGetString(GLenum name) {
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:
-			return (const GLubyte *)"GL_ARB_draw_buffers_blend";
+			return (const GLubyte *)(gl4metalSupportsComputeShaders()
+				? "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata GL_ARB_compute_shader GL_ARB_shader_image_load_store"
+				: "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata");
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetString: missing 0x%X", name);
@@ -682,9 +750,18 @@ const GLubyte *glGetStringi(GLenum name, GLuint index) {
 		GL4METAL_LOG("glGetStringi: unhandled 0x%X", name);
 		return NULL;
 	}
-	if (index != 0) {
-		gl4metalSetError(GL_INVALID_VALUE);
-		return NULL;
-	}
-	return (const GLubyte *)"GL_ARB_draw_buffers_blend";
+	static const char *const baseExtensions[] = {
+		"GL_ARB_draw_buffers_blend",
+		"GL_ARB_clear_texture",
+		"GL_ARB_invalidate_subdata"
+	};
+	static const char *const computeExtensions[] = {
+		"GL_ARB_compute_shader",
+		"GL_ARB_shader_image_load_store"
+	};
+	if (index < 3) return (const GLubyte *)baseExtensions[index];
+	if (gl4metalSupportsComputeShaders() && index < 5)
+		return (const GLubyte *)computeExtensions[index - 3];
+	gl4metalSetError(GL_INVALID_VALUE);
+	return NULL;
 }

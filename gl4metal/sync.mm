@@ -2,8 +2,6 @@
 #import "draw.h"
 
 #include <unistd.h>
-#include <mutex>
-#include <unordered_set>
 
 // A fence completes when the command buffer that holds the commands recorded before it has completed.
 struct SyncObject {
@@ -22,41 +20,36 @@ static bool isSignaled(const SyncObject *s) {
 	return status < MTLCommandBufferStatusCommitted && s->buffer != ctx.currentCommandBuffer;
 }
 
-// Report asynchronous GPU faults in the application log instead of losing the last submitted frame silently.
-void installCommandBufferErrorHandler(id<MTLCommandBuffer> commandBuffer) {
-	if (!commandBuffer) return;
-	[commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-		if (completed.status == MTLCommandBufferStatusError) {
-			NSError *error = completed.error;
-			static std::mutex errorMutex;
-			static std::unordered_set<NSInteger> reportedErrorCodes;
-			bool firstForCode = false;
-			{
-				std::lock_guard<std::mutex> lock(errorMutex);
-				firstForCode = reportedErrorCodes.insert(error.code).second;
-			}
-			if (firstForCode) {
-				GL4METAL_LOG("Metal command buffer failed (status=%ld, error=%ld): %s; label is only the last encoded draw hint, not a guaranteed fault location: '%s'",
-					(long)completed.status, (long)error.code,
-					error.localizedDescription.UTF8String ?: "unknown Metal GPU error",
-					completed.label.UTF8String ?: "(unlabelled)");
-				if (error.userInfo.count > 0) {
-					GL4METAL_LOG("Metal command buffer error details: %s", error.userInfo.description.UTF8String ?: "(none)");
-				}
-			}
-		}
-	}];
+// Metal completion handlers can run on arbitrary driver queues, including while the
+// app is tearing down its GL context. Poll the last submitted command buffer from the
+// GL thread instead; this keeps all GL4Metal state and diagnostics single-thread-affine.
+static __strong id<MTLCommandBuffer> lastReportedCommandBufferError = nil;
+
+void reportCommandBufferErrorIfNeeded(id<MTLCommandBuffer> commandBuffer) {
+	if (!commandBuffer || commandBuffer.status != MTLCommandBufferStatusError ||
+		lastReportedCommandBufferError == commandBuffer) return;
+	// Keep only the most recently reported command buffer alive. A raw pointer set
+	// could grow forever and become incorrect if Objective-C reuses an address.
+	lastReportedCommandBufferError = commandBuffer;
+	NSError *error = commandBuffer.error;
+	GL4METAL_LOG("Metal command buffer failed (status=%ld, error=%ld): %s; label is only the last encoded draw hint, not a guaranteed fault location: '%s'",
+		(long)commandBuffer.status, (long)error.code,
+		error.localizedDescription.UTF8String ?: "unknown Metal GPU error",
+		commandBuffer.label.UTF8String ?: "(unlabelled)");
+	if (error.userInfo.count > 0) {
+		GL4METAL_LOG("Metal command buffer error details: %s", error.userInfo.description.UTF8String ?: "(none)");
+	}
 }
 
 // Commits the open command buffer so that fences waiting for it can complete.
 void flushCommandBuffer(bool waitUntilCompleted) {
+	reportCommandBufferErrorIfNeeded(ctx.last_committed_buffer);
 	endRenderEncoder();
 	if (ctx.currentComputeEncoder) {
 		[ctx.currentComputeEncoder endEncoding];
 		ctx.currentComputeEncoder = nil;
 	}
 	if (ctx.currentCommandBuffer) {
-		installCommandBufferErrorHandler(ctx.currentCommandBuffer);
 		[ctx.currentCommandBuffer commit];
 		resetDrawUniformUploadArena(ctx.currentCommandBuffer);
 		resetTextureUploadArena(ctx.currentCommandBuffer);
@@ -65,6 +58,7 @@ void flushCommandBuffer(bool waitUntilCompleted) {
 	}
 	if (waitUntilCompleted && ctx.last_committed_buffer) {
 		[ctx.last_committed_buffer waitUntilCompleted];
+		reportCommandBufferErrorIfNeeded(ctx.last_committed_buffer);
 	}
 }
 

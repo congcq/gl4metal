@@ -58,7 +58,11 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 
     gl4metal/shadertranslator.cpp
 
+    gl4metal/extensions/ARB/GL_ARB_clear_texture.mm
+    gl4metal/extensions/ARB/GL_ARB_compute_shader.mm
     gl4metal/extensions/ARB/GL_ARB_draw_buffers_blend.mm
+    gl4metal/extensions/ARB/GL_ARB_invalidate_subdata.mm
+    gl4metal/extensions/ARB/GL_ARB_shader_image_load_store.mm
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
@@ -72,7 +76,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-    "-framework Foundation"
+    "-framework CoreFoundation"
     "-framework Metal"
     "-framework QuartzCore"
     "-framework UIKit"

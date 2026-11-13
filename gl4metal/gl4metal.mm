@@ -2,10 +2,43 @@
 
 #include <mutex>
 
-MTLContext ctx; // context for Metal device
+thread_local MTLContext ctx; // context for Metal device
 
-static std::mutex gl4metalInitMutex;
+static std::mutex *gl4metalInitMutex = new std::mutex();
 static bool gl4metalInitialized = false;
+
+// Compute-shader compatibility is exposed only when the active Metal device
+// meets the OpenGL compute baseline used by Iris. Device identity is stable for
+// the lifetime of MTLContext, so cache this capability instead of repeating
+// Objective-C feature queries from every GL limit/string query.
+bool gl4metalSupportsComputeShaders(void) {
+	static bool capabilityCached = false;
+	static bool capabilitySupported = false;
+	if (!ctx.device) return false;
+	if (capabilityCached) return capabilitySupported;
+
+	NSUInteger sharedMemoryLimit = 0;
+	MTLSize threadgroupLimits = MTLSizeMake(0, 0, 0);
+	bool apple6 = false;
+	if (@available(iOS 14.0, *)) {
+		apple6 = [ctx.device supportsFamily:MTLGPUFamilyApple6];
+		sharedMemoryLimit = ctx.device.maxThreadgroupMemoryLength;
+		threadgroupLimits = ctx.device.maxThreadsPerThreadgroup;
+		capabilitySupported = apple6 && sharedMemoryLimit >= 32768 &&
+			threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 &&
+			threadgroupLimits.depth >= 64;
+	}
+	capabilityCached = true;
+	GL4METAL_LOG("Compute capability: Apple6=%d, threads/group=%lu x %lu x %lu, threadgroup memory=%lu, enabled=%d",
+		apple6 ? 1 : 0, (unsigned long)threadgroupLimits.width,
+		(unsigned long)threadgroupLimits.height, (unsigned long)threadgroupLimits.depth,
+		(unsigned long)sharedMemoryLimit, capabilitySupported ? 1 : 0);
+	return capabilitySupported;
+}
+
+NSUInteger gl4metalMaxComputeWorkGroupInvocations(void) {
+	return gl4metalSupportsComputeShaders() ? GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS : 0u;
+}
 
 void initDevice() {
 	// Keep the device identity stable. Replacing it after resources have been created
@@ -22,7 +55,7 @@ void initDevice() {
 }
 
 GLboolean gl4metalInit() {
-	std::lock_guard<std::mutex> initLock(gl4metalInitMutex);
+	std::lock_guard<std::mutex> initLock(*gl4metalInitMutex);
 	if (gl4metalInitialized) return GL_TRUE;
 	initDevice();
 	if (!ctx.device || !ctx.commandQueue) {
@@ -33,6 +66,12 @@ GLboolean gl4metalInit() {
 	if (check && check[0] == '1') {
 		gl4metalCheckExports();
 	}
+
+	// Shader packs create many transient FBOs while building/reloading pipelines.
+	// Reserve the common working set once so frame-time FBO insertions do not
+	// repeatedly rehash the context table.
+	ctx.fbo_objects.max_load_factor(0.75f);
+	ctx.fbo_objects.reserve(128);
 
 	// OpenGL initial state
 	ctx.depth_write_enabled = GL_TRUE;
@@ -150,9 +189,18 @@ static MTLStencilDescriptor *makeStencilDescriptor(const MTLContext::StencilFace
 }
 
 void updateDepthStencilState() {
-	static std::unordered_map<std::string, id<MTLDepthStencilState>> cache;
-	static std::mutex cacheMutex;
-	std::lock_guard<std::mutex> lock(cacheMutex);
+	// Context/Metal teardown can still trigger GL state callbacks while the JVM is
+	// exiting. Keep both the cache and its mutex alive until process termination;
+	// destroying a static unordered_map of strong Objective-C objects can race a
+	// late callback and leave a subsequent find() operating on a destroyed table.
+	using DepthStencilCache = std::unordered_map<std::string, id<MTLDepthStencilState>>;
+	static DepthStencilCache *cache = new DepthStencilCache();
+	static std::mutex *cacheMutex = new std::mutex();
+	if (!ctx.device) {
+		ctx.depthStencilState = nil;
+		return;
+	}
+	std::lock_guard<std::mutex> lock(*cacheMutex);
 
 	const bool depthEnabled = ctx.depth_test_enabled != GL_FALSE;
 	const bool stencilEnabled = ctx.caps[GL_STENCIL_TEST] != GL_FALSE;
@@ -169,8 +217,8 @@ void updateDepthStencilState() {
 	append(back.func); append((uint32_t)back.ref); append(back.value_mask); append(back.write_mask);
 	append(back.fail); append(back.depth_fail); append(back.depth_pass);
 
-	auto it = cache.find(key);
-	if (it == cache.end() || !it->second) {
+	auto it = cache->find(key);
+	if (it == cache->end() || !it->second) {
 		MTLDepthStencilDescriptor *descriptor = [[MTLDepthStencilDescriptor alloc] init];
 		descriptor.depthCompareFunction = depthEnabled ? getMetalCompareFunc(ctx.depth_func) : MTLCompareFunctionAlways;
 		descriptor.depthWriteEnabled = depthEnabled && ctx.depth_write_enabled;
@@ -190,7 +238,7 @@ void updateDepthStencilState() {
 			descriptor.backFaceStencil = disabled;
 		}
 		id<MTLDepthStencilState> created = [ctx.device newDepthStencilStateWithDescriptor:descriptor];
-		if (it == cache.end()) it = cache.emplace(key, created).first;
+		if (it == cache->end()) it = cache->emplace(key, created).first;
 		else it->second = created;
 	}
 	ctx.depthStencilState = it->second;

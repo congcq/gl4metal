@@ -37,10 +37,11 @@
 
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
+#define GL4METAL_MAX_3D_TEXTURE_SIZE 2048
 #define GL4METAL_MAX_COLOR_ATTACHMENTS 8
 #define GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS 36
 // Metal reserves buffer slots 16...30 for UBOs/default uniforms; compute SSBOs use 0...15.
-#define GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 512
+#define GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 1024
 
 // MARK: - Textures
 
@@ -48,7 +49,7 @@ struct TextureObject {
 	GLenum target = 0; // 0 until the name is bound for the first time
 	id<MTLTexture> texture = nil;
 	GLenum internalformat = GL_RGBA8;
-	GLsizei width = 0, height = 0; // level 0 size
+	GLsizei width = 0, height = 0, depth = 1; // level 0 size; depth > 1 for GL_TEXTURE_3D
 	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
 	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
 
@@ -90,10 +91,10 @@ struct FBO {
 	FBOAttachment depth, stencil;
 	GLenum draw_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS] = { GL_COLOR_ATTACHMENT0 };
 	GLenum read_buffer = GL_COLOR_ATTACHMENT0;
-};
-
-struct VAO {
-	
+	// Pending GL invalidation hints. They become MTLLoadActionDontCare at the next pass.
+	uint32_t invalidated_color_mask = 0;
+	bool invalidated_depth = false;
+	bool invalidated_stencil = false;
 };
 
 // MARK: - Vertex arrays
@@ -167,6 +168,9 @@ struct ProgramUniform {
 	TranslatedUniform info; // name, type, per-stage layout in the default uniform block
 	GLint base_location;    // an array of N elements owns N consecutive locations
 	std::vector<GLint> units; // samplers: texture unit set with glUniform1i
+	bool is_image = false;   // opaque image uniforms are reflected and location-addressable, but have no UBO storage
+	GLenum opaque_gl_type = 0; // exact GL_IMAGE_* type reported by glGetActiveUniform
+	uint32_t image_index = 0;  // first flattened ProgramObject::storage_images / image_units element
 };
 
 struct ProgramBlock {
@@ -197,7 +201,7 @@ struct ProgramObject {
 	id<MTLFunction> fragment_function = nil;
 	id<MTLFunction> vertex_function_flipped = nil; // vertex_function with gl_Position.y negated (texture targets)
 	std::vector<ProgramAttrib> attribs;
-	std::vector<ProgramUniform> uniforms; // default-block uniforms with glUniform locations
+	std::vector<ProgramUniform> uniforms; // default-block uniforms, samplers, and opaque image uniforms with locations
 	std::vector<ActiveUniformInfo> active_uniforms; // GL_ACTIVE_UNIFORMS includes named-block members too
 	std::vector<std::pair<GLint, GLint>> locations; // GL uniform location -> (index in uniforms, array element)
 	std::vector<uint8_t> uniform_data[3];           // CPU copy of default uniforms: [0] vertex, [1] fragment, [2] compute
@@ -205,10 +209,16 @@ struct ProgramObject {
 	std::vector<ProgramBlock> blocks;
 	std::vector<TranslatedStorageBuffer> storage_buffers;
 	std::vector<TranslatedImage> storage_images;
+	std::vector<GLint> image_units; // GL image-unit uniform values, parallel to flattened storage_images
 	id<MTLComputePipelineState> compute_pipeline = nil;
 	uint32_t compute_workgroup_size[3] = {1, 1, 1};
+	// Stable identities are assigned by the process-lifetime MSL stage cache.
+	// They let render-pipeline cache keys ignore transient GL program names.
+	uint64_t vertex_stage_cache_id = 0;
+	uint64_t fragment_stage_cache_id = 0;
 	bool is_compute = false;
 	bool uses_gl_frag_coord = false; // fragment MSL needs the per-render-pass coordinate parameters
+
 };
 
 struct ShaderStorageBufferBinding {
@@ -317,7 +327,7 @@ struct MTLContext {
 	GLuint bound_samplers[GL4METAL_MAX_TEXTURE_UNITS]; // glBindSampler, 0 = none
 	UniformBufferBinding uniform_buffer_bindings[GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS];
 	ShaderStorageBufferBinding shader_storage_buffer_bindings[GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS];
-	ImageUnitBinding image_unit_bindings[GL4METAL_MAX_TEXTURE_UNITS];
+	ImageUnitBinding image_unit_bindings[GL4METAL_MAX_IMAGE_UNITS];
 	std::unordered_set<const void *> sync_objects;
 	id<MTLCommandBuffer> last_committed_buffer;
 	GLboolean pack_swap_bytes = GL_FALSE; // GL_PACK_SWAP_BYTES; appended to preserve existing member offsets
@@ -370,17 +380,78 @@ struct MTLContext {
 	// Compute encoder is appended to preserve all existing MTLContext member offsets.
 	id<MTLComputeCommandEncoder> currentComputeEncoder = nil;
 	uint64_t render_pass_serial = 0; // logical pass identity; feedback blits may split Metal encoders
+
+	// GL_UNPACK_IMAGE_HEIGHT / GL_UNPACK_SKIP_IMAGES are used only by 3D uploads.
+	// Appended so adding pixel-store state does not shift established context offsets.
+	GLint unpack_image_height = 0;
+	GLint unpack_skip_images = 0;
+	GLint pack_image_height = 0;
+	GLint pack_skip_images = 0;
+	GLboolean unpack_swap_bytes = GL_FALSE;
+	struct { GLsizei w = 0, h = 0, d = 0; GLenum internalformat = 0; } proxy_texture_3d;
+
+	// TBDR load/store hints for the currently encoded render pass. Appended to preserve
+	// all established MTLContext member offsets across Objective-C++ translation units.
+	uint32_t pass_color_attachment_mask = 0;
+	uint32_t pass_discard_color_store_mask = 0;
+	bool pass_discard_depth_store = false;
+	bool pass_discard_stencil_store = false;
 };
 
-extern MTLContext ctx;
+extern thread_local MTLContext ctx;
+
+inline void traceFramebufferMap(const char *operation) {
+	static const bool enabled = [] {
+		const char *value = std::getenv("GL4METAL_TRACE_FBO_MAP");
+		return value && value[0] == '1';
+	}();
+	if (!enabled) return;
+	GL4METAL_LOG("FBO map before %s: ctx=%p map=%p size=%zu buckets=%zu load=%.3f draw=%u read=%u",
+		operation ? operation : "unknown", (void *)&ctx, (void *)&ctx.fbo_objects,
+		ctx.fbo_objects.size(), ctx.fbo_objects.bucket_count(), (double)ctx.fbo_objects.load_factor(),
+		ctx.draw_fbo, ctx.read_fbo);
+}
+#define GL4METAL_FBO_FIND(framebufferName) (traceFramebufferMap(__func__), ctx.fbo_objects.find(framebufferName))
+
+// Runtime-gated capability helpers (gl4metal.mm).
+bool gl4metalSupportsComputeShaders(void);
+NSUInteger gl4metalMaxComputeWorkGroupInvocations(void);
+
+
+// Buffer-size metadata is queried by several GL entry points and may be touched
+// during late JVM/renderer teardown. Keep its registry and mutex alive for the
+// process lifetime, and protect every lookup/update/erase independently of the
+// Objective-C Metal buffer objects. The legacy MTLContext::buffer_sizes member
+// remains in place to preserve the established context layout, but is unused.
+struct GL4MetalBufferSizeRegistry {
+	std::mutex mutex;
+	std::unordered_map<GLuint, NSUInteger> sizes;
+};
+
+inline GL4MetalBufferSizeRegistry &gl4metalBufferSizeRegistry() {
+	static GL4MetalBufferSizeRegistry *registry = new GL4MetalBufferSizeRegistry();
+	return *registry;
+}
 
 inline NSUInteger glBufferLogicalSize(GLuint bufferName) {
-	auto sizeIt = ctx.buffer_sizes.find(bufferName);
-	if (sizeIt != ctx.buffer_sizes.end()) return sizeIt->second;
-	auto bufferIt = ctx.buffer_objects.find(bufferName);
-	return bufferIt != ctx.buffer_objects.end() && bufferIt->second ? bufferIt->second.length : 0;
+	GL4MetalBufferSizeRegistry &registry = gl4metalBufferSizeRegistry();
+	std::lock_guard<std::mutex> lock(registry.mutex);
+	const auto sizeIt = registry.sizes.find(bufferName);
+	return sizeIt != registry.sizes.end() ? sizeIt->second : 0;
 }
-extern std::recursive_mutex gl4metalSamplerObjectMutex; // sampler object state shared by GL entry points and draw.mm
+
+inline void gl4metalSetBufferLogicalSize(GLuint bufferName, NSUInteger size) {
+	GL4MetalBufferSizeRegistry &registry = gl4metalBufferSizeRegistry();
+	std::lock_guard<std::mutex> lock(registry.mutex);
+	registry.sizes[bufferName] = size;
+}
+
+inline void gl4metalEraseBufferLogicalSize(GLuint bufferName) {
+	GL4MetalBufferSizeRegistry &registry = gl4metalBufferSizeRegistry();
+	std::lock_guard<std::mutex> lock(registry.mutex);
+	registry.sizes.erase(bufferName);
+}
+extern std::mutex &gl4metalSamplerObjectMutex; // sampler object state shared by GL entry points and draw.mm
 
 static inline GLuint boundBuffer(GLenum target) {
 	auto it = ctx.bound_buffers.find(target);
