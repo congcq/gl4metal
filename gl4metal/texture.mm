@@ -194,21 +194,19 @@ static const uint8_t *resolveUnpackPointer(const void *pixels, size_t byteOffset
 	return (const uint8_t *)it->second.contents + baseOffset + byteOffset;
 }
 
-// Small/medium texture updates share one staging arena per command buffer. Each
-// encoded blit gets a distinct range, so the CPU never overwrites bytes that the GPU
-// may still be reading. The command buffer retains the arena until completion.
+// Small/medium texture updates share one staging arena per command buffer on the
+// owning GL thread. Each encoded blit gets a distinct range, so the CPU never overwrites
+// bytes that the GPU may still be reading. The command buffer retains the arena.
 struct TextureUploadArena {
 	id<MTLCommandBuffer> commandBuffer = nil;
 	id<MTLBuffer> buffer = nil;
 	NSUInteger used = 0;
 };
 
-static TextureUploadArena textureUploadArena;
-static std::mutex *textureUploadArenaMutex = new std::mutex();
+static thread_local TextureUploadArena textureUploadArena;
 
 void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer) {
 	if (!commandBuffer) return;
-	std::lock_guard<std::mutex> lock(*textureUploadArenaMutex);
 	if (textureUploadArena.commandBuffer == commandBuffer) {
 		textureUploadArena.commandBuffer = nil;
 		textureUploadArena.buffer = nil;
@@ -242,7 +240,6 @@ static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger
 	id<MTLBuffer> staging = nil;
 	NSUInteger stagingOffset = 0;
 	{
-		std::lock_guard<std::mutex> lock(*textureUploadArenaMutex);
 		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
 			textureUploadArena.commandBuffer = targetCommandBuffer;
 			textureUploadArena.buffer = nil;
@@ -311,7 +308,6 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 	id<MTLBuffer> staging = nil;
 	NSUInteger stagingOffset = 0;
 	{
-		std::lock_guard<std::mutex> lock(*textureUploadArenaMutex);
 		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
 			textureUploadArena.commandBuffer = targetCommandBuffer;
 			textureUploadArena.buffer = nil;

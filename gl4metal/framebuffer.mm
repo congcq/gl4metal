@@ -8,6 +8,8 @@
 
 #import "framebuffer.h"
 
+extern void invalidateDrawEncoderStateCache(void);
+
 #include <mutex>
 #include <new>
 #include <cstdio>
@@ -61,6 +63,7 @@ void endRenderEncoder(void) {
 		[ctx.currentEncoder endEncoding];
 		ctx.currentEncoder = nil;
 	}
+	invalidateDrawEncoderStateCache();
 	ctx.fragcoord_params_bound = false;
 	ctx.discard_default_depth_stencil_on_end = false;
 	ctx.pass_uses_default_framebuffer = false;

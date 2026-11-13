@@ -6,12 +6,8 @@
 #include <new>
 #include <array>
 
-// These caches are process-wide / context-wide and may be reached by more than one
-// JVM thread. std::unordered_map and std::unordered_set do not support concurrent
-// mutation, even when the keys differ.
-static std::mutex *convertedVertexBufferCacheMutex = new std::mutex();
-static std::mutex *samplerCacheMutex = new std::mutex();
-static std::mutex *pipelineCacheMutex = new std::mutex();
+// Feedback diagnostics and fallback Metal objects are process-wide. Their locks are
+// intentionally kept separate from the render-encoder state cache, which is thread-local.
 static std::mutex *feedbackLoopSetMutex = new std::mutex();
 static std::mutex *fallbackTextureMutex = new std::mutex();
 static std::mutex *fallbackSamplerMutex = new std::mutex();
@@ -25,11 +21,9 @@ struct DrawUniformUploadArena {
 	NSUInteger used = 0;
 };
 
-static DrawUniformUploadArena drawUniformUploadArena;
-static std::mutex *drawUniformUploadArenaMutex = new std::mutex();
+static thread_local DrawUniformUploadArena drawUniformUploadArena;
 
 void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
-	std::lock_guard<std::mutex> lock(*drawUniformUploadArenaMutex);
 	if (!commandBuffer || drawUniformUploadArena.commandBuffer == commandBuffer) {
 		drawUniformUploadArena.commandBuffer = nil;
 		drawUniformUploadArena.buffer = nil;
@@ -41,7 +35,6 @@ static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment,
 	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset, void **destinationContents) {
 	if (length == 0 || !ctx.device || !ctx.currentCommandBuffer || length > ctx.device.maxBufferLength) return false;
 	if (alignment == 0) alignment = 1;
-	std::lock_guard<std::mutex> lock(*drawUniformUploadArenaMutex);
 	id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
 	if (drawUniformUploadArena.commandBuffer != commandBuffer) {
 		drawUniformUploadArena.commandBuffer = commandBuffer;
@@ -269,10 +262,9 @@ static uint32_t loadExtendedIntegerComponent(const uint8_t *src, GLenum type) {
 	}
 }
 
-static std::unordered_map<GLuint, std::unordered_map<std::string, id<MTLBuffer>>> convertedVertexBufferCache;
+static thread_local std::unordered_map<GLuint, std::unordered_map<std::string, id<MTLBuffer>>> convertedVertexBufferCache;
 
 void invalidateConvertedVertexBuffers(GLuint buffer) {
-	std::lock_guard<std::mutex> lock(*convertedVertexBufferCacheMutex);
 	convertedVertexBufferCache.erase(buffer);
 }
 
@@ -295,7 +287,6 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 	cacheKey.append((const char *)&va.stride, sizeof(va.stride));
 	cacheKey.append((const char *)&sourceOffset, sizeof(sourceOffset));
 	cacheKey.append((const char *)&sourceLength, sizeof(sourceLength));
-	std::lock_guard<std::mutex> lock(*convertedVertexBufferCacheMutex);
 	auto &perBuffer = convertedVertexBufferCache[bufferId];
 	auto cached = perBuffer.find(cacheKey);
 	if (cached != perBuffer.end() && cached->second) {
@@ -406,7 +397,7 @@ struct FeedbackSnapshotRequest {
 	GLint level = 0;
 	GLint drawBufferIndex = -1;
 	GLint unit = -1;
-	std::string samplerName;
+	const char *samplerName = nullptr;
 	id<MTLTexture> source = nil;
 	id<MTLTexture> snapshot = nil;
 };
@@ -418,8 +409,25 @@ struct FeedbackSnapshotRequest {
 static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *caller,
 	__strong id<MTLRenderCommandEncoder> &encoder,
 	std::unordered_map<GLuint, id<MTLTexture>> &snapshotsByTexture) {
-	std::vector<FeedbackSnapshotRequest> requests;
-	std::unordered_set<GLuint> seenTextures;
+	static thread_local std::vector<FeedbackSnapshotRequest> requests;
+	static thread_local std::unordered_set<GLuint> seenTextures;
+	// Requests contain strong Metal texture references. Clear them on every exit,
+	// including the default-framebuffer and no-sampler fast paths, while retaining
+	// vector/hash-table capacity for subsequent feedback checks.
+	requests.clear();
+	seenTextures.clear();
+	struct ScratchReset {
+		std::vector<FeedbackSnapshotRequest> &requests;
+		std::unordered_set<GLuint> &seenTextures;
+		~ScratchReset() { requests.clear(); seenTextures.clear(); }
+	} scratchReset{requests, seenTextures};
+	if (ctx.draw_fbo == 0) return true; // the drawable is never a GL texture attachment
+	bool hasSampler = false;
+	for (const ProgramUniform &uniform : program.uniforms) {
+		if (uniform.info.kind == TranslatedUniform::Sampler &&
+			(uniform.info.stage[0].present || uniform.info.stage[1].present)) { hasSampler = true; break; }
+	}
+	if (!hasSampler) return true;
 
 	for (const ProgramUniform &uniform : program.uniforms) {
 		if (uniform.info.kind != TranslatedUniform::Sampler ||
@@ -504,7 +512,7 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 				request.level = level;
 				request.drawBufferIndex = drawBufferIndex;
 				request.unit = unit;
-				request.samplerName = uniform.info.name;
+				request.samplerName = uniform.info.name.c_str();
 				request.source = source;
 				request.snapshot = snapshot;
 				requests.push_back(std::move(request));
@@ -568,7 +576,7 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 		}
 		if (firstReport) {
 			GL4METAL_LOG("draw: snapshotting feedback image (program=%u framebuffer=%u texture=%u sampler='%s' unit=%d attachment=0x%X level=%d drawBufferIndex=%d snapshot=%p size=%lux%lu format=%lu)",
-				ctx.current_program, ctx.draw_fbo, request.textureName, request.samplerName.c_str(), request.unit,
+				ctx.current_program, ctx.draw_fbo, request.textureName, (request.samplerName ? request.samplerName : ""), request.unit,
 				request.attachment, request.level, request.drawBufferIndex, (__bridge void *)request.snapshot,
 				(unsigned long)request.source.width, (unsigned long)request.source.height, (unsigned long)request.source.pixelFormat);
 		}
@@ -599,23 +607,20 @@ static bool firstVertexFetchTrace(const std::string &key) {
 }
 
 static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit) {
-	// Snapshot the bound sampler and its parameters while sampler-object state is locked.
+	// Snapshot sampler-object state on the owning GL thread; this context is thread-local.
 	GLenum minFilter = t.min_filter, magFilter = t.mag_filter;
 	GLenum wrapS = t.wrap_s, wrapT = t.wrap_t, wrapR = t.wrap_r;
 	GLfloat minLod = t.min_lod, maxLod = t.max_lod, anisotropy = t.max_anisotropy;
 	GLenum compareMode = t.compare_mode, compareFunc = t.compare_func;
-	{
-		std::lock_guard<std::mutex> objectLock(gl4metalSamplerObjectMutex);
-		const GLuint samplerName = ctx.bound_samplers[textureUnit];
-		if (samplerName != 0) {
-			auto found = ctx.sampler_objects.find(samplerName);
-			if (found != ctx.sampler_objects.end()) {
-				const SamplerObject &so = found->second;
-				minFilter = so.min_filter; magFilter = so.mag_filter;
-				wrapS = so.wrap_s; wrapT = so.wrap_t; wrapR = so.wrap_r;
-				minLod = so.min_lod; maxLod = so.max_lod; anisotropy = so.max_anisotropy;
-				compareMode = so.compare_mode; compareFunc = so.compare_func;
-			}
+	const GLuint samplerName = ctx.bound_samplers[textureUnit];
+	if (samplerName != 0) {
+		auto found = ctx.sampler_objects.find(samplerName);
+		if (found != ctx.sampler_objects.end()) {
+			const SamplerObject &so = found->second;
+			minFilter = so.min_filter; magFilter = so.mag_filter;
+			wrapS = so.wrap_s; wrapT = so.wrap_t; wrapR = so.wrap_r;
+			minLod = so.min_lod; maxLod = so.max_lod; anisotropy = so.max_anisotropy;
+			compareMode = so.compare_mode; compareFunc = so.compare_func;
 		}
 	}
 	// Reuse thread-local key storage; samplerFor is called for every active sampler on every draw.
@@ -637,10 +642,19 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	putBytes(key, &compareMode, sizeof(compareMode));
 	putBytes(key, &compareFunc, sizeof(compareFunc));
 
-	{
-		std::lock_guard<std::mutex> cacheLock(*samplerCacheMutex);
-		auto it = ctx.sampler_cache.find(key);
-		if (it != ctx.sampler_cache.end()) return it->second;
+	struct LastSamplerCache {
+		std::string key;
+		__strong id<MTLSamplerState> sampler = nil;
+		bool valid = false;
+	};
+	static thread_local LastSamplerCache lastSamplerCache;
+	if (lastSamplerCache.valid && key == lastSamplerCache.key) return lastSamplerCache.sampler;
+	auto cachedSampler = ctx.sampler_cache.find(key);
+	if (cachedSampler != ctx.sampler_cache.end()) {
+		lastSamplerCache.key = key;
+		lastSamplerCache.sampler = cachedSampler->second;
+		lastSamplerCache.valid = true;
+		return cachedSampler->second;
 	}
 
 	bool mipmapped = minFilter == GL_NEAREST_MIPMAP_NEAREST || minFilter == GL_LINEAR_MIPMAP_NEAREST ||
@@ -670,11 +684,11 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 			minFilter, magFilter, wrapS, wrapT, wrapR);
 		return nil;
 	}
-	{
-		std::lock_guard<std::mutex> cacheLock(*samplerCacheMutex);
-		auto inserted = ctx.sampler_cache.emplace(key, sampler);
-		return inserted.first->second;
-	}
+	auto inserted = ctx.sampler_cache.emplace(key, sampler);
+	lastSamplerCache.key = key;
+	lastSamplerCache.sampler = inserted.first->second;
+	lastSamplerCache.valid = true;
+	return inserted.first->second;
 }
 
 // What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1).
@@ -793,6 +807,220 @@ struct ActiveAttrib {
 	NSUInteger slot = 0;
 };
 
+
+// Metal command encoders retain their last bindings. GL4Metal previously resent
+// practically every state item on every draw, even when a shader pack rendered
+// thousands of objects with identical state. Keep a per-thread shadow of the active
+// encoder and emit Metal setters only when their effective value changes.
+// MTLContext/currentEncoder are thread-local, so this cache requires no mutex.
+static constexpr NSUInteger kDrawVertexBufferSlots = GL4METAL_UNIFORM_BUFFER_INDEX + 1;
+static constexpr NSUInteger kDrawTextureSlots = GL4METAL_MAX_VERTEX_TEXTURE_UNITS;
+
+struct DrawEncoderBufferSlot {
+	uint8_t kind = 0; // 0 unknown, 1 MTLBuffer, 2 cached 16-byte generic attribute
+	__strong id<MTLBuffer> buffer = nil;
+	NSUInteger offset = 0;
+	uint8_t constantBytes[16] = {};
+};
+
+struct DrawEncoderTextureSlot {
+	bool valid = false;
+	__strong id<MTLTexture> texture = nil;
+};
+
+struct DrawEncoderSamplerSlot {
+	bool valid = false;
+	__strong id<MTLSamplerState> sampler = nil;
+};
+
+// The default uniform blocks use set*Bytes for small payloads (up to Metal's
+// 4 KiB inline-data limit). Keep a per-stage copy so stable uniforms do not
+// repeatedly cross the Objective-C/Metal encoder boundary on every draw.
+struct DrawEncoderBytesSlot {
+	bool valid = false;
+	NSUInteger length = 0;
+	uint8_t bytes[4096] = {};
+};
+
+struct DrawEncoderStateCache {
+	__weak id<MTLRenderCommandEncoder> encoder = nil;
+	bool pipelineValid = false;
+	__strong id<MTLRenderPipelineState> pipeline = nil;
+	bool depthStateValid = false;
+	__strong id<MTLDepthStencilState> depthState = nil;
+	bool stencilReferenceValid = false;
+	uint32_t stencilFrontReference = 0;
+	uint32_t stencilBackReference = 0;
+	bool windingValid = false;
+	MTLWinding winding = MTLWindingClockwise;
+	bool cullValid = false;
+	MTLCullMode cull = MTLCullModeNone;
+	bool fillValid = false;
+	MTLTriangleFillMode fill = MTLTriangleFillModeFill;
+	bool depthBiasValid = false;
+	float depthBiasUnits = 0.0f;
+	float depthBiasSlope = 0.0f;
+	bool blendColorValid = false;
+	float blendColor[4] = {};
+	DrawEncoderBufferSlot vertexBuffers[kDrawVertexBufferSlots];
+	DrawEncoderBufferSlot fragmentBuffers[kDrawVertexBufferSlots];
+	DrawEncoderTextureSlot vertexTextures[kDrawTextureSlots];
+	DrawEncoderTextureSlot fragmentTextures[kDrawTextureSlots];
+	DrawEncoderSamplerSlot vertexSamplers[kDrawTextureSlots];
+	DrawEncoderSamplerSlot fragmentSamplers[kDrawTextureSlots];
+	DrawEncoderBytesSlot vertexDefaultBytes;
+	DrawEncoderBytesSlot fragmentDefaultBytes;
+
+	void resetForEncoder(id<MTLRenderCommandEncoder> newEncoder) {
+		pipelineValid = depthStateValid = stencilReferenceValid = false;
+		vertexDefaultBytes.valid = fragmentDefaultBytes.valid = false;
+		vertexDefaultBytes.length = fragmentDefaultBytes.length = 0;
+		windingValid = cullValid = fillValid = depthBiasValid = blendColorValid = false;
+		pipeline = nil;
+		depthState = nil;
+		for (NSUInteger slot = 0; slot < kDrawVertexBufferSlots; ++slot) {
+			vertexBuffers[slot].kind = fragmentBuffers[slot].kind = 0;
+			vertexBuffers[slot].buffer = fragmentBuffers[slot].buffer = nil;
+			vertexBuffers[slot].offset = fragmentBuffers[slot].offset = 0;
+		}
+		for (NSUInteger slot = 0; slot < kDrawTextureSlots; ++slot) {
+			vertexTextures[slot].valid = fragmentTextures[slot].valid = false;
+			vertexTextures[slot].texture = fragmentTextures[slot].texture = nil;
+			vertexSamplers[slot].valid = fragmentSamplers[slot].valid = false;
+			vertexSamplers[slot].sampler = fragmentSamplers[slot].sampler = nil;
+		}
+		encoder = newEncoder;
+	}
+};
+
+static DrawEncoderStateCache &threadDrawEncoderStateCache(void) {
+	static thread_local DrawEncoderStateCache cache;
+	return cache;
+}
+
+static DrawEncoderStateCache &drawEncoderStateFor(id<MTLRenderCommandEncoder> encoder) {
+	DrawEncoderStateCache &cache = threadDrawEncoderStateCache();
+	if (cache.encoder != encoder) cache.resetForEncoder(encoder);
+	return cache;
+}
+
+// Called whenever framebuffer.mm ends the active render encoder. Releasing the
+// shadow references here prevents the cache from extending texture/buffer lifetimes
+// across idle frames or after a framebuffer switch.
+void invalidateDrawEncoderStateCache(void) {
+	threadDrawEncoderStateCache().resetForEncoder(nil);
+}
+
+static inline void bindVertexBufferCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	if (slot >= kDrawVertexBufferSlots) {
+		[encoder setVertexBuffer:buffer offset:offset atIndex:slot];
+		return;
+	}
+	DrawEncoderBufferSlot &binding = cache.vertexBuffers[slot];
+	if (slot == GL4METAL_UNIFORM_BUFFER_INDEX) cache.vertexDefaultBytes.valid = false;
+	if (binding.kind == 1 && binding.buffer == buffer && binding.offset == offset) return;
+	[encoder setVertexBuffer:buffer offset:offset atIndex:slot];
+	binding.kind = 1;
+	binding.buffer = buffer;
+	binding.offset = offset;
+}
+
+static inline void bindFragmentBufferCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	if (slot >= kDrawVertexBufferSlots) {
+		[encoder setFragmentBuffer:buffer offset:offset atIndex:slot];
+		return;
+	}
+	DrawEncoderBufferSlot &binding = cache.fragmentBuffers[slot];
+	if (slot == GL4METAL_UNIFORM_BUFFER_INDEX) cache.fragmentDefaultBytes.valid = false;
+	if (binding.kind == 1 && binding.buffer == buffer && binding.offset == offset) return;
+	[encoder setFragmentBuffer:buffer offset:offset atIndex:slot];
+	binding.kind = 1;
+	binding.buffer = buffer;
+	binding.offset = offset;
+}
+
+static inline void bindVertexDefaultBytesCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderBytesSlot &binding = cache.vertexDefaultBytes;
+	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	[encoder setVertexBytes:bytes length:length atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+	if (length != 0) memcpy(binding.bytes, bytes, length);
+	binding.length = length;
+	binding.valid = true;
+	cache.vertexBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].kind = 0;
+	cache.vertexBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].buffer = nil;
+	cache.vertexBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].offset = 0;
+}
+
+static inline void bindFragmentDefaultBytesCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderBytesSlot &binding = cache.fragmentDefaultBytes;
+	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	[encoder setFragmentBytes:bytes length:length atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+	if (length != 0) memcpy(binding.bytes, bytes, length);
+	binding.length = length;
+	binding.valid = true;
+	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].kind = 0;
+	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].buffer = nil;
+	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].offset = 0;
+}
+
+static inline void bindVertexConstantCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger slot) {
+	if (slot >= 16) {
+		[encoder setVertexBytes:bytes length:16 atIndex:slot];
+		return;
+	}
+	DrawEncoderBufferSlot &binding = cache.vertexBuffers[slot];
+	if (binding.kind == 2 && memcmp(binding.constantBytes, bytes, 16) == 0) return;
+	[encoder setVertexBytes:bytes length:16 atIndex:slot];
+	binding.kind = 2;
+	binding.buffer = nil;
+	memcpy(binding.constantBytes, bytes, 16);
+}
+
+static inline void bindVertexTextureCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger slot) {
+	if (slot >= kDrawTextureSlots) { [encoder setVertexTexture:texture atIndex:slot]; return; }
+	DrawEncoderTextureSlot &binding = cache.vertexTextures[slot];
+	if (binding.valid && binding.texture == texture) return;
+	[encoder setVertexTexture:texture atIndex:slot];
+	binding.texture = texture;
+	binding.valid = true;
+}
+
+static inline void bindFragmentTextureCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger slot) {
+	if (slot >= kDrawTextureSlots) { [encoder setFragmentTexture:texture atIndex:slot]; return; }
+	DrawEncoderTextureSlot &binding = cache.fragmentTextures[slot];
+	if (binding.valid && binding.texture == texture) return;
+	[encoder setFragmentTexture:texture atIndex:slot];
+	binding.texture = texture;
+	binding.valid = true;
+}
+
+static inline void bindVertexSamplerCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger slot) {
+	if (slot >= kDrawTextureSlots) { [encoder setVertexSamplerState:sampler atIndex:slot]; return; }
+	DrawEncoderSamplerSlot &binding = cache.vertexSamplers[slot];
+	if (binding.valid && binding.sampler == sampler) return;
+	[encoder setVertexSamplerState:sampler atIndex:slot];
+	binding.sampler = sampler;
+	binding.valid = true;
+}
+
+static inline void bindFragmentSamplerCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger slot) {
+	if (slot >= kDrawTextureSlots) { [encoder setFragmentSamplerState:sampler atIndex:slot]; return; }
+	DrawEncoderSamplerSlot &binding = cache.fragmentSamplers[slot];
+	if (binding.valid && binding.sampler == sampler) return;
+	[encoder setFragmentSamplerState:sampler atIndex:slot];
+	binding.sampler = sampler;
+	binding.valid = true;
+}
+
 static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p, std::vector<ActiveAttrib> &attribs, const char *caller) {
 	bool flip = ctx.pass_flipped;
 	bool blend = false;
@@ -848,12 +1076,23 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		put(aa.constant ? 1 : 0);
 	}
 
-	{
-		std::lock_guard<std::mutex> cacheLock(*pipelineCacheMutex);
-		auto cached = ctx.pipeline_cache.find(key);
-		if (cached != ctx.pipeline_cache.end()) {
-			return cached->second; // may be nil: a combination that already failed was reported once
-		}
+	// MTLContext is thread-local and render encoders are owned by the GL submission
+	// thread. The pipeline map is therefore context-local too; a process-wide mutex
+	// here only serialized otherwise independent iPhone/iPad contexts on every draw.
+	struct LastPipelineCache {
+		std::string key;
+		__strong id<MTLRenderPipelineState> pipeline = nil;
+		bool valid = false;
+	};
+	static thread_local LastPipelineCache lastPipelineCache;
+	if (lastPipelineCache.valid && lastPipelineCache.pipeline && key == lastPipelineCache.key) return lastPipelineCache.pipeline;
+
+	auto cached = ctx.pipeline_cache.find(key);
+	if (cached != ctx.pipeline_cache.end()) {
+		lastPipelineCache.key = key;
+		lastPipelineCache.pipeline = cached->second;
+		lastPipelineCache.valid = true;
+		return cached->second; // may be nil: a combination that already failed was reported once
 	}
 
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -920,19 +1159,17 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 		GL4METAL_LOG("%s: pipeline creation failed for program %u: %s", caller, programId,
 			error ? error.localizedDescription.UTF8String : "unknown Metal pipeline error");
 	}
-	// Pipeline compilation can take milliseconds on iOS. Do it outside the shared
-	// cache mutex so unrelated variants can compile concurrently on worker threads.
-	// A racing thread may have populated the same key; use that canonical entry.
-	{
-		std::lock_guard<std::mutex> cacheLock(*pipelineCacheMutex);
-		auto inserted = ctx.pipeline_cache.emplace(key, pipeline);
-		if (!inserted.second) return inserted.first->second;
-		if (ctx.pipeline_cache.size() > 512) {
-			auto victim = ctx.pipeline_cache.begin();
-			if (victim == inserted.first) ++victim;
-			if (victim != ctx.pipeline_cache.end()) ctx.pipeline_cache.erase(victim);
-		}
+	// Pipeline cache belongs to this thread-local context; no shared lock is needed.
+	auto inserted = ctx.pipeline_cache.emplace(key, pipeline);
+	if (!inserted.second) pipeline = inserted.first->second;
+	if (ctx.pipeline_cache.size() > 512) {
+		auto victim = ctx.pipeline_cache.begin();
+		if (victim == inserted.first) ++victim;
+		if (victim != ctx.pipeline_cache.end()) ctx.pipeline_cache.erase(victim);
 	}
+	lastPipelineCache.key = key;
+	lastPipelineCache.pipeline = pipeline;
+	lastPipelineCache.valid = true;
 	return pipeline;
 }
 
@@ -1209,10 +1446,16 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// Resolve active sampler/attachment aliases before setting any render state. The
 	// snapshot helper may end and recreate the encoder, so it must run before pipeline,
 	// vertex, uniform, or sampler bindings are recorded on the current encoder.
-	std::unordered_map<GLuint, id<MTLTexture>> feedbackSnapshots;
+	static thread_local std::unordered_map<GLuint, id<MTLTexture>> feedbackSnapshots;
+	feedbackSnapshots.clear();
+	struct FeedbackSnapshotMapReset {
+		std::unordered_map<GLuint, id<MTLTexture>> &snapshots;
+		~FeedbackSnapshotMapReset() { snapshots.clear(); }
+	} feedbackSnapshotMapReset{feedbackSnapshots};
 	if (!prepareFeedbackSnapshots(p, caller, enc, feedbackSnapshots)) {
 		return;
 	}
+	DrawEncoderStateCache &encoderCache = drawEncoderStateFor(enc);
 
 	// Fixed-function state.
 	MTLCullMode cull = MTLCullModeNone;
@@ -1245,7 +1488,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		GL4METAL_LOG("%s: no valid Metal depth-stencil state; draw skipped", caller);
 		return;
 	}
-	[enc setRenderPipelineState:pipeline];
+	if (!encoderCache.pipelineValid || encoderCache.pipeline != pipeline) {
+		[enc setRenderPipelineState:pipeline];
+		encoderCache.pipeline = pipeline;
+		encoderCache.pipelineValid = true;
+	}
 	if (p.uses_gl_frag_coord && !ctx.fragcoord_params_bound) {
 		struct alignas(8) FragmentCoordFixupParams {
 			uint32_t target_height;
@@ -1265,26 +1512,61 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		[enc setFragmentBytes:&fragCoordParams length:sizeof(fragCoordParams) atIndex:GL4METAL_FRAGCOORD_BUFFER_INDEX];
 		ctx.fragcoord_params_bound = true;
 	}
-	[enc setDepthStencilState:activeDepthState];
-	[enc setStencilFrontReferenceValue:(uint32_t)ctx.stencil_front.ref backReferenceValue:(uint32_t)ctx.stencil_back.ref];
-	[enc setFrontFacingWinding:ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];
-	[enc setCullMode:cull];
-	[enc setTriangleFillMode:ctx.polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-	if (capOn(GL_POLYGON_OFFSET_FILL)) {
-		[enc setDepthBias:ctx.polygon_offset_units slopeScale:ctx.polygon_offset_factor clamp:0.0f];
-	} else {
-		[enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+	if (!encoderCache.depthStateValid || encoderCache.depthState != activeDepthState) {
+		[enc setDepthStencilState:activeDepthState];
+		encoderCache.depthState = activeDepthState;
+		encoderCache.depthStateValid = true;
 	}
-	[enc setBlendColorRed:ctx.blend_color[0] green:ctx.blend_color[1] blue:ctx.blend_color[2] alpha:ctx.blend_color[3]];
+	const uint32_t stencilFrontReference = (uint32_t)ctx.stencil_front.ref;
+	const uint32_t stencilBackReference = (uint32_t)ctx.stencil_back.ref;
+	if (!encoderCache.stencilReferenceValid ||
+		encoderCache.stencilFrontReference != stencilFrontReference ||
+		encoderCache.stencilBackReference != stencilBackReference) {
+		[enc setStencilFrontReferenceValue:stencilFrontReference backReferenceValue:stencilBackReference];
+		encoderCache.stencilFrontReference = stencilFrontReference;
+		encoderCache.stencilBackReference = stencilBackReference;
+		encoderCache.stencilReferenceValid = true;
+	}
+	const MTLWinding activeWinding = ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
+	if (!encoderCache.windingValid || encoderCache.winding != activeWinding) {
+		[enc setFrontFacingWinding:activeWinding];
+		encoderCache.winding = activeWinding;
+		encoderCache.windingValid = true;
+	}
+	if (!encoderCache.cullValid || encoderCache.cull != cull) {
+		[enc setCullMode:cull];
+		encoderCache.cull = cull;
+		encoderCache.cullValid = true;
+	}
+	const MTLTriangleFillMode activeFillMode = ctx.polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+	if (!encoderCache.fillValid || encoderCache.fill != activeFillMode) {
+		[enc setTriangleFillMode:activeFillMode];
+		encoderCache.fill = activeFillMode;
+		encoderCache.fillValid = true;
+	}
+	const float activeDepthBiasUnits = capOn(GL_POLYGON_OFFSET_FILL) ? ctx.polygon_offset_units : 0.0f;
+	const float activeDepthBiasSlope = capOn(GL_POLYGON_OFFSET_FILL) ? ctx.polygon_offset_factor : 0.0f;
+	if (!encoderCache.depthBiasValid || encoderCache.depthBiasUnits != activeDepthBiasUnits ||
+		encoderCache.depthBiasSlope != activeDepthBiasSlope) {
+		[enc setDepthBias:activeDepthBiasUnits slopeScale:activeDepthBiasSlope clamp:0.0f];
+		encoderCache.depthBiasUnits = activeDepthBiasUnits;
+		encoderCache.depthBiasSlope = activeDepthBiasSlope;
+		encoderCache.depthBiasValid = true;
+	}
+	if (!encoderCache.blendColorValid || memcmp(encoderCache.blendColor, ctx.blend_color, sizeof(encoderCache.blendColor)) != 0) {
+		[enc setBlendColorRed:ctx.blend_color[0] green:ctx.blend_color[1] blue:ctx.blend_color[2] alpha:ctx.blend_color[3]];
+		memcpy(encoderCache.blendColor, ctx.blend_color, sizeof(encoderCache.blendColor));
+		encoderCache.blendColorValid = true;
+	}
 
 	// Vertex buffers.
 	for (const ActiveAttrib &aa : attribs) {
 		if (aa.constant) {
 			uint8_t value[16]; // glVertexAttrib*: the attribute's current value
 			genericAttribValue((GLuint)aa.pa->gl_index, aa.pa->is_integer, value);
-			[enc setVertexBytes:value length:sizeof(value) atIndex:aa.slot];
+			bindVertexConstantCached(encoderCache, enc, value, aa.slot);
 		} else {
-			[enc setVertexBuffer:aa.buffer offset:aa.offset atIndex:aa.slot];
+			bindVertexBufferCached(encoderCache, enc, aa.buffer, aa.offset, aa.slot);
 		}
 	}
 
@@ -1321,9 +1603,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 		if (data.size() <= 4096) { // setBytes limit
 			if (s == 0) {
-				[enc setVertexBytes:data.data() length:data.size() atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				bindVertexDefaultBytesCached(encoderCache, enc, data.data(), (NSUInteger)data.size());
 			} else {
-				[enc setFragmentBytes:data.data() length:data.size() atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				bindFragmentDefaultBytesCached(encoderCache, enc, data.data(), (NSUInteger)data.size());
 			}
 		} else {
 			if (data.size() > ctx.device.maxBufferLength) {
@@ -1339,9 +1621,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				return;
 			}
 			if (s == 0) {
-				[enc setVertexBuffer:buffer offset:offset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				bindVertexBufferCached(encoderCache, enc, buffer, offset, GL4METAL_UNIFORM_BUFFER_INDEX);
 			} else {
-				[enc setFragmentBuffer:buffer offset:offset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+				bindFragmentBufferCached(encoderCache, enc, buffer, offset, GL4METAL_UNIFORM_BUFFER_INDEX);
 			}
 		}
 	}
@@ -1408,10 +1690,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			return;
 		}
 		if (block.info.stage[0].present) {
-			[enc setVertexBuffer:bound->second offset:offset atIndex:block.info.stage[0].slot];
+			bindVertexBufferCached(encoderCache, enc, bound->second, offset, block.info.stage[0].slot);
 		}
 		if (block.info.stage[1].present) {
-			[enc setFragmentBuffer:bound->second offset:offset atIndex:block.info.stage[1].slot];
+			bindFragmentBufferCached(encoderCache, enc, bound->second, offset, block.info.stage[1].slot);
 		}
 	}
 
@@ -1531,13 +1813,13 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			}
 			if (u.info.stage[0].present) {
 				NSUInteger index = u.info.stage[0].slot + (NSUInteger)e;
-				[enc setVertexTexture:texture atIndex:index];
-				if (!isBufferSampler) [enc setVertexSamplerState:sampler atIndex:index];
+				bindVertexTextureCached(encoderCache, enc, texture, index);
+				if (!isBufferSampler) bindVertexSamplerCached(encoderCache, enc, sampler, index);
 			}
 			if (u.info.stage[1].present) {
 				NSUInteger index = u.info.stage[1].slot + (NSUInteger)e;
-				[enc setFragmentTexture:texture atIndex:index];
-				if (!isBufferSampler) [enc setFragmentSamplerState:sampler atIndex:index];
+				bindFragmentTextureCached(encoderCache, enc, texture, index);
+				if (!isBufferSampler) bindFragmentSamplerCached(encoderCache, enc, sampler, index);
 			}
 		}
 	}

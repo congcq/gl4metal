@@ -48,7 +48,10 @@ void markBuffersUsed(const GLuint *buf_ids, size_t objectCount) {
 	if (!activeBuffer || !buf_ids || objectCount == 0) return;
 	for (size_t index = 0; index < objectCount; ++index) {
 		const GLuint buf_id = buf_ids[index];
-		if (buf_id != 0) ctx.buffer_last_use[buf_id] = activeBuffer;
+		if (buf_id == 0) continue;
+		auto useIt = ctx.buffer_last_use.find(buf_id);
+		if (useIt == ctx.buffer_last_use.end()) ctx.buffer_last_use.emplace(buf_id, activeBuffer);
+		else if (useIt->second != activeBuffer) useIt->second = activeBuffer;
 	}
 	// Prune infrequently instead of scanning the whole map on every draw. When the
 	// table becomes large, prune immediately to keep memory bounded.

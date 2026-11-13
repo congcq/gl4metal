@@ -1,9 +1,7 @@
 #import "sampler.h"
 
-// Sampler-object state uses one mutex. Public entry points acquire it once
-// and use unlocked helpers below, avoiding nested locking in parameter queries.
-std::mutex &gl4metalSamplerObjectMutex = *new std::mutex();
-
+// Sampler objects belong to the thread-local MTLContext. A GL context is current
+// on its owning thread, so a process-wide mutex would serialize unrelated devices.
 static SamplerObject *findSamplerUnlocked(GLuint samplerName) {
 	auto it = ctx.sampler_objects.find(samplerName);
 	return it == ctx.sampler_objects.end() ? nullptr : &it->second;
@@ -18,7 +16,6 @@ void glGenSamplers(GLsizei count, GLuint *samplers) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		return;
 	}
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	for (GLsizei i = 0; i < count; i++) {
 		GLuint samplerName = ++ctx.next_sampler_id;
 		ctx.sampler_objects[samplerName] = SamplerObject();
@@ -31,7 +28,6 @@ void glDeleteSamplers(GLsizei count, const GLuint *samplers) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		return;
 	}
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	for (GLsizei i = 0; i < count; i++) {
 		GLuint samplerName = samplers[i];
 		if (samplerName == 0) continue;
@@ -43,12 +39,10 @@ void glDeleteSamplers(GLsizei count, const GLuint *samplers) {
 }
 
 GLboolean glIsSampler(GLuint samplerName) {
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	return samplerName != 0 && findSamplerUnlocked(samplerName) != nullptr;
 }
 
 void glBindSampler(GLuint unit, GLuint samplerName) {
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	if (unit >= (GLuint)GL4METAL_MAX_TEXTURE_UNITS ||
 		(samplerName != 0 && !findSamplerUnlocked(samplerName))) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -106,37 +100,31 @@ static bool samplerParameterfUnlocked(GLuint samplerName, GLenum pname, GLfloat 
 }
 
 void glSamplerParameteri(GLuint samplerName, GLenum pname, GLint param) {
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	samplerParameteriUnlocked(samplerName, pname, param);
 }
 
 void glSamplerParameteriv(GLuint samplerName, GLenum pname, const GLint *param) {
 	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	// Vector-valued pnames (for example border colour) are not supported.
 	samplerParameteriUnlocked(samplerName, pname, param[0]);
 }
 
 void glSamplerParameterf(GLuint samplerName, GLenum pname, GLfloat param) {
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	samplerParameterfUnlocked(samplerName, pname, param);
 }
 
 void glSamplerParameterfv(GLuint samplerName, GLenum pname, const GLfloat *param) {
 	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	samplerParameterfUnlocked(samplerName, pname, param[0]);
 }
 
 void glSamplerParameterIiv(GLuint samplerName, GLenum pname, const GLint *param) {
 	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	samplerParameteriUnlocked(samplerName, pname, param[0]);
 }
 
 void glSamplerParameterIuiv(GLuint samplerName, GLenum pname, const GLuint *param) {
 	if (!param) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	samplerParameteriUnlocked(samplerName, pname, (GLint)param[0]);
 }
 
@@ -172,13 +160,11 @@ static bool getSamplerParameterivUnlocked(GLuint samplerName, GLenum pname, GLin
 
 void glGetSamplerParameteriv(GLuint samplerName, GLenum pname, GLint *params) {
 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	getSamplerParameterivUnlocked(samplerName, pname, params);
 }
 
 void glGetSamplerParameterfv(GLuint samplerName, GLenum pname, GLfloat *params) {
 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	SamplerObject *sampler = findSamplerUnlocked(samplerName);
 	if (!sampler) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -200,13 +186,11 @@ void glGetSamplerParameterfv(GLuint samplerName, GLenum pname, GLfloat *params) 
 
 void glGetSamplerParameterIiv(GLuint samplerName, GLenum pname, GLint *params) {
 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	getSamplerParameterivUnlocked(samplerName, pname, params);
 }
 
 void glGetSamplerParameterIuiv(GLuint samplerName, GLenum pname, GLuint *params) {
 	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
-	std::lock_guard<std::mutex> lock(gl4metalSamplerObjectMutex);
 	GLint value = 0;
 	if (getSamplerParameterivUnlocked(samplerName, pname, &value)) *params = (GLuint)value;
 	else *params = 0;

@@ -451,7 +451,6 @@ inline void gl4metalEraseBufferLogicalSize(GLuint bufferName) {
 	std::lock_guard<std::mutex> lock(registry.mutex);
 	registry.sizes.erase(bufferName);
 }
-extern std::mutex &gl4metalSamplerObjectMutex; // sampler object state shared by GL entry points and draw.mm
 
 static inline GLuint boundBuffer(GLenum target) {
 	auto it = ctx.bound_buffers.find(target);
