@@ -77,10 +77,19 @@ bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
 	return true;
 }
 
+static bool diagnosticsMasterEnabled() {
+	static const bool enabled = [] {
+		const char *value = getenv("GL4METAL_DIAGNOSTICS");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static bool vertexFetchValidationEnabled() {
 	// Full validation scans all indices on the CPU for every indexed draw. Keep it opt-in
 	// for diagnostics; EBO byte-range validation remains enabled unconditionally.
 	static const bool enabled = [] {
+		if (!diagnosticsMasterEnabled()) return false;
 		const char *value = getenv("GL4METAL_VALIDATE_VERTEX_FETCH");
 		return value && value[0] == '1';
 	}();
@@ -91,6 +100,7 @@ static bool drawLabelingEnabled() {
 	// Formatting an NSString for every draw adds CPU and autorelease-pool pressure.
 	// Enable only while diagnosing a specific GPU command-buffer fault.
 	static const bool enabled = [] {
+		if (!diagnosticsMasterEnabled()) return false;
 		const char *value = getenv("GL4METAL_TRACE_DRAW_LABELS");
 		return value && value[0] == '1';
 	}();
@@ -99,6 +109,7 @@ static bool drawLabelingEnabled() {
 
 static bool vertexSamplerTraceEnabled() {
 	static const bool enabled = [] {
+		if (!diagnosticsMasterEnabled()) return false;
 		const char *value = getenv("GL4METAL_TRACE_VERTEX_SAMPLERS");
 		return value && value[0] && value[0] != '0';
 	}();
@@ -107,6 +118,7 @@ static bool vertexSamplerTraceEnabled() {
 
 static bool vertexFetchTraceEnabled() {
 	static const bool enabled = [] {
+		if (!diagnosticsMasterEnabled()) return false;
 		const char *value = getenv("GL4METAL_TRACE_VERTEX_FETCH");
 		return value && value[0] && value[0] != '0';
 	}();
@@ -115,6 +127,7 @@ static bool vertexFetchTraceEnabled() {
 
 static bool fragmentSamplerTraceEnabled() {
 	static const bool enabled = [] {
+		if (!diagnosticsMasterEnabled()) return false;
 		const char *value = getenv("GL4METAL_TRACE_FRAGMENT_SAMPLERS");
 		return value && value[0] && value[0] != '0';
 	}();
@@ -287,6 +300,8 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 	cacheKey.append((const char *)&va.stride, sizeof(va.stride));
 	cacheKey.append((const char *)&sourceOffset, sizeof(sourceOffset));
 	cacheKey.append((const char *)&sourceLength, sizeof(sourceLength));
+	const uintptr_t sourceIdentity = (uintptr_t)(__bridge void *)source;
+	cacheKey.append((const char *)&sourceIdentity, sizeof(sourceIdentity));
 	auto &perBuffer = convertedVertexBufferCache[bufferId];
 	auto cached = perBuffer.find(cacheKey);
 	if (cached != perBuffer.end() && cached->second) {
@@ -803,9 +818,34 @@ struct ActiveAttrib {
 	NSUInteger stride = 0;
 	NSUInteger elementBytes = 0; // bytes consumed by one vertex/instance attribute element
 	GLuint divisor = 0;
-	GLuint source_buffer = 0; // zero when buffer points at an internally converted stream
+	GLuint source_buffer = 0; // zero when buffer is retained after deletion or internally converted
+	NSUInteger source_buffer_length = 0; // GL-visible byte length captured for this binding
 	NSUInteger slot = 0;
 };
+
+static id<MTLBuffer> metalBufferForVertexAttrib(const VertexAttrib &attrib) {
+	if (attrib.retains_deleted_buffer) return attrib.retained_deleted_buffer;
+	auto storage = ctx.buffer_objects.find(attrib.bound_vbo);
+	return storage != ctx.buffer_objects.end() ? storage->second : nil;
+}
+
+static NSUInteger logicalLengthForVertexAttrib(const VertexAttrib &attrib) {
+	return attrib.retains_deleted_buffer
+		? attrib.retained_deleted_buffer_size
+		: glBufferLogicalSize(attrib.bound_vbo);
+}
+
+static id<MTLBuffer> metalBufferForElementArray(const VertexArray &vao) {
+	if (vao.retains_deleted_element_buffer) return vao.retained_deleted_element_buffer;
+	auto storage = ctx.buffer_objects.find(vao.element_array_buffer_id);
+	return storage != ctx.buffer_objects.end() ? storage->second : nil;
+}
+
+static NSUInteger logicalLengthForElementArray(const VertexArray &vao) {
+	return vao.retains_deleted_element_buffer
+		? vao.retained_deleted_element_buffer_size
+		: glBufferLogicalSize(vao.element_array_buffer_id);
+}
 
 
 // Metal command encoders retain their last bindings. GL4Metal previously resent
@@ -1275,7 +1315,7 @@ static bool validateVertexFetchRanges(const DrawCall &dc, const char *caller,
 		const uint64_t elementIndex = aa.divisor == 0
 			? range.maxIndex
 			: ((uint64_t)dc.instances - 1) / (uint64_t)aa.divisor;
-		const NSUInteger visibleLength = aa.source_buffer != 0 ? glBufferLogicalSize(aa.source_buffer) : aa.buffer.length;
+		const NSUInteger visibleLength = aa.source_buffer_length;
 		if (aa.elementBytes == 0 || aa.stride == 0 || aa.offset > visibleLength) {
 			GL4METAL_LOG("%s: invalid vertex binding for '%s' (offset=%lu stride=%lu element=%lu length=%lu); draw skipped",
 				caller, aa.pa ? aa.pa->name.c_str() : "?", (unsigned long)aa.offset,
@@ -1364,23 +1404,24 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	attribs.clear();
 	if (attribs.capacity() < p.attribs.size()) attribs.reserve(p.attribs.size());
 	for (const ProgramAttrib &pa : p.attribs) {
-		if (pa.gl_index < 0 || pa.gl_index >= 16) {
-			continue;
-		}
+		if (pa.gl_index < 0 || pa.gl_index >= 16) continue;
 		const VertexAttrib &va = vao.attribs[pa.gl_index];
-		if (va.enabled && va.bound_vbo != 0) {
-			auto storage = ctx.buffer_objects.find(va.bound_vbo);
-			if (storage == ctx.buffer_objects.end() || !storage->second) {
+		ActiveAttrib aa;
+		aa.pa = &pa;
+		if (va.enabled) {
+			if (va.bound_vbo == 0 && !va.retains_deleted_buffer) {
 				gl4metalSetError(GL_INVALID_OPERATION);
-				GL4METAL_LOG("%s: enabled attribute '%s' references VBO %u without valid Metal storage; draw skipped",
+				GL4METAL_LOG("%s: enabled attribute '%s' has no buffer attached to VAO %u; draw skipped",
+					caller, pa.name.c_str(), ctx.current_vao);
+				return;
+			}
+			id<MTLBuffer> attributeBuffer = metalBufferForVertexAttrib(va);
+			if (!attributeBuffer) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: enabled attribute '%s' references VBO %u without retained Metal storage; draw skipped",
 					caller, pa.name.c_str(), va.bound_vbo);
 				return;
 			}
-		}
-		ActiveAttrib aa;
-		aa.pa = &pa;
-		auto bit = ctx.buffer_objects.find(va.bound_vbo);
-		if (va.enabled && va.bound_vbo != 0 && bit != ctx.buffer_objects.end() && bit->second != nil) {
 			NSUInteger tight = 0;
 			MTLVertexFormat format = vertexFormatFor(va, tight);
 			if (format == MTLVertexFormatInvalid) {
@@ -1389,11 +1430,15 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			}
 			aa.constant = false;
 			aa.format = format;
-			aa.buffer = bit->second;
-			aa.source_buffer = va.bound_vbo;
+			aa.buffer = attributeBuffer;
+			aa.source_buffer = va.retains_deleted_buffer ? 0 : va.bound_vbo;
+			// The byte-length lookup is only needed by the opt-in full vertex-fetch
+			// validator. Avoid one hash-map lookup per active attribute in release draws.
+			aa.source_buffer_length = vertexFetchValidationEnabled()
+				? logicalLengthForVertexAttrib(va) : 0;
 			aa.offset = (NSUInteger)(uintptr_t)va.pointer;
 			aa.stride = va.stride > 0 ? (NSUInteger)va.stride : tight;
-			aa.elementBytes = tight; // native vertex fetch width; converted integer formats override this below
+			aa.elementBytes = tight;
 			aa.divisor = va.divisor;
 
 			if (pa.is_integer && va.integer) {
@@ -1404,7 +1449,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				if (hasIntegerStorageType && sourceUnsigned != pa.is_unsigned) {
 					NSUInteger convertedStride = 0;
 					id<MTLBuffer> converted = nil;
-					if (!makeSignednessConvertedVertexBuffer(va.bound_vbo, va, bit->second, convertedStride, converted)) {
+					if (!makeSignednessConvertedVertexBuffer(va.bound_vbo, va, attributeBuffer, convertedStride, converted)) {
 						GL4METAL_LOG("%s: cannot convert integer vertex attribute '%s' from GL type 0x%X for the shader's %s input", caller, pa.name.c_str(), va.type, pa.is_unsigned ? "unsigned" : "signed");
 						return;
 					}
@@ -1413,6 +1458,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					aa.format = pa.is_unsigned ? unsignedFormats[va.size] : signedFormats[va.size];
 					aa.buffer = converted;
 					aa.source_buffer = 0;
+					if (vertexFetchValidationEnabled()) aa.source_buffer_length = converted.length;
 					aa.offset = 0;
 					aa.stride = convertedStride;
 					aa.elementBytes = (NSUInteger)va.size * sizeof(uint32_t);
@@ -1421,19 +1467,6 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		} else {
 			aa.constant = true;
 			aa.format = pa.is_integer ? (pa.is_unsigned ? MTLVertexFormatUInt4 : MTLVertexFormatInt4) : MTLVertexFormatFloat4;
-		}
-		if (vertexFetchTraceEnabled()) {
-			const std::string traceKey = std::to_string(ctx.current_program) + ":" + pa.name + ":" +
-				std::to_string(va.bound_vbo) + ":" + std::to_string((uintptr_t)(__bridge void *)aa.buffer) +
-				":" + std::to_string((unsigned long)aa.format) + ":" + std::to_string(aa.stride);
-			if (firstVertexFetchTrace(traceKey)) {
-				GL4METAL_LOG("vertex attribute binding: program=%u name='%s' GLindex=%d VBO=%u integer=%d unsigned=%d normalized=%d sourceType=0x%X size=%d stride=%lu offset=%lu divisor=%u MetalFormat=%lu MetalBuffer=%p bytes=%lu elementBytes=%lu",
-					ctx.current_program, pa.name.c_str(), pa.gl_index, va.bound_vbo, va.integer ? 1 : 0,
-					pa.is_unsigned ? 1 : 0, va.normalized ? 1 : 0, va.type, va.size,
-					(unsigned long)va.stride, (unsigned long)(uintptr_t)va.pointer, va.divisor,
-					(unsigned long)aa.format, (__bridge void *)aa.buffer,
-					(unsigned long)(aa.buffer ? aa.buffer.length : 0), (unsigned long)aa.elementBytes);
-			}
 		}
 		attribs.push_back(aa);
 	}
@@ -1584,7 +1617,8 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		};
 		for (const ActiveAttrib &aa : attribs) {
 			if (aa.constant || !aa.pa || aa.pa->gl_index < 0 || aa.pa->gl_index >= 16) continue;
-			appendUnique(vao.attribs[aa.pa->gl_index].bound_vbo);
+			const VertexAttrib &attribute = vao.attribs[aa.pa->gl_index];
+			if (!attribute.retains_deleted_buffer) appendUnique(attribute.bound_vbo);
 		}
 		for (const ProgramBlock &block : p.blocks) {
 			if (block.info.stage[0].present || block.info.stage[1].present) {
@@ -1875,20 +1909,19 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 
-	auto eit = ctx.buffer_objects.find(vao.element_array_buffer_id);
-	if (vao.element_array_buffer_id == 0 || eit == ctx.buffer_objects.end() || !eit->second) {
+	id<MTLBuffer> ebo = metalBufferForElementArray(vao);
+	if (vao.element_array_buffer_id == 0 || !ebo) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("%s: no element array buffer bound to the current VAO", caller);
+		GL4METAL_LOG("%s: no element array buffer with storage is attached to the current VAO", caller);
 		return;
 	}
-	id<MTLBuffer> ebo = eit->second;
 	NSUInteger indexSize = dc.indexType == GL_UNSIGNED_INT ? 4 : (dc.indexType == GL_UNSIGNED_SHORT ? 2 : 1);
 	if (dc.indexType != GL_UNSIGNED_INT && dc.indexType != GL_UNSIGNED_SHORT && dc.indexType != GL_UNSIGNED_BYTE) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: invalid index type 0x%X", caller, dc.indexType);
 		return;
 	}
-	const NSUInteger eboLogicalLength = glBufferLogicalSize(vao.element_array_buffer_id);
+	const NSUInteger eboLogicalLength = logicalLengthForElementArray(vao);
 	if (dc.indexOffset < 0 || (NSUInteger)dc.indexOffset > eboLogicalLength ||
 		(NSUInteger)dc.count > (eboLogicalLength - (NSUInteger)dc.indexOffset) / indexSize) {
 		gl4metalSetError(GL_INVALID_OPERATION);
@@ -1904,7 +1937,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 
 	const bool primitiveRestart = capOn(GL_PRIMITIVE_RESTART);
 	if (dc.indexType != GL_UNSIGNED_BYTE && !fan && !primitiveRestart) {
-		markActiveDrawBuffers(vao.element_array_buffer_id);
+		markActiveDrawBuffers(vao.retains_deleted_element_buffer ? 0 : vao.element_array_buffer_id);
 		[enc drawIndexedPrimitives:prim indexCount:(NSUInteger)dc.count
 						 indexType:(dc.indexType == GL_UNSIGNED_INT ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16)
 					   indexBuffer:ebo indexBufferOffset:(NSUInteger)dc.indexOffset
@@ -1981,7 +2014,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	if (indices.empty()) return;
 	id<MTLBuffer> tmp = createTemporaryIndexBuffer(indices, caller);
 	if (!tmp) return;
-	markActiveDrawBuffers(vao.element_array_buffer_id);
+	markActiveDrawBuffers(vao.retains_deleted_element_buffer ? 0 : vao.element_array_buffer_id);
 	if (primitiveRestart && !fan) {
 		for (const auto &segment : segments) {
 			if (segment.second == 0) continue;
@@ -2044,7 +2077,10 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
 }
 
 void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
-	glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+	(void)start;
+	(void)end; // start/end are range hints; the indexed data remains authoritative.
+	DrawCall dc = { mode, 0, count, true, type, (GLintptr)(uintptr_t)indices, 1, basevertex };
+	executeDraw(dc, "glDrawRangeElementsBaseVertex");
 }
 
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLint basevertex) {
@@ -2052,8 +2088,20 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, 
 	executeDraw(dc, "glDrawElementsInstancedBaseVertex");
 }
 
-void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum type, const void *const*indices, GLsizei drawcount, const GLint *basevertex) {
-	for (GLsizei i = 0; i < drawcount; i++) {
-		glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei drawcount, const GLint *basevertex) {
+	if (drawcount < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (drawcount == 0) return;
+	if (!count || !indices || !basevertex) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glMultiDrawElementsBaseVertex: null parameter array");
+		return;
+	}
+	for (GLsizei draw_index = 0; draw_index < drawcount; ++draw_index) {
+		DrawCall dc = { mode, 0, count[draw_index], true, type,
+			(GLintptr)(uintptr_t)indices[draw_index], 1, basevertex[draw_index] };
+		executeDraw(dc, "glMultiDrawElementsBaseVertex");
 	}
 }

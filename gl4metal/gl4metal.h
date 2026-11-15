@@ -109,11 +109,21 @@ struct VertexAttrib {
 	const void *pointer;
 	bool integer; // glVertexAttribIPointer
 	GLuint divisor;
+
+	// A deleted buffer remains alive while referenced by an unbound VAO. Keep the
+	// Metal backing and GL-visible byte length here so the name can be reused by
+	// the application without redirecting this VAO to the new buffer object.
+	bool retains_deleted_buffer = false;
+	__strong id<MTLBuffer> retained_deleted_buffer = nil;
+	NSUInteger retained_deleted_buffer_size = 0;
 };
 
 struct VertexArray {
 	VertexAttrib attribs[16];
 	GLuint element_array_buffer_id;
+	bool retains_deleted_element_buffer = false;
+	__strong id<MTLBuffer> retained_deleted_element_buffer = nil;
+	NSUInteger retained_deleted_element_buffer_size = 0;
 };
 
 // MARK: - Shaders
@@ -402,6 +412,8 @@ extern thread_local MTLContext ctx;
 
 inline void traceFramebufferMap(const char *operation) {
 	static const bool enabled = [] {
+		const char *diagnostics = std::getenv("GL4METAL_DIAGNOSTICS");
+		if (!diagnostics || diagnostics[0] != '1') return false;
 		const char *value = std::getenv("GL4METAL_TRACE_FBO_MAP");
 		return value && value[0] == '1';
 	}();

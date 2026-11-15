@@ -20,8 +20,17 @@ extern void invalidateDrawEncoderStateCache(void);
 
 // MARK: - Render passes
 
+static bool framebufferDiagnosticsEnabled() {
+	static const bool enabled = [] {
+		const char *value = std::getenv("GL4METAL_DIAGNOSTICS");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static bool drawBufferTraceEnabled() {
 	static const bool enabled = [] {
+		if (!framebufferDiagnosticsEnabled()) return false;
 		const char *value = std::getenv("GL4METAL_TRACE_DRAW_BUFFERS");
 		return value && value[0] == '1';
 	}();

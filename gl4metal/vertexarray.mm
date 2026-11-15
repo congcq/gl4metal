@@ -64,14 +64,19 @@ void glGenVertexArrays(GLsizei n, GLuint *arrays) {
 }
 
 void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {
+	if (n < 0 || (n > 0 && !arrays)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	for (GLsizei i = 0; i < n; i++) {
-		if (arrays[i] == 0) {
-			continue;
-		}
-		if (ctx.current_vao == arrays[i]) {
+		const GLuint vao_id = arrays[i];
+		if (vao_id == 0) continue;
+		const bool deletingCurrent = ctx.current_vao == vao_id;
+		ctx.vao_objects.erase(vao_id); // releases any retained deleted-buffer storage
+		if (deletingCurrent) {
 			ctx.current_vao = 0;
+			ctx.bound_buffers[GL_ELEMENT_ARRAY_BUFFER] = ctx.vao_objects[0].element_array_buffer_id;
 		}
-		ctx.vao_objects.erase(arrays[i]);
 	}
 }
 
@@ -84,6 +89,7 @@ void glBindVertexArray(GLuint array) {
 		ctx.vao_objects[array] = VertexArray();
 	}
 	ctx.current_vao = array;
+	ctx.bound_buffers[GL_ELEMENT_ARRAY_BUFFER] = ctx.vao_objects[array].element_array_buffer_id;
 }
 
 // MARK: - Vertex attribute arrays
@@ -141,6 +147,9 @@ void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm
 	}
 	VertexAttrib &a = ctx.vao_objects[ctx.current_vao].attribs[index];
 	a.bound_vbo = boundBuffer(GL_ARRAY_BUFFER); // the array buffer binding at call time is captured into the VAO
+	a.retains_deleted_buffer = false;
+	a.retained_deleted_buffer = nil;
+	a.retained_deleted_buffer_size = 0;
 	a.size = size;
 	a.type = type;
 	a.normalized = normalized;
@@ -167,6 +176,9 @@ void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei strid
 	}
 	VertexAttrib &a = ctx.vao_objects[ctx.current_vao].attribs[index];
 	a.bound_vbo = boundBuffer(GL_ARRAY_BUFFER);
+	a.retains_deleted_buffer = false;
+	a.retained_deleted_buffer = nil;
+	a.retained_deleted_buffer_size = 0;
 	a.size = size;
 	a.type = type;
 	a.normalized = GL_FALSE;

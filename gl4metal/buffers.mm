@@ -136,36 +136,80 @@ void glGenBuffers(GLsizei n, GLuint *buffers) {
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
+	if (n < 0 || (n > 0 && !buffers)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	for (GLsizei i = 0; i < n; i++) {
-		GLuint buf_id = buffers[i];
-		if (buf_id == 0) {
-			continue;
-		}
+		const GLuint buf_id = buffers[i];
+		if (buf_id == 0) continue;
+
+		auto storageIt = ctx.buffer_objects.find(buf_id);
+		__strong id<MTLBuffer> deletedStorage =
+			(storageIt != ctx.buffer_objects.end()) ? storageIt->second : nil;
+		const NSUInteger deletedLogicalSize = glBufferLogicalSize(buf_id);
+		const GLuint currentVaoId = ctx.current_vao;
+		bool detachedCurrentElement = false;
+
+		// GL_ARRAY_BUFFER and the other generic targets are context bindings. The
+		// element-array binding is VAO state, so update it from the current VAO below.
 		for (auto &binding : ctx.bound_buffers) {
-			if (binding.second == buf_id) {
+			if (binding.first != GL_ELEMENT_ARRAY_BUFFER && binding.second == buf_id) {
 				binding.second = 0;
 			}
 		}
-		for (auto &vao : ctx.vao_objects) {
-			if (vao.second.element_array_buffer_id == buf_id) {
-				vao.second.element_array_buffer_id = 0;
+
+		for (auto &vaoEntry : ctx.vao_objects) {
+			const bool isCurrentVao = vaoEntry.first == currentVaoId;
+			VertexArray &vao = vaoEntry.second;
+			if (vao.element_array_buffer_id == buf_id && !vao.retains_deleted_element_buffer) {
+				if (isCurrentVao) {
+					// Deletion detaches the buffer from container objects bound to this
+					// context. The current VAO loses the EBO association; other VAOs keep
+					// their reference and therefore must retain the old Metal storage.
+					vao.element_array_buffer_id = 0;
+					vao.retains_deleted_element_buffer = false;
+					vao.retained_deleted_element_buffer = nil;
+					vao.retained_deleted_element_buffer_size = 0;
+					detachedCurrentElement = true;
+				} else if (!vao.retains_deleted_element_buffer) {
+					vao.retains_deleted_element_buffer = true;
+					vao.retained_deleted_element_buffer = deletedStorage;
+					vao.retained_deleted_element_buffer_size = deletedLogicalSize;
+				}
 			}
-			for (VertexAttrib &attrib : vao.second.attribs) {
-				if (attrib.bound_vbo == buf_id) {
+			for (VertexAttrib &attrib : vao.attribs) {
+				if (attrib.bound_vbo != buf_id || attrib.retains_deleted_buffer) continue;
+				if (isCurrentVao) {
+					// Keep the enable bit and byte offset: enable state is independent
+					// of the buffer association. An enabled array with no buffer will be
+					// rejected by executeDraw until the client supplies a new pointer.
 					attrib.bound_vbo = 0;
-					attrib.pointer = nullptr;
-					attrib.enabled = false;
+					attrib.retains_deleted_buffer = false;
+					attrib.retained_deleted_buffer = nil;
+					attrib.retained_deleted_buffer_size = 0;
+				} else if (!attrib.retains_deleted_buffer) {
+					attrib.retains_deleted_buffer = true;
+					attrib.retained_deleted_buffer = deletedStorage;
+					attrib.retained_deleted_buffer_size = deletedLogicalSize;
 				}
 			}
 		}
+		if (detachedCurrentElement) {
+			ctx.bound_buffers[GL_ELEMENT_ARRAY_BUFFER] = 0;
+		} else {
+			auto currentVaoIt = ctx.vao_objects.find(currentVaoId);
+			ctx.bound_buffers[GL_ELEMENT_ARRAY_BUFFER] =
+				(currentVaoIt != ctx.vao_objects.end()) ? currentVaoIt->second.element_array_buffer_id : 0;
+		}
+
 		for (UniformBufferBinding &binding : ctx.uniform_buffer_bindings) {
 			if (binding.buffer == buf_id) binding = UniformBufferBinding();
 		}
 		for (ShaderStorageBufferBinding &binding : ctx.shader_storage_buffer_bindings) {
 			if (binding.buffer == buf_id) binding = ShaderStorageBufferBinding();
 		}
-		// Deleting a GL buffer detaches it from every texture-buffer object. The
-		// command buffer retains any old Metal resources already referenced by draws.
+		// Detach texture-buffer views as in the existing backend implementation.
 		for (auto &textureEntry : ctx.texture_objects) {
 			TextureObject &textureObject = textureEntry.second;
 			if (textureObject.buffer_object == buf_id) {
@@ -176,10 +220,15 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 				textureObject.height = 0;
 			}
 		}
+
+		// Drop the GL name immediately. Non-current VAOs hold strong references to
+		// the old MTLBuffer in their own attachment records, so reusing this numeric
+		// GL name creates a new buffer without changing those VAOs' backing storage.
 		invalidateConvertedVertexBuffers(buf_id);
 		ctx.buffer_last_use.erase(buf_id);
-		ctx.buffer_objects.erase(buf_id); // deleted buffer references were detached from texture-buffer objects above
+		ctx.buffer_objects.erase(buf_id);
 		gl4metalEraseBufferLogicalSize(buf_id);
+
 	}
 }
 
@@ -199,7 +248,11 @@ void glBindBuffer(GLenum target, GLuint buffer) {
 	}
 	ctx.bound_buffers[target] = buffer;
 	if (target == GL_ELEMENT_ARRAY_BUFFER) {
-		ctx.vao_objects[ctx.current_vao].element_array_buffer_id = buffer; // element buffer binding is VAO state
+		VertexArray &vao = ctx.vao_objects[ctx.current_vao];
+		vao.element_array_buffer_id = buffer; // element buffer binding is VAO state
+		vao.retains_deleted_element_buffer = false;
+		vao.retained_deleted_element_buffer = nil;
+		vao.retained_deleted_element_buffer_size = 0;
 	}
 }
 
@@ -332,13 +385,33 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		return;
 	}
 
-	// iOS only has shared (unified memory) buffers: no Managed mode, so no didModifyRange: is needed after CPU writes.
+	// Reuse an existing shared buffer when it has enough capacity and the GPU has
+	// finished using it. This avoids allocating a fresh MTLBuffer for every dynamic
+	// Minecraft vertex/index upload. If an earlier draw still references the store,
+	// keep the no-stall rename path below and let the command buffer retain the old one.
 	NSUInteger length = std::max<NSUInteger>((NSUInteger)size, 1); // Metal rejects zero-length buffers
+	auto existingIt = ctx.buffer_objects.find(buf_id);
+	if (existingIt != ctx.buffer_objects.end() && existingIt->second &&
+		existingIt->second.length >= length && !bufferHasPendingGPUUse(buf_id)) {
+		id<MTLBuffer> reusableBuffer = existingIt->second;
+		if (data && size > 0) {
+			memcpy(reusableBuffer.contents, data, (size_t)size);
+		}
+		invalidateConvertedVertexBuffers(buf_id);
+		ctx.buffer_last_use.erase(buf_id);
+		gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
+		refreshTextureBufferViews(buf_id);
+		return;
+	}
+
+	// iOS uses shared storage, so CPU writes are directly visible to Metal. When the
+	// old allocation is still in flight or too small, allocate a replacement rather
+	// than stalling the render thread. Existing command encoders retain the old store.
 	id<MTLBuffer> buffer = nil;
 	if (data && size > 0) {
 		buffer = [ctx.device newBufferWithBytes:data length:length options:MTLResourceStorageModeShared];
 	} else {
-		buffer = [ctx.device newBufferWithLength:length options:MTLResourceStorageModeShared]; // zero filled
+		buffer = [ctx.device newBufferWithLength:length options:MTLResourceStorageModeShared];
 	}
 	if (!buffer) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);

@@ -73,7 +73,6 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     glslang::glslang
     glslang-default-resource-limits
     spirv-cross-c
-    spirv-cross-core
     spirv-cross-cpp
     spirv-cross-glsl
     spirv-cross-msl
