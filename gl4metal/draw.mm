@@ -12,67 +12,90 @@ static std::mutex *feedbackLoopSetMutex = new std::mutex();
 static std::mutex *fallbackTextureMutex = new std::mutex();
 static std::mutex *fallbackSamplerMutex = new std::mutex();
 
-// Large default uniform blocks use one shared upload arena per in-flight command
-// buffer instead of allocating a new MTLBuffer for every draw. Each slice is aligned
-// to 256 bytes, matching the constant-buffer offset alignment used by GL4Metal UBOs.
-struct DrawUniformUploadArena {
+// Large default uniform blocks and converted index lists share one transient upload
+// arena per in-flight command buffer. This avoids creating one MTLBuffer per fallback
+// draw while keeping every encoded slice alive until its command buffer completes.
+struct DrawTransientUploadArena {
 	id<MTLCommandBuffer> commandBuffer = nil;
 	id<MTLBuffer> buffer = nil;
 	NSUInteger used = 0;
+	bool submitted = false;
 };
 
-static thread_local DrawUniformUploadArena drawUniformUploadArena;
+// Keep one arena per in-flight command buffer. A buffer is recycled only after
+// Metal reports that its previous command buffer completed, avoiding CPU writes
+// racing GPU reads while reusing allocations across successive frames.
+static thread_local std::vector<DrawTransientUploadArena> drawTransientUploadArenas;
 
-void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer) {
-	if (!commandBuffer || drawUniformUploadArena.commandBuffer == commandBuffer) {
-		drawUniformUploadArena.commandBuffer = nil;
-		drawUniformUploadArena.buffer = nil;
-		drawUniformUploadArena.used = 0;
+void resetDrawTransientUploadArena(id<MTLCommandBuffer> commandBuffer) {
+	if (!commandBuffer) return;
+	for (DrawTransientUploadArena &arena : drawTransientUploadArenas) {
+		if (arena.commandBuffer == commandBuffer) {
+			arena.submitted = true;
+			return;
+		}
 	}
 }
 
-static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment,
+static DrawTransientUploadArena *drawTransientUploadArenaForCommandBuffer(id<MTLCommandBuffer> commandBuffer) {
+	for (DrawTransientUploadArena &arena : drawTransientUploadArenas) {
+		if (arena.commandBuffer == commandBuffer) return &arena;
+	}
+	for (DrawTransientUploadArena &arena : drawTransientUploadArenas) {
+		const MTLCommandBufferStatus status = arena.commandBuffer ? arena.commandBuffer.status : MTLCommandBufferStatusCompleted;
+		if (!arena.commandBuffer || (arena.submitted &&
+			(status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError))) {
+			arena.commandBuffer = commandBuffer;
+			arena.used = 0;
+			arena.submitted = false;
+			return &arena;
+		}
+	}
+	drawTransientUploadArenas.emplace_back();
+	DrawTransientUploadArena &arena = drawTransientUploadArenas.back();
+	arena.commandBuffer = commandBuffer;
+	return &arena;
+}
+
+static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment, NSUInteger minimumCapacity,
 	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset, void **destinationContents) {
 	if (length == 0 || !ctx.device || !ctx.currentCommandBuffer || length > ctx.device.maxBufferLength) return false;
 	if (alignment == 0) alignment = 1;
-	id<MTLCommandBuffer> commandBuffer = ctx.currentCommandBuffer;
-	if (drawUniformUploadArena.commandBuffer != commandBuffer) {
-		drawUniformUploadArena.commandBuffer = commandBuffer;
-		drawUniformUploadArena.buffer = nil;
-		drawUniformUploadArena.used = 0;
-	}
-	if (drawUniformUploadArena.used > std::numeric_limits<NSUInteger>::max() - (alignment - 1)) return false;
-	NSUInteger offset = ((drawUniformUploadArena.used + alignment - 1) / alignment) * alignment;
+	DrawTransientUploadArena *arena = drawTransientUploadArenaForCommandBuffer(ctx.currentCommandBuffer);
+	if (!arena || arena->used > std::numeric_limits<NSUInteger>::max() - (alignment - 1)) return false;
+	NSUInteger offset = ((arena->used + alignment - 1) / alignment) * alignment;
 	if (offset > ctx.device.maxBufferLength || length > ctx.device.maxBufferLength - offset) return false;
 	NSUInteger requiredEnd = offset + length;
-	if (!drawUniformUploadArena.buffer || requiredEnd > drawUniformUploadArena.buffer.length) {
-		NSUInteger capacity = std::max<NSUInteger>(256 * 1024, requiredEnd);
-		if (drawUniformUploadArena.buffer && drawUniformUploadArena.buffer.length <= ctx.device.maxBufferLength / 2) {
-			capacity = std::max(capacity, drawUniformUploadArena.buffer.length * 2);
+	if (!arena->buffer || requiredEnd > arena->buffer.length) {
+		NSUInteger capacity = std::max<NSUInteger>(minimumCapacity, requiredEnd);
+		if (arena->buffer && arena->buffer.length <= ctx.device.maxBufferLength / 2) {
+			capacity = std::max(capacity, arena->buffer.length * 2);
 		}
 		capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
 		if (capacity < length) return false;
 		id<MTLBuffer> expanded = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
 		if (!expanded) return false;
-		// Encoders already reference the old arena buffer; command-buffer retention
-		// keeps it alive while subsequent allocations continue in the replacement.
-		drawUniformUploadArena.buffer = expanded;
-		drawUniformUploadArena.used = 0;
+		// Earlier encoders retain the previous allocation until this command buffer
+		// completes. The replacement is used only by subsequent draw commands.
+		arena->buffer = expanded;
+		arena->used = 0;
 		offset = 0;
 		requiredEnd = length;
 	}
-	destinationBuffer = drawUniformUploadArena.buffer;
+	destinationBuffer = arena->buffer;
 	destinationOffset = offset;
-	if (destinationContents) *destinationContents = (uint8_t *)destinationBuffer.contents + destinationOffset;
-	drawUniformUploadArena.used = requiredEnd;
-	return destinationBuffer.contents != nullptr;
+	void *contents = destinationBuffer.contents;
+	if (!contents) return false;
+	if (destinationContents) *destinationContents = (uint8_t *)contents + destinationOffset;
+	arena->used = requiredEnd;
+	return true;
 }
 
 bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
 	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
 	if (!source || length == 0) return false;
 	void *destination = nullptr;
-	if (!allocateDrawTransientBuffer(length, 256, destinationBuffer, destinationOffset, &destination)) return false;
+	if (!allocateDrawTransientBuffer(length, 256, 256 * 1024, destinationBuffer, destinationOffset, &destination)) return false;
 	memcpy(destination, source, (size_t)length);
 	return true;
 }
@@ -1229,24 +1252,41 @@ struct VertexIndexRange {
 	uint64_t maxIndex = 0;
 };
 
-static id<MTLBuffer> createTemporaryIndexBuffer(const std::vector<uint32_t> &indices, const char *caller) {
+static bool createTemporaryIndexBuffer(const std::vector<uint32_t> &indices, const char *caller,
+	__strong id<MTLBuffer> &buffer, NSUInteger &bufferOffset) {
+	buffer = nil;
+	bufferOffset = 0;
 	if (indices.empty() || !ctx.device || indices.size() > SIZE_MAX / sizeof(uint32_t)) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("%s: temporary index-buffer size overflow or empty input", caller);
-		return nil;
+		return false;
 	}
 	const NSUInteger byteLength = (NSUInteger)(indices.size() * sizeof(uint32_t));
 	if (byteLength > ctx.device.maxBufferLength) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("%s: temporary index buffer (%llu bytes) exceeds Metal maxBufferLength", caller, (unsigned long long)byteLength);
-		return nil;
+		return false;
 	}
-	id<MTLBuffer> buffer = [ctx.device newBufferWithBytes:indices.data() length:byteLength options:MTLResourceStorageModeShared];
+
+	// Reuse the command-buffer transient arena instead of allocating one MTLBuffer
+	// per converted draw. Metal retains the arena buffer for every encoded draw, so
+	// slices remain valid until this command buffer completes.
+	void *destination = nullptr;
+	if (allocateDrawTransientBuffer(byteLength, alignof(uint32_t), 32 * 1024,
+		buffer, bufferOffset, &destination)) {
+		memcpy(destination, indices.data(), (size_t)byteLength);
+		return true;
+	}
+
+	// Keep a conservative fallback for transient-arena allocation failure.
+	buffer = [ctx.device newBufferWithBytes:indices.data() length:byteLength options:MTLResourceStorageModeShared];
+	bufferOffset = 0;
 	if (!buffer) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("%s: Metal failed to allocate %llu-byte temporary index buffer", caller, (unsigned long long)byteLength);
+		return false;
 	}
-	return buffer;
+	return true;
 }
 
 static bool validateVertexFetchRanges(const DrawCall &dc, const char *caller,
@@ -1606,7 +1646,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// Record all GL buffers consumed by this draw in one GL-thread batch. CPU updates can
 	// rename only in-flight storage without a mutex or per-attribute map operation.
 	auto markActiveDrawBuffers = [&](GLuint elementBuffer) {
-		std::array<GLuint, 48> names{}; // 16 vertex streams + 28 combined-stage UBOs + one EBO
+		std::array<GLuint, 128> names{}; // vertex streams + UBOs + SSBOs + element buffer
 		size_t count = 0;
 		auto appendUnique = [&](GLuint draw_id) {
 			if (draw_id == 0) return;
@@ -1623,6 +1663,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		for (const ProgramBlock &block : p.blocks) {
 			if (block.info.stage[0].present || block.info.stage[1].present) {
 				appendUnique(ctx.uniform_buffer_bindings[block.binding_point].buffer);
+			}
+		}
+		for (const TranslatedStorageBuffer &storageInfo : p.storage_buffers) {
+			if (storageInfo.stage[0].present || storageInfo.stage[1].present) {
+				appendUnique(ctx.shader_storage_buffer_bindings[storageInfo.binding].buffer);
 			}
 		}
 		appendUnique(elementBuffer);
@@ -1662,12 +1707,106 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 	}
 
+	// SSBOs and named UBOs share the Metal buffer namespace. The translator
+	// reserves vertex slots 0...15 for attributes, fragment slot 15 for gl_FragCoord,
+	// slot 29 for SPIRV-Cross OpArrayLength, and slot 30 for loose uniforms.
+	std::array<uint32_t, GL4METAL_BUFFER_SIZE_BUFFER_INDEX + 1> vertexBufferSizes{};
+	std::array<uint32_t, GL4METAL_BUFFER_SIZE_BUFFER_INDEX + 1> fragmentBufferSizes{};
+	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX> usedVertexBufferSlots{};
+	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX> usedFragmentBufferSlots{};
+	for (size_t slot = 0; slot < 16; ++slot) usedVertexBufferSlots[slot] = true;
+	usedFragmentBufferSlots[GL4METAL_FRAGCOORD_BUFFER_INDEX] = true;
+
+	for (const TranslatedStorageBuffer &storageInfo : p.storage_buffers) {
+		if (storageInfo.binding >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: SSBO '%s' has invalid GL binding point %u; draw skipped",
+				caller, storageInfo.name.c_str(), storageInfo.binding);
+			return;
+		}
+		const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[storageInfo.binding];
+		auto bound = ctx.buffer_objects.find(binding.buffer);
+		if (binding.buffer == 0 || bound == ctx.buffer_objects.end() || !bound->second) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: active shader storage block '%s' has no buffer at binding point %u; draw skipped",
+				caller, storageInfo.name.c_str(), storageInfo.binding);
+			return;
+		}
+		if (binding.offset < 0 || (binding.offset & 15) != 0) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: SSBO '%s' has invalid 16-byte-aligned offset %lld; draw skipped",
+				caller, storageInfo.name.c_str(), (long long)binding.offset);
+			return;
+		}
+		const NSUInteger logicalLength = glBufferLogicalSize(binding.buffer);
+		const NSUInteger offset = (NSUInteger)binding.offset;
+		if (offset > logicalLength) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: SSBO '%s' offset exceeds its buffer store; draw skipped", caller, storageInfo.name.c_str());
+			return;
+		}
+		const NSUInteger available = logicalLength - offset;
+		const NSUInteger rangeSize = binding.size == 0 ? available :
+			(binding.size < 0 ? 0 : (NSUInteger)binding.size);
+		if (binding.size < 0 || rangeSize > available || rangeSize < storageInfo.required_size ||
+			offset > bound->second.length || rangeSize > bound->second.length - offset) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: SSBO '%s' needs at least %u bytes but binding %u exposes %llu bytes; draw skipped",
+				caller, storageInfo.name.c_str(), storageInfo.required_size, storageInfo.binding,
+				(unsigned long long)rangeSize);
+			return;
+		}
+		if (storageInfo.stage[0].present) {
+			const uint32_t slot = storageInfo.stage[0].slot;
+			if (slot < 16 || slot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX || usedVertexBufferSlots[slot]) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: SSBO '%s' collides with a vertex-stage Metal buffer slot %u; draw skipped",
+					caller, storageInfo.name.c_str(), slot);
+				return;
+			}
+			usedVertexBufferSlots[slot] = true;
+			if (p.needs_buffer_size_buffer[0]) {
+				if (rangeSize > (NSUInteger)UINT32_MAX) {
+					gl4metalSetError(GL_INVALID_OPERATION);
+					GL4METAL_LOG("%s: SSBO '%s' range exceeds SPIRV-Cross 32-bit OpArrayLength size limits; draw skipped", caller, storageInfo.name.c_str());
+					return;
+				}
+				vertexBufferSizes[slot] = (uint32_t)rangeSize;
+			}
+			bindVertexBufferCached(encoderCache, enc, bound->second, offset, slot);
+		}
+		if (storageInfo.stage[1].present) {
+			const uint32_t slot = storageInfo.stage[1].slot;
+			if (slot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX || slot == GL4METAL_FRAGCOORD_BUFFER_INDEX || usedFragmentBufferSlots[slot]) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("%s: SSBO '%s' collides with a fragment-stage Metal buffer slot %u; draw skipped",
+					caller, storageInfo.name.c_str(), slot);
+				return;
+			}
+			usedFragmentBufferSlots[slot] = true;
+			if (p.needs_buffer_size_buffer[1]) {
+				if (rangeSize > (NSUInteger)UINT32_MAX) {
+					gl4metalSetError(GL_INVALID_OPERATION);
+					GL4METAL_LOG("%s: SSBO '%s' range exceeds SPIRV-Cross 32-bit OpArrayLength size limits; draw skipped", caller, storageInfo.name.c_str());
+					return;
+				}
+				fragmentBufferSizes[slot] = (uint32_t)rangeSize;
+			}
+			bindFragmentBufferCached(encoderCache, enc, bound->second, offset, slot);
+		}
+	}
+
+	if (p.needs_buffer_size_buffer[0]) {
+		[enc setVertexBytes:vertexBufferSizes.data() length:sizeof(vertexBufferSizes)
+			atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+	}
+	if (p.needs_buffer_size_buffer[1]) {
+		[enc setFragmentBytes:fragmentBufferSizes.data() length:sizeof(fragmentBufferSizes)
+			atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+	}
+
 	// Uniform blocks: never leave an active MSL buffer slot unset or reuse a stale binding.
-	// The translator allocates MSL slots 16...29 per stage independently of GL binding points; slot 30 is the default block.
-	// MSL UBO slots are a small fixed range (16..29); stack bitsets avoid two
-	// unordered_set allocations and hash lookups on every draw.
-	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX - 16> usedVertexBlockSlots{};
-	std::array<bool, GL4METAL_UNIFORM_BUFFER_INDEX - 16> usedFragmentBlockSlots{};
+	// SSBO and UBO slots are dynamically allocated per stage, with slot 30 reserved for default uniforms.
 	for (const ProgramBlock &block : p.blocks) {
 		if (!block.info.stage[0].present && !block.info.stage[1].present) continue;
 		if (block.binding_point >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS) {
@@ -1676,22 +1815,23 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				caller, block.info.name.c_str(), block.binding_point);
 			return;
 		}
-		if ((block.info.stage[0].present && (block.info.stage[0].slot < 16 || block.info.stage[0].slot >= GL4METAL_UNIFORM_BUFFER_INDEX)) ||
-			(block.info.stage[1].present && (block.info.stage[1].slot < 16 || block.info.stage[1].slot >= GL4METAL_UNIFORM_BUFFER_INDEX))) {
+		if ((block.info.stage[0].present && (block.info.stage[0].slot < 16 || block.info.stage[0].slot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX)) ||
+			(block.info.stage[1].present && (block.info.stage[1].slot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX ||
+				block.info.stage[1].slot == GL4METAL_FRAGCOORD_BUFFER_INDEX))) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("%s: uniform block '%s' maps to a reserved/out-of-range Metal buffer slot (VS=%u FS=%u); draw skipped",
 				caller, block.info.name.c_str(), block.info.stage[0].slot, block.info.stage[1].slot);
 			return;
 		}
-		if ((block.info.stage[0].present && usedVertexBlockSlots[block.info.stage[0].slot - 16]) ||
-			(block.info.stage[1].present && usedFragmentBlockSlots[block.info.stage[1].slot - 16])) {
+		if ((block.info.stage[0].present && usedVertexBufferSlots[block.info.stage[0].slot]) ||
+			(block.info.stage[1].present && usedFragmentBufferSlots[block.info.stage[1].slot])) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("%s: multiple uniform blocks collide on a Metal buffer slot; block '%s' draw skipped",
 				caller, block.info.name.c_str());
 			return;
 		}
-		if (block.info.stage[0].present) usedVertexBlockSlots[block.info.stage[0].slot - 16] = true;
-		if (block.info.stage[1].present) usedFragmentBlockSlots[block.info.stage[1].slot - 16] = true;
+		if (block.info.stage[0].present) usedVertexBufferSlots[block.info.stage[0].slot] = true;
+		if (block.info.stage[1].present) usedFragmentBufferSlots[block.info.stage[1].slot] = true;
 		const UniformBufferBinding &binding = ctx.uniform_buffer_bindings[block.binding_point];
 		auto bound = ctx.buffer_objects.find(binding.buffer);
 		if (binding.buffer == 0 || bound == ctx.buffer_objects.end() || !bound->second) {
@@ -1900,10 +2040,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			gl4metalSetError(GL_OUT_OF_MEMORY);
 			return;
 		}
-		id<MTLBuffer> tmp = createTemporaryIndexBuffer(indices, caller);
-		if (!tmp) return;
+		__strong id<MTLBuffer> tmp = nil;
+		NSUInteger tmpOffset = 0;
+		if (!createTemporaryIndexBuffer(indices, caller, tmp, tmpOffset)) return;
 		markActiveDrawBuffers(0);
-		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
+		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:tmpOffset
 					 instanceCount:(NSUInteger)dc.instances baseVertex:0 baseInstance:0];
 		markDefaultFramebufferAttachmentsWritten();
 		return;
@@ -2012,18 +2153,19 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	if (indices.empty()) return;
-	id<MTLBuffer> tmp = createTemporaryIndexBuffer(indices, caller);
-	if (!tmp) return;
+	__strong id<MTLBuffer> tmp = nil;
+	NSUInteger tmpOffset = 0;
+	if (!createTemporaryIndexBuffer(indices, caller, tmp, tmpOffset)) return;
 	markActiveDrawBuffers(vao.retains_deleted_element_buffer ? 0 : vao.element_array_buffer_id);
 	if (primitiveRestart && !fan) {
 		for (const auto &segment : segments) {
 			if (segment.second == 0) continue;
 			[enc drawIndexedPrimitives:prim indexCount:segment.second indexType:MTLIndexTypeUInt32 indexBuffer:tmp
-				indexBufferOffset:segment.first * sizeof(uint32_t) instanceCount:(NSUInteger)dc.instances
+				indexBufferOffset:tmpOffset + segment.first * sizeof(uint32_t) instanceCount:(NSUInteger)dc.instances
 				baseVertex:dc.baseVertex baseInstance:0];
 		}
 	} else {
-		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:0
+		[enc drawIndexedPrimitives:prim indexCount:indices.size() indexType:MTLIndexTypeUInt32 indexBuffer:tmp indexBufferOffset:tmpOffset
 				 instanceCount:(NSUInteger)dc.instances baseVertex:dc.baseVertex baseInstance:0];
 	}
 	markDefaultFramebufferAttachmentsWritten();

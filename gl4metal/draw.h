@@ -4,8 +4,8 @@
 #import "gl4metal.h"
 #import "framebuffer.h"
 
-// Release the CPU-side reference to the per-command-buffer large-uniform upload arena after submission.
-void resetDrawUniformUploadArena(id<MTLCommandBuffer> commandBuffer);
+// Release the CPU-side reference to the per-command-buffer transient upload arena after submission.
+void resetDrawTransientUploadArena(id<MTLCommandBuffer> commandBuffer);
 id<MTLTexture> gl4metalFallbackTextureForUniform(const TranslatedUniform &uniform);
 id<MTLSamplerState> gl4metalFallbackSampler(void);
 id<MTLSamplerState> gl4metalSamplerForTexture(const TextureObject &texture, GLuint textureUnit);

@@ -5,6 +5,8 @@
 
 #include <mutex>
 #include <atomic>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 
@@ -361,6 +363,8 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 	program.compute_workgroup_size[2] = translated.workgroup_size[2];
 	program.storage_buffers = translated.storage_buffers;
 	program.storage_images = translated.storage_images;
+	for (int stage = 0; stage < 3; ++stage)
+		program.needs_buffer_size_buffer[stage] = translated.needs_buffer_size_buffer[stage];
 	program.image_units.clear();
 	program.image_units.reserve(program.storage_images.size());
 	for (const TranslatedImage &imageInfo : program.storage_images) {
@@ -508,8 +512,12 @@ static bool resolveComputeBuffer(GLuint buffer_id, GLintptr offset, GLsizeiptr b
 	}
 	const NSUInteger remaining = logicalSize - start;
 	const NSUInteger requested = boundSize > 0 ? (NSUInteger)boundSize : remaining;
+	// A GL range binding may intentionally expose only a subrange of the backing
+	// store. Runtime-sized GLSL arrays are bounded by that range; requiring the
+	// range to equal the entire allocation incorrectly rejects valid bindBufferRange.
+	(void)runtimeSized;
 	if (requested > remaining || requested < (NSUInteger)requiredSize ||
-		(runtimeSized && requested != remaining) || start > bufferFound->second.length ||
+		start > bufferFound->second.length ||
 		requested > bufferFound->second.length - start) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		return false;
@@ -609,6 +617,7 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 	if (indirect) addUniqueBufferName(usedBufferNames, indirectBufferName);
 
 	// Resolve every buffer and check its logical GL range before creating an encoder.
+	std::array<uint32_t, GL4METAL_BUFFER_SIZE_BUFFER_INDEX + 1> computeBufferSizes{};
 	for (const TranslatedStorageBuffer &storageInfo : program->storage_buffers) {
 		if (storageInfo.binding >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS || storageInfo.slot >= 16) {
 			gl4metalSetError(GL_INVALID_OPERATION);
@@ -616,6 +625,12 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 			return;
 		}
 		const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[storageInfo.binding];
+		if (binding.offset < 0 || (binding.offset & 15) != 0) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glDispatchCompute: SSBO '%s' has invalid 16-byte-aligned offset %lld",
+				storageInfo.name.c_str(), (long long)binding.offset);
+			return;
+		}
 		ComputeBufferBinding resolved;
 		if (!resolveComputeBuffer(binding.buffer, binding.offset, binding.size, storageInfo.required_size,
 			storageInfo.runtime_sized, resolved.buffer, resolved.offset, resolved.size)) {
@@ -624,16 +639,24 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 			return;
 		}
 		resolved.slot = storageInfo.slot;
+		if (program->needs_buffer_size_buffer[2]) {
+			if (resolved.size > (NSUInteger)UINT32_MAX) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("glDispatchCompute: SSBO '%s' range exceeds SPIRV-Cross 32-bit OpArrayLength size limits", storageInfo.name.c_str());
+				return;
+			}
+			computeBufferSizes[storageInfo.slot] = (uint32_t)resolved.size;
+		}
 		storageBufferBindings.push_back(resolved);
 		addUniqueBufferName(usedBufferNames, binding.buffer);
 	}
 
-	// UBO indices map into Metal buffer slots 16...29; loose uniforms use slot 30.
+	// UBO indices map into Metal buffer slots 16...28; slot 29 carries SSBO lengths and loose uniforms use slot 30.
 	for (const ProgramBlock &block : program->blocks) {
 		const TranslatedBlock::Stage &stage = block.info.stage[2];
 		if (!stage.present) continue;
 		if (block.binding_point >= GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS || stage.slot < 16 ||
-			stage.slot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
+			stage.slot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("glDispatchCompute: invalid UBO binding/Metal slot for '%s'", block.info.name.c_str());
 			return;
@@ -803,6 +826,10 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 	}
 	for (const ComputeBufferBinding &binding : uniformBufferBindings) {
 		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
+	}
+	if (program->needs_buffer_size_buffer[2]) {
+		[computeEncoder setBytes:computeBufferSizes.data()
+			length:sizeof(computeBufferSizes) atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
 	}
 	if (!program->uniform_data[2].empty()) {
 		const std::vector<uint8_t> &uniformBytes = program->uniform_data[2];
@@ -987,7 +1014,7 @@ void glLinkProgram(GLuint program) {
 
 	// GLSL -> SPIR-V -> MSL for both stages at once (see shadertranslator.cpp).
 	TranslatedProgram tp;
-	if (!translateProgram(vs->source, fs->source, tp)) {
+	if (!translateProgram(vs->source, fs->source, tp, p.frag_data_bindings)) {
 		p.info_log = tp.log;
 		GL4METAL_LOG("glLinkProgram(%u): translation failed:\n%s", program, tp.log.c_str());
 		return;
@@ -1020,6 +1047,12 @@ void glLinkProgram(GLuint program) {
 		GL4METAL_LOG("glLinkProgram(%u): %s", program, p.info_log.c_str());
 		return;
 	}
+
+	// The translator reflects storage blocks independently of UBOs and samplers.
+	// Preserve this GL-facing reflection for indexed binding and program-interface queries.
+	p.storage_buffers = tp.storage_buffers;
+	for (int stage = 0; stage < 3; ++stage)
+		p.needs_buffer_size_buffer[stage] = tp.needs_buffer_size_buffer[stage];
 
 	// Vertex attributes: honour glBindAttribLocation first, then give the rest the lowest free index.
 	bool used[16] = {};
@@ -1160,6 +1193,10 @@ void glValidateProgram(GLuint program) {
 }
 
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
+	if (!params) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	ProgramObject *p = findProgram(program);
 	if (!p) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -1290,11 +1327,30 @@ void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *l
 // MARK: - Fragment output locations
 
 void glBindFragDataLocation(GLuint program, GLuint color, const GLchar *name) {
-	// one colour output: the translator numbers it 0
+	ProgramObject *p = findProgram(program);
+	if (!p || !name || !name[0] || color >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glBindFragDataLocation: invalid program %u, color %u or output name", program, color);
+		return;
+	}
+	if (strncmp(name, "gl_", 3) == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBindFragDataLocation: output name '%s' uses the reserved gl_ prefix", name);
+		return;
+	}
+	p->frag_data_bindings[name] = color; // takes effect at the next glLinkProgram
 }
 
 void glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint index, const GLchar *name) {
-	// dual-source blending is not supported
+	if (!findProgram(program) || !name || !name[0] || colorNumber >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (index != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION); // dual-source fragment outputs are not supported
+		return;
+	}
+	glBindFragDataLocation(program, colorNumber, name);
 }
 
 GLint glGetFragDataLocation(GLuint program, const GLchar *name) {

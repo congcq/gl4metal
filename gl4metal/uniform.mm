@@ -464,6 +464,342 @@ void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint unif
 	it->second.blocks[uniformBlockIndex].binding_point = uniformBlockBinding;
 }
 
+
+// MARK: - Shader-storage block / program-resource introspection
+
+static GLenum storageVariableGLType(const TranslatedUniform &uniform) {
+	const int rows = std::max(1, std::min(uniform.vecsize, 4));
+	if (uniform.columns > 1) {
+		if (uniform.columns == rows) {
+			static const GLenum squareTypes[] = { GL_FLOAT_MAT2, GL_FLOAT_MAT3, GL_FLOAT_MAT4 };
+			return (uniform.columns >= 2 && uniform.columns <= 4) ? squareTypes[uniform.columns - 2] : GL_FLOAT_MAT4;
+		}
+		static const GLenum matrixTypes[4][4] = {
+			{ 0, 0, 0, 0 },
+			{ 0, 0, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4 },
+			{ 0, GL_FLOAT_MAT3x2, 0, GL_FLOAT_MAT3x4 },
+			{ 0, GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, 0 }
+		};
+		if (uniform.columns >= 2 && uniform.columns <= 4 && rows >= 2 && rows <= 4)
+			return matrixTypes[uniform.columns][rows];
+	}
+	static const GLenum floatTypes[] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
+	static const GLenum intTypes[] = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
+	static const GLenum uintTypes[] = { GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4 };
+	static const GLenum boolTypes[] = { GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4 };
+	switch (uniform.kind) {
+		case TranslatedUniform::Int: return intTypes[rows - 1];
+		case TranslatedUniform::UInt: return uintTypes[rows - 1];
+		case TranslatedUniform::Bool: return boolTypes[rows - 1];
+		default: return floatTypes[rows - 1];
+	}
+}
+
+static std::string storageVariableResourceName(const TranslatedUniform &member) {
+	return member.array_size != 1 ? member.name + "[0]" : member.name;
+}
+
+static bool getStorageVariableByIndex(const ProgramObject &program, GLuint resourceIndex,
+	GLuint &blockIndex, const TranslatedStorageBuffer *&block, const TranslatedUniform *&member) {
+	GLuint currentIndex = 0;
+	for (size_t candidateBlock = 0; candidateBlock < program.storage_buffers.size(); ++candidateBlock) {
+		const TranslatedStorageBuffer &candidate = program.storage_buffers[candidateBlock];
+		for (const TranslatedUniform &candidateMember : candidate.members) {
+			if (currentIndex == resourceIndex) {
+				blockIndex = (GLuint)candidateBlock;
+				block = &candidate;
+				member = &candidateMember;
+				return true;
+			}
+			++currentIndex;
+		}
+	}
+	return false;
+}
+
+void glGetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	auto programIt = ctx.program_objects.find(program);
+	if (programIt == ctx.program_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		*params = 0;
+		return;
+	}
+	if (!programIt->second.linked) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		*params = 0;
+		return;
+	}
+	const ProgramObject &object = programIt->second;
+	if (programInterface != GL_SHADER_STORAGE_BLOCK && programInterface != GL_BUFFER_VARIABLE) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		*params = 0;
+		return;
+	}
+	size_t resourceCount = 0;
+	size_t maxNameLength = 0;
+	size_t maxVariables = 0;
+	if (programInterface == GL_SHADER_STORAGE_BLOCK) {
+		resourceCount = object.storage_buffers.size();
+		for (const TranslatedStorageBuffer &block : object.storage_buffers) {
+			maxNameLength = std::max(maxNameLength, block.name.size() + 1);
+			maxVariables = std::max(maxVariables, block.members.size());
+		}
+	} else {
+		for (const TranslatedStorageBuffer &block : object.storage_buffers) {
+			resourceCount += block.members.size();
+			for (const TranslatedUniform &member : block.members)
+				maxNameLength = std::max(maxNameLength, storageVariableResourceName(member).size() + 1);
+		}
+	}
+	switch (pname) {
+		case GL_ACTIVE_RESOURCES: *params = (GLint)resourceCount; break;
+		case GL_MAX_NAME_LENGTH: *params = (GLint)maxNameLength; break;
+		case GL_MAX_NUM_ACTIVE_VARIABLES:
+			if (programInterface != GL_SHADER_STORAGE_BLOCK) {
+				gl4metalSetError(GL_INVALID_OPERATION); *params = 0;
+			} else *params = (GLint)maxVariables;
+			break;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			*params = 0;
+			break;
+	}
+}
+
+GLuint glGetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar *name) {
+	if (!name) { gl4metalSetError(GL_INVALID_VALUE); return GL_INVALID_INDEX; }
+	auto programIt = ctx.program_objects.find(program);
+	if (programIt == ctx.program_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return GL_INVALID_INDEX;
+	}
+	if (!programIt->second.linked) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return GL_INVALID_INDEX;
+	}
+	const ProgramObject &object = programIt->second;
+	if (programInterface == GL_SHADER_STORAGE_BLOCK) {
+		for (size_t blockIndex = 0; blockIndex < object.storage_buffers.size(); ++blockIndex)
+			if (object.storage_buffers[blockIndex].name == name) return (GLuint)blockIndex;
+	} else if (programInterface == GL_BUFFER_VARIABLE) {
+		GLuint resourceIndex = 0;
+		for (const TranslatedStorageBuffer &block : object.storage_buffers) {
+			for (const TranslatedUniform &member : block.members) {
+				const std::string resourceName = storageVariableResourceName(member);
+				if (resourceName == name || (member.array_size != 1 && member.name == name)) return resourceIndex;
+				++resourceIndex;
+			}
+		}
+	} else {
+		gl4metalSetError(GL_INVALID_ENUM);
+	}
+	return GL_INVALID_INDEX;
+}
+
+void glGetProgramResourceName(GLuint program, GLenum programInterface, GLuint index,
+	GLsizei bufSize, GLsizei *length, GLchar *name) {
+	if (bufSize < 0 || (bufSize > 0 && !name)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
+		return;
+	}
+	auto programIt = ctx.program_objects.find(program);
+	if (programIt == ctx.program_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
+		return;
+	}
+	if (!programIt->second.linked) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		if (length) *length = 0;
+		return;
+	}
+	const ProgramObject &object = programIt->second;
+	if (programInterface == GL_SHADER_STORAGE_BLOCK) {
+		if (index >= object.storage_buffers.size()) { gl4metalSetError(GL_INVALID_VALUE); if (length) *length = 0; return; }
+		copyGLString(object.storage_buffers[index].name, bufSize, length, name);
+		return;
+	}
+	if (programInterface == GL_BUFFER_VARIABLE) {
+		GLuint blockIndex = 0;
+		const TranslatedStorageBuffer *block = nullptr;
+		const TranslatedUniform *member = nullptr;
+		if (!getStorageVariableByIndex(object, index, blockIndex, block, member)) {
+			gl4metalSetError(GL_INVALID_VALUE); if (length) *length = 0; return;
+		}
+		copyGLString(storageVariableResourceName(*member), bufSize, length, name);
+		return;
+	}
+	gl4metalSetError(GL_INVALID_ENUM);
+	if (length) *length = 0;
+}
+
+void glGetProgramResourceiv(GLuint program, GLenum programInterface, GLuint index,
+	GLsizei propCount, const GLenum *props, GLsizei bufSize, GLsizei *length, GLint *params) {
+	if (length) *length = 0;
+	if (propCount <= 0 || bufSize < 0 || !props || (bufSize != 0 && !params)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	auto programIt = ctx.program_objects.find(program);
+	if (programIt == ctx.program_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (!programIt->second.linked) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	const ProgramObject &object = programIt->second;
+	const TranslatedStorageBuffer *storageBlock = nullptr;
+	const TranslatedUniform *storageMember = nullptr;
+	GLuint parentBlockIndex = 0;
+	if (programInterface == GL_SHADER_STORAGE_BLOCK) {
+		if (index >= object.storage_buffers.size()) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		storageBlock = &object.storage_buffers[index];
+	} else if (programInterface == GL_BUFFER_VARIABLE) {
+		if (!getStorageVariableByIndex(object, index, parentBlockIndex, storageBlock, storageMember)) {
+			gl4metalSetError(GL_INVALID_VALUE); return;
+		}
+	} else {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+
+	auto stageReferenced = [](bool vertexPresent, bool fragmentPresent, bool computePresent, GLenum property) -> GLint {
+		switch (property) {
+			case GL_REFERENCED_BY_VERTEX_SHADER: return vertexPresent ? GL_TRUE : GL_FALSE;
+			case GL_REFERENCED_BY_TESS_CONTROL_SHADER:
+			case GL_REFERENCED_BY_TESS_EVALUATION_SHADER:
+			case GL_REFERENCED_BY_GEOMETRY_SHADER: return GL_FALSE;
+			case GL_REFERENCED_BY_FRAGMENT_SHADER: return fragmentPresent ? GL_TRUE : GL_FALSE;
+			case GL_REFERENCED_BY_COMPUTE_SHADER: return computePresent ? GL_TRUE : GL_FALSE;
+			default: return -1;
+		}
+	};
+	auto memberStage = [](const TranslatedUniform &member) -> const TranslatedUniform::Stage & {
+		return member.stage[member.stage[0].present ? 0 : (member.stage[1].present ? 1 : 2)];
+	};
+	auto isReferencedStageProperty = [](GLenum property) {
+		return property == GL_REFERENCED_BY_VERTEX_SHADER ||
+			property == GL_REFERENCED_BY_TESS_CONTROL_SHADER ||
+			property == GL_REFERENCED_BY_TESS_EVALUATION_SHADER ||
+			property == GL_REFERENCED_BY_GEOMETRY_SHADER ||
+			property == GL_REFERENCED_BY_FRAGMENT_SHADER ||
+			property == GL_REFERENCED_BY_COMPUTE_SHADER;
+	};
+	auto isKnownResourceProperty = [](GLenum property) {
+		switch (property) {
+			case GL_NAME_LENGTH:
+			case GL_TYPE:
+			case GL_ARRAY_SIZE:
+			case GL_OFFSET:
+			case GL_BLOCK_INDEX:
+			case GL_ARRAY_STRIDE:
+			case GL_MATRIX_STRIDE:
+			case GL_IS_ROW_MAJOR:
+			case GL_BUFFER_BINDING:
+			case GL_BUFFER_DATA_SIZE:
+			case GL_NUM_ACTIVE_VARIABLES:
+			case GL_ACTIVE_VARIABLES:
+			case GL_REFERENCED_BY_VERTEX_SHADER:
+			case GL_REFERENCED_BY_TESS_CONTROL_SHADER:
+			case GL_REFERENCED_BY_TESS_EVALUATION_SHADER:
+			case GL_REFERENCED_BY_GEOMETRY_SHADER:
+			case GL_REFERENCED_BY_FRAGMENT_SHADER:
+			case GL_REFERENCED_BY_COMPUTE_SHADER:
+			case GL_TOP_LEVEL_ARRAY_SIZE:
+			case GL_TOP_LEVEL_ARRAY_STRIDE:
+				return true;
+			default:
+				return false;
+		}
+	};
+	GLsizei written = 0;
+	auto appendValue = [&](GLint value) {
+		if (written < bufSize) params[written++] = value;
+	};
+	for (GLsizei propIndex = 0; propIndex < propCount; ++propIndex) {
+		const GLenum property = props[propIndex];
+		if (!isKnownResourceProperty(property)) {
+			gl4metalSetError(GL_INVALID_ENUM);
+			continue;
+		}
+		const bool allowedForInterface = programInterface == GL_SHADER_STORAGE_BLOCK
+			? (property == GL_NAME_LENGTH || property == GL_BUFFER_BINDING || property == GL_BUFFER_DATA_SIZE ||
+				property == GL_NUM_ACTIVE_VARIABLES || property == GL_ACTIVE_VARIABLES || isReferencedStageProperty(property))
+			: (property == GL_NAME_LENGTH || property == GL_TYPE || property == GL_ARRAY_SIZE ||
+				property == GL_OFFSET || property == GL_BLOCK_INDEX || property == GL_ARRAY_STRIDE ||
+				property == GL_MATRIX_STRIDE || property == GL_IS_ROW_MAJOR ||
+				property == GL_TOP_LEVEL_ARRAY_SIZE || property == GL_TOP_LEVEL_ARRAY_STRIDE ||
+				isReferencedStageProperty(property));
+		if (!allowedForInterface) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			continue;
+		}
+		if (programInterface == GL_SHADER_STORAGE_BLOCK) {
+			const GLint referenced = stageReferenced(storageBlock->stage[0].present,
+				storageBlock->stage[1].present, storageBlock->stage[2].present, property);
+			if (referenced >= 0) { appendValue(referenced); continue; }
+			switch (property) {
+				case GL_BUFFER_BINDING: appendValue((GLint)storageBlock->binding); break;
+				case GL_BUFFER_DATA_SIZE: appendValue((GLint)storageBlock->required_size); break;
+				case GL_NUM_ACTIVE_VARIABLES: appendValue((GLint)storageBlock->members.size()); break;
+				case GL_ACTIVE_VARIABLES: {
+					GLuint baseIndex = 0;
+					for (size_t blockIndex = 0; blockIndex < index; ++blockIndex)
+						baseIndex += (GLuint)object.storage_buffers[blockIndex].members.size();
+					for (size_t memberIndex = 0; memberIndex < storageBlock->members.size() && written < bufSize; ++memberIndex)
+						appendValue((GLint)(baseIndex + (GLuint)memberIndex));
+					break;
+				}
+				case GL_NAME_LENGTH: appendValue((GLint)storageBlock->name.size() + 1); break;
+				default: gl4metalSetError(GL_INVALID_ENUM); break;
+			}
+		} else {
+			const TranslatedUniform::Stage &stage = memberStage(*storageMember);
+			const GLint referenced = stageReferenced(storageMember->stage[0].present,
+				storageMember->stage[1].present, storageMember->stage[2].present, property);
+			if (referenced >= 0) { appendValue(referenced); continue; }
+			switch (property) {
+				case GL_TYPE: appendValue((GLint)storageVariableGLType(*storageMember)); break;
+				case GL_ARRAY_SIZE: appendValue(storageMember->array_size); break;
+				case GL_OFFSET: appendValue((GLint)stage.offset); break;
+				case GL_ARRAY_STRIDE: appendValue((GLint)stage.array_stride); break;
+				case GL_MATRIX_STRIDE: appendValue((GLint)stage.matrix_stride); break;
+				case GL_IS_ROW_MAJOR: appendValue(stage.row_major ? GL_TRUE : GL_FALSE); break;
+				case GL_BLOCK_INDEX: appendValue((GLint)parentBlockIndex); break;
+				case GL_TOP_LEVEL_ARRAY_SIZE: appendValue(storageMember->array_size); break;
+				case GL_TOP_LEVEL_ARRAY_STRIDE: appendValue((GLint)stage.array_stride); break;
+				case GL_NAME_LENGTH: appendValue((GLint)storageVariableResourceName(*storageMember).size() + 1); break;
+				default: gl4metalSetError(GL_INVALID_ENUM); break;
+			}
+		}
+	}
+	if (length) *length = written;
+}
+
+void glShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding) {
+	auto programIt = ctx.program_objects.find(program);
+	if (programIt == ctx.program_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (!programIt->second.linked) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	if (storageBlockIndex >= programIt->second.storage_buffers.size() ||
+		storageBlockBinding >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glShaderStorageBlockBinding: invalid block %u or binding point %u",
+			storageBlockIndex, storageBlockBinding);
+		return;
+	}
+	programIt->second.storage_buffers[storageBlockIndex].binding = storageBlockBinding;
+}
+
 // MARK: - Setting uniforms
 
 void glUniform1f(GLint location, GLfloat v0) {

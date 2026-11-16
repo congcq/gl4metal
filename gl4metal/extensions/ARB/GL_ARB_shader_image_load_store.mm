@@ -58,10 +58,24 @@ void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean laye
 }
 
 void glMemoryBarrier(GLbitfield barriers) {
-	(void)barriers; // Metal command encoders provide ordered resource hazards for implemented resources.
-	if (ctx.currentComputeEncoder) {
-		[ctx.currentComputeEncoder endEncoding];
-		ctx.currentComputeEncoder = nil;
+	constexpr GLbitfield validBarrierBits =
+		GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT |
+		GL_UNIFORM_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+		GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_COMMAND_BARRIER_BIT |
+		GL_PIXEL_BUFFER_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT |
+		GL_BUFFER_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT |
+		GL_TRANSFORM_FEEDBACK_BARRIER_BIT | GL_ATOMIC_COUNTER_BARRIER_BIT |
+		GL_SHADER_STORAGE_BARRIER_BIT | GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT |
+		GL_QUERY_BUFFER_BARRIER_BIT;
+	if (barriers != GL_ALL_BARRIER_BITS && (barriers & ~validBarrierBits) != 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glMemoryBarrier: invalid barrier mask 0x%08X", barriers);
+		return;
 	}
+	// A zero mask has no visibility requirements and must not split a Metal encoder.
+	if (barriers == 0) return;
+	// End the active encoder to establish a resource-visibility boundary. The
+	// command buffer uses tracked MTLBuffers/MTLTextures, so Metal orders hazards
+	// between the preceding and following encoders without a CPU-side wait.
 	endRenderEncoder();
 }

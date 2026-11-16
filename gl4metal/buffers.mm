@@ -317,8 +317,10 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 		return;
 	}
 	// UBO offsets follow the reported 256-byte GL alignment. Metal's setBuffer
-	// offset for SSBOs only needs 4-byte alignment on iOS.
-	const GLintptr alignment = uniformTarget ? 256 : 4;
+	// SSBO range starts must preserve std430 base alignment (up to 16 bytes).
+	// Metal accepts 4-byte buffer offsets, but 16-byte alignment keeps vec4/matrix
+	// block members naturally aligned after the GL range offset is applied.
+	const GLintptr alignment = uniformTarget ? 256 : 16;
 	if ((offset % alignment) != 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glBindBufferRange: offset %lld is not aligned to %lld bytes", (long long)offset, (long long)alignment);

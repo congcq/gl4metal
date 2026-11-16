@@ -14,7 +14,8 @@ static bool renderbufferFormatBits(GLenum internalformat, GLint pname, GLint &va
 	value = 0;
 	switch (pname) {
 		case GL_RENDERBUFFER_RED_SIZE:
-			value = (internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F) ?
+			value = internalformat == GL_R3_G3_B2 ? 3 : internalformat == GL_RGB5_A1 ? 5 :
+				(internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F) ?
 				(internalformat == GL_R8 ? 8 : internalformat == GL_R16 ? 16 : internalformat == GL_R16F ? 16 : 32) :
 				(internalformat == GL_RG8 || internalformat == GL_RG16 || internalformat == GL_RG16F || internalformat == GL_RG32F) ?
 				(internalformat == GL_RG8 ? 8 : internalformat == GL_RG16 ? 16 : internalformat == GL_RG16F ? 16 : 32) :
@@ -24,19 +25,23 @@ static bool renderbufferFormatBits(GLenum internalformat, GLint pname, GLint &va
 				internalformat == GL_RGB10_A2 ? 10 : internalformat == GL_R11F_G11F_B10F ? 11 : 0;
 			return true;
 		case GL_RENDERBUFFER_GREEN_SIZE:
-			if (internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F) value = 0;
+			if (internalformat == GL_R3_G3_B2) value = 3;
+			else if (internalformat == GL_RGB5_A1) value = 5;
+			else if (internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F) value = 0;
 			else if (internalformat == GL_RG8 || internalformat == GL_RG16 || internalformat == GL_RG16F || internalformat == GL_RG32F) value = (internalformat == GL_RG8 ? 8 : internalformat == GL_RG16 ? 16 : internalformat == GL_RG16F ? 16 : 32);
 			else value = renderbufferFormatBits(internalformat, GL_RENDERBUFFER_RED_SIZE, value) ? value : 0;
 			return true;
 		case GL_RENDERBUFFER_BLUE_SIZE:
-			value = (internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F ||
+			value = internalformat == GL_R3_G3_B2 ? 2 : internalformat == GL_RGB5_A1 ? 5 :
+				(internalformat == GL_R8 || internalformat == GL_R16 || internalformat == GL_R16F || internalformat == GL_R32F ||
 				internalformat == GL_RG8 || internalformat == GL_RG16 || internalformat == GL_RG16F || internalformat == GL_RG32F) ? 0 :
 				(internalformat == GL_RGB8 || internalformat == GL_RGBA8 || internalformat == GL_SRGB8 || internalformat == GL_SRGB8_ALPHA8) ? 8 :
 				(internalformat == GL_RGB16 || internalformat == GL_RGBA16 || internalformat == GL_RGB16F || internalformat == GL_RGBA16F) ? 16 :
 				(internalformat == GL_RGB32F || internalformat == GL_RGBA32F) ? 32 : internalformat == GL_RGB10_A2 ? 10 : internalformat == GL_R11F_G11F_B10F ? 10 : 0;
 			return true;
 		case GL_RENDERBUFFER_ALPHA_SIZE:
-			value = (internalformat == GL_RGBA8 || internalformat == GL_SRGB8_ALPHA8) ? 8 :
+			value = internalformat == GL_RGB5_A1 ? 1 :
+				(internalformat == GL_RGBA8 || internalformat == GL_SRGB8_ALPHA8) ? 8 :
 				(internalformat == GL_RGBA16 || internalformat == GL_RGBA16F) ? 16 :
 				internalformat == GL_RGBA32F ? 32 : internalformat == GL_RGB10_A2 ? 2 : 0;
 			return true;

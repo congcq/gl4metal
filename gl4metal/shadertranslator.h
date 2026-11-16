@@ -6,10 +6,16 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
-// Metal buffer argument index of the "default uniform block" (GL's loose uniforms) in both stages.
-// Vertex buffers occupy the low indices (0...15), so the uniform data lives at the top of the argument table.
+// Metal buffer indices shared by GL buffers and SPIRV-Cross helper resources.
+// Vertex attributes occupy vertex slots 0...15; fragment slot 15 is gl_FragCoord.
+// Slot 29 carries OpArrayLength byte sizes and slot 30 carries GL loose uniforms.
+#define GL4METAL_BUFFER_SIZE_BUFFER_INDEX 29
 #define GL4METAL_UNIFORM_BUFFER_INDEX 30
+// Metal/iOS supports up to eight color attachments on the target devices.
+#define GL4METAL_MAX_FRAGMENT_OUTPUTS 8
+
 // Iris uses GL_MAX_TEXTURE_IMAGE_UNITS as a logical dynamic-sampler allocator
 // capacity. Those logical units are virtualized to dense MSL slots at draw time.
 // Keep 96 fragment-side logical units plus 16 vertex-side logical units in the
@@ -67,11 +73,17 @@ struct TranslatedAttrib {
 };
 
 struct TranslatedStorageBuffer {
-	std::string name;
-	uint32_t binding = 0; // GL_SHADER_STORAGE_BUFFER binding point
-	uint32_t slot = 0;    // MSL [[buffer(slot)]]
+	std::string name;       // GLSL storage block type name (GL_SHADER_STORAGE_BLOCK resource name)
+	uint32_t binding = 0;   // GL_SHADER_STORAGE_BUFFER binding point
+	uint32_t slot = 0;      // legacy compute-stage MSL [[buffer(slot)]]
 	uint32_t required_size = 0;
-	bool runtime_sized = false; // unsized trailing array: Metal must see the full remaining GL store
+	bool runtime_sized = false;
+	uint32_t active_variable_count = 0;
+	struct Stage {
+		bool present = false;
+		uint32_t slot = 0;  // MSL [[buffer(slot)]] in this execution stage
+	} stage[3];             // 0 = vertex, 1 = fragment, 2 = compute
+	std::vector<TranslatedUniform> members; // active GL_BUFFER_VARIABLE records
 };
 
 struct TranslatedImage {
@@ -95,10 +107,12 @@ struct TranslatedProgram {
 	uint32_t workgroup_size[3] = {1, 1, 1};
 	std::vector<std::pair<std::string, uint32_t>> frag_outputs;
 	bool uses_gl_frag_coord = false; // fragment MSL entry point includes the dynamic render-target coordinate parameters
+	bool needs_buffer_size_buffer[3] = {false, false, false}; // SPIRV-Cross OpArrayLength helper, bound at MSL buffer 29
 	std::string log;
 };
 
-bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out);
+bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+	const std::unordered_map<std::string, uint32_t> &fragDataBindings);
 bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out);
 
 // Compact nested threadgroup float3 arrays to packed_float3 where the MSL

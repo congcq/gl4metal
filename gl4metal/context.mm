@@ -69,7 +69,7 @@ void glSwapBuffers(void) {
 		[ctx.currentCommandBuffer presentDrawable:ctx.currentDrawable];
 	}
 	[ctx.currentCommandBuffer commit];
-	resetDrawUniformUploadArena(ctx.currentCommandBuffer);
+	resetDrawTransientUploadArena(ctx.currentCommandBuffer);
 	resetTextureUploadArena(ctx.currentCommandBuffer);
 	ctx.last_committed_buffer = ctx.currentCommandBuffer;
 	ctx.currentCommandBuffer = nil;

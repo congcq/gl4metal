@@ -51,7 +51,7 @@ void flushCommandBuffer(bool waitUntilCompleted) {
 	}
 	if (ctx.currentCommandBuffer) {
 		[ctx.currentCommandBuffer commit];
-		resetDrawUniformUploadArena(ctx.currentCommandBuffer);
+		resetDrawTransientUploadArena(ctx.currentCommandBuffer);
 		resetTextureUploadArena(ctx.currentCommandBuffer);
 		ctx.last_committed_buffer = ctx.currentCommandBuffer;
 		ctx.currentCommandBuffer = nil;

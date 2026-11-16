@@ -138,7 +138,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 3;
 			break;
 		case GL_NUM_EXTENSIONS:
-			*data = gl4metalSupportsComputeShaders() ? 5 : 3;
+			*data = gl4metalSupportsComputeShaders() ? 6 : 4;
 			break;
 		case GL_CONTEXT_FLAGS:
 			*data = GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT;
@@ -228,7 +228,8 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 0; // multisample storage images are not implemented
 			break;
 		case GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS:
-			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_COLOR_ATTACHMENTS : 0;
+			*data = std::max(41 + (GLint)GL4METAL_MAX_COLOR_ATTACHMENTS,
+				(gl4metalSupportsComputeShaders() ? 16 + (GLint)GL4METAL_MAX_IMAGE_UNITS : 0));
 			break;
 		case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
 			*data = gl4metalSupportsComputeShaders()
@@ -250,7 +251,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = (GLint)gl4metalMaxComputeWorkGroupInvocations();
 			break;
 		case GL_MAX_COMPUTE_UNIFORM_BLOCKS:
-			*data = gl4metalSupportsComputeShaders() ? 14 : 0;
+			*data = gl4metalSupportsComputeShaders() ? 13 : 0;
 			break;
 		case GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS:
 			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_COMPUTE_TEXTURE_UNITS : 0;
@@ -258,15 +259,32 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
 			*data = gl4metalSupportsComputeShaders() ? GL4METAL_MAX_IMAGE_UNITS : 0;
 			break;
+		case GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS:
+			// Vertex inputs own Metal slots 0...15; slot 29 is reserved for SSBO runtime-array lengths.
+			*data = 13;
+			break;
+		case GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS:
+			// Fragment slot 15 is reserved for gl_FragCoord and slot 29 for SSBO runtime-array lengths.
+			*data = 28;
+			break;
+		case GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS:
+		case GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS:
+		case GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS:
+			*data = 0; // GL4Metal does not expose geometry or tessellation stages.
+			break;
 		case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS:
+			*data = gl4metalSupportsComputeShaders() ? 16 : 0;
+			break;
 		case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS:
+			*data = GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+			break;
 		case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS:
-			// GL_ARB_shader_storage_buffer_object and its buffer-storage companion
-			// APIs are not advertised by this build yet. Do not claim SSBO capacity.
-			*data = 0;
+			// Graphics programs can use 13 vertex + 28 fragment blocks; compute programs
+			// are limited to 16. A program cannot contain both compute and graphics stages.
+			*data = 41;
 			break;
 		case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT:
-			*data = 4;
+			*data = 16;
 			break;
 		case GL_MAX_SHADER_STORAGE_BLOCK_SIZE:
 			*data = ctx.device ? (GLint)std::min<NSUInteger>(ctx.device.maxBufferLength,
@@ -288,10 +306,10 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			break;
 		case GL_MAX_VERTEX_UNIFORM_BLOCKS:
 		case GL_MAX_FRAGMENT_UNIFORM_BLOCKS:
-			*data = 14; // Metal slots 16...29 are used for blocks, see shadertranslator.cpp
+			*data = 13; // Metal slots 16...28 are used for blocks; slot 29 is an OpArrayLength helper
 			break;
 		case GL_MAX_COMBINED_UNIFORM_BLOCKS:
-			*data = 28;
+			*data = 26;
 			break;
 		case GL_MAX_GEOMETRY_UNIFORM_BLOCKS:
 			*data = 0;
@@ -409,12 +427,16 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 }
 
 void glGetInteger64v(GLenum pname, GLint64 *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (pname == GL_MAX_SHADER_STORAGE_BLOCK_SIZE) {
+		const NSUInteger maxLength = ctx.device ? ctx.device.maxBufferLength : 0;
+		data[0] = (GLint64)std::min<NSUInteger>(maxLength, (NSUInteger)std::numeric_limits<GLint64>::max());
+		return;
+	}
 	GLint values[4] = { 0, 0, 0, 0 };
 	glGetIntegerv(pname, values);
-	int count = (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 : (pname == GL_MAX_VIEWPORT_DIMS ? 2 : 1);
-	for (int i = 0; i < count; i++) {
-		data[i] = values[i];
-	}
+	const int count = (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 : (pname == GL_MAX_VIEWPORT_DIMS ? 2 : 1);
+	for (int index = 0; index < count; ++index) data[index] = values[index];
 }
 
 void glGetBooleani_v(GLenum target, GLuint index, GLboolean *data) {
@@ -525,9 +547,32 @@ void glGetIntegeri_v(GLenum target, GLuint index, GLint *data) {
 }
 
 void glGetInteger64i_v(GLenum target, GLuint index, GLint64 *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	const bool uniformRangeQuery = target == GL_UNIFORM_BUFFER_START || target == GL_UNIFORM_BUFFER_SIZE;
+	const bool storageRangeQuery = target == GL_SHADER_STORAGE_BUFFER_START || target == GL_SHADER_STORAGE_BUFFER_SIZE;
+	if (uniformRangeQuery || storageRangeQuery) {
+		const GLuint bindingCount = uniformRangeQuery ? GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS : GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+		if (index >= bindingCount) { gl4metalSetError(GL_INVALID_VALUE); return; }
+		if (uniformRangeQuery) {
+			const UniformBufferBinding &binding = ctx.uniform_buffer_bindings[index];
+			if (target == GL_UNIFORM_BUFFER_START) { *data = (GLint64)binding.offset; return; }
+			if (binding.size != 0) { *data = (GLint64)binding.size; return; }
+			auto buffer = ctx.buffer_objects.find(binding.buffer);
+			*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
+				? (GLint64)glBufferLogicalSize(binding.buffer) : 0;
+			return;
+		}
+		const ShaderStorageBufferBinding &binding = ctx.shader_storage_buffer_bindings[index];
+		if (target == GL_SHADER_STORAGE_BUFFER_START) { *data = (GLint64)binding.offset; return; }
+		if (binding.size != 0) { *data = (GLint64)binding.size; return; }
+		auto buffer = ctx.buffer_objects.find(binding.buffer);
+		*data = (binding.buffer != 0 && buffer != ctx.buffer_objects.end() && buffer->second)
+			? (GLint64)glBufferLogicalSize(binding.buffer) : 0;
+		return;
+	}
 	GLint value = 0;
 	glGetIntegeri_v(target, index, &value);
-	*data = value;
+	*data = (GLint64)value;
 }
 
 static NSUInteger currentDrawFramebufferSampleCount() {
@@ -735,8 +780,8 @@ const GLubyte *glGetString(GLenum name) {
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:
 			return (const GLubyte *)(gl4metalSupportsComputeShaders()
-				? "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata GL_ARB_compute_shader GL_ARB_shader_image_load_store"
-				: "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata");
+				? "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata GL_ARB_shader_storage_buffer_object GL_ARB_compute_shader GL_ARB_shader_image_load_store"
+				: "GL_ARB_draw_buffers_blend GL_ARB_clear_texture GL_ARB_invalidate_subdata GL_ARB_shader_storage_buffer_object");
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetString: missing 0x%X", name);
@@ -753,15 +798,16 @@ const GLubyte *glGetStringi(GLenum name, GLuint index) {
 	static const char *const baseExtensions[] = {
 		"GL_ARB_draw_buffers_blend",
 		"GL_ARB_clear_texture",
-		"GL_ARB_invalidate_subdata"
+		"GL_ARB_invalidate_subdata",
+		"GL_ARB_shader_storage_buffer_object"
 	};
 	static const char *const computeExtensions[] = {
 		"GL_ARB_compute_shader",
 		"GL_ARB_shader_image_load_store"
 	};
-	if (index < 3) return (const GLubyte *)baseExtensions[index];
-	if (gl4metalSupportsComputeShaders() && index < 5)
-		return (const GLubyte *)computeExtensions[index - 3];
+	if (index < 4) return (const GLubyte *)baseExtensions[index];
+	if (gl4metalSupportsComputeShaders() && index < 6)
+		return (const GLubyte *)computeExtensions[index - 4];
 	gl4metalSetError(GL_INVALID_VALUE);
 	return NULL;
 }

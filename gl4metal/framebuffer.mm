@@ -118,6 +118,55 @@ static id<MTLTexture> attachmentTexture(const FBOAttachment &a) {
 	return texture;
 }
 
+static void logFBOAttachmentState(GLuint framebufferName, const char *attachmentName, const FBOAttachment &attachment) {
+	if (!hasAttachment(attachment)) return;
+	if (attachment.texture != 0) {
+		auto object = ctx.texture_objects.find(attachment.texture);
+		if (object == ctx.texture_objects.end()) {
+			GL4METAL_LOG("FBO %u %s: missing GL texture object name=%u level=%d",
+				framebufferName, attachmentName, attachment.texture, attachment.level);
+			return;
+		}
+		const TextureObject &textureObject = object->second;
+		id<MTLTexture> metalTexture = textureObject.texture;
+		if (!metalTexture) {
+			GL4METAL_LOG("FBO %u %s: GL texture=%u has no Metal storage (tracked internalformat=0x%X, imageSize=%dx%dx%d, target=0x%X, level=%d)",
+				framebufferName, attachmentName, attachment.texture, textureObject.internalformat,
+				textureObject.width, textureObject.height, textureObject.depth, textureObject.target, attachment.level);
+			return;
+		}
+		GL4METAL_LOG("FBO %u %s: texture=%u level=%d MetalFormat=%lu size=%lux%lu type=%lu usage=0x%lx sampleCount=%lu renderTarget=%d",
+			framebufferName, attachmentName, attachment.texture, attachment.level,
+			(unsigned long)metalTexture.pixelFormat, (unsigned long)metalTexture.width, (unsigned long)metalTexture.height,
+			(unsigned long)metalTexture.textureType, (unsigned long)metalTexture.usage,
+			(unsigned long)metalTexture.sampleCount,
+			(metalTexture.usage & MTLTextureUsageRenderTarget) != 0 ? 1 : 0);
+		return;
+	}
+	auto object = ctx.renderbuffer_objects.find(attachment.renderbuffer);
+	if (object == ctx.renderbuffer_objects.end() || !object->second.initialized || !object->second.texture) {
+		GL4METAL_LOG("FBO %u %s: renderbuffer=%u has no initialized Metal storage",
+			framebufferName, attachmentName, attachment.renderbuffer);
+		return;
+	}
+	id<MTLTexture> metalTexture = object->second.texture;
+	GL4METAL_LOG("FBO %u %s: renderbuffer=%u MetalFormat=%lu size=%lux%lu samples=%lu renderTarget=%d",
+		framebufferName, attachmentName, attachment.renderbuffer,
+		(unsigned long)metalTexture.pixelFormat, (unsigned long)metalTexture.width, (unsigned long)metalTexture.height,
+		(unsigned long)metalTexture.sampleCount,
+		(metalTexture.usage & MTLTextureUsageRenderTarget) != 0 ? 1 : 0);
+}
+
+static void logFBOAttachmentStates(GLuint framebufferName, const FBO &fbo) {
+	logFBOAttachmentState(framebufferName, "DEPTH_ATTACHMENT", fbo.depth);
+	logFBOAttachmentState(framebufferName, "STENCIL_ATTACHMENT", fbo.stencil);
+	for (int attachmentIndex = 0; attachmentIndex < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachmentIndex) {
+		char attachmentName[32];
+		snprintf(attachmentName, sizeof(attachmentName), "COLOR_ATTACHMENT%d", attachmentIndex);
+		logFBOAttachmentState(framebufferName, attachmentName, fbo.color[attachmentIndex]);
+	}
+}
+
 static bool checkFBOAttachment(const FBOAttachment &a, int role, NSUInteger &width, NSUInteger &height,
 	NSUInteger &sampleCount, bool &haveExtent, bool &haveSamples, bool &sampleMismatch) {
 	// role: 0=color, 1=depth, 2=stencil. An unattached point is valid.
@@ -309,6 +358,10 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask, bool preserveP
 			gl4metalSetError(GL_INVALID_FRAMEBUFFER_OPERATION);
 			GL4METAL_LOG("beginRenderPass: draw framebuffer %u is incomplete (status=0x%X); pass not encoded",
 				ctx.draw_fbo, fboStatus);
+			auto diagnosticFBO = GL4METAL_FBO_FIND(ctx.draw_fbo);
+			if (diagnosticFBO != ctx.fbo_objects.end()) {
+				logFBOAttachmentStates(ctx.draw_fbo, diagnosticFBO->second);
+			}
 			return nil;
 		}
 		auto it = GL4METAL_FBO_FIND(ctx.draw_fbo);
@@ -1575,12 +1628,14 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 
 	// Source: 8-bit colour textures, with the index of R, G, B, A inside one pixel (-1: absent).
 	int srcComps = 0, srcIdx[4] = { -1, -1, -1, -1 };
+	const bool srcA1BGR5 = tex.pixelFormat == MTLPixelFormatA1BGR5Unorm;
 	switch (tex.pixelFormat) {
 		case MTLPixelFormatR8Unorm:         srcComps = 1; srcIdx[0] = 0; break;
 		case MTLPixelFormatRG8Unorm:        srcComps = 2; srcIdx[0] = 0; srcIdx[1] = 1; break;
 		case MTLPixelFormatRGBA8Unorm:
 		case MTLPixelFormatRGBA8Unorm_sRGB: srcComps = 4; srcIdx[0] = 0; srcIdx[1] = 1; srcIdx[2] = 2; srcIdx[3] = 3; break;
 		case MTLPixelFormatBGRA8Unorm:      srcComps = 4; srcIdx[2] = 0; srcIdx[1] = 1; srcIdx[0] = 2; srcIdx[3] = 3; break;
+		case MTLPixelFormatA1BGR5Unorm:    srcComps = 2; break;
 		default:
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("glReadPixels: unsupported source MTLPixelFormat %d", (int)tex.pixelFormat);
@@ -1680,9 +1735,20 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 		const uint8_t *src = raw.data() + (size_t)row * rawRowBytes;
 		uint8_t *rowDst = dst + (size_t)row * rowBytes;
 		for (GLsizei col = 0; col < width; col++, src += srcComps, rowDst += dstComps) {
+			uint8_t packedRGBA[4] = { 0, 0, 0, 255 };
+			if (srcA1BGR5) {
+				uint16_t packed = 0;
+				memcpy(&packed, src, sizeof(packed));
+				packedRGBA[0] = (uint8_t)(((packed & 0x1fu) * 255u + 15u) / 31u);
+				packedRGBA[1] = (uint8_t)((((packed >> 5) & 0x1fu) * 255u + 15u) / 31u);
+				packedRGBA[2] = (uint8_t)((((packed >> 10) & 0x1fu) * 255u + 15u) / 31u);
+				packedRGBA[3] = (packed & 0x8000u) ? 255u : 0u;
+			}
 			for (int c = 0; c < dstComps; c++) {
-				const int idx = srcIdx[dstChannel[c]];
-				rowDst[c] = idx >= 0 ? src[idx] : (dstChannel[c] == 3 ? 255 : 0);
+				const int channel = dstChannel[c];
+				const int idx = srcIdx[channel];
+				rowDst[c] = srcA1BGR5 ? packedRGBA[channel] :
+					(idx >= 0 ? src[idx] : (channel == 3 ? 255 : 0));
 			}
 		}
 	}

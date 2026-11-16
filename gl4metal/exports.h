@@ -267,6 +267,11 @@ GL4METAL_EXPORT void glGetUniformIndices(GLuint program, GLsizei uniformCount, c
 GL4METAL_EXPORT void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params);
 GL4METAL_EXPORT void glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformName);
 GL4METAL_EXPORT GLuint glGetUniformBlockIndex(GLuint program, const GLchar *uniformBlockName);
+GL4METAL_EXPORT void glGetProgramInterfaceiv(GLuint program, GLenum programInterface, GLenum pname, GLint *params);
+GL4METAL_EXPORT GLuint glGetProgramResourceIndex(GLuint program, GLenum programInterface, const GLchar *name);
+GL4METAL_EXPORT void glGetProgramResourceName(GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name);
+GL4METAL_EXPORT void glGetProgramResourceiv(GLuint program, GLenum programInterface, GLuint index, GLsizei propCount, const GLenum *props, GLsizei bufSize, GLsizei *length, GLint *params);
+GL4METAL_EXPORT void glShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding);
 GL4METAL_EXPORT void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params);
 GL4METAL_EXPORT void glGetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformBlockName);
 GL4METAL_EXPORT void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding);

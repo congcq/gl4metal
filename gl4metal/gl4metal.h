@@ -25,6 +25,181 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
+#ifndef GL_R3_G3_B2
+#define GL_R3_G3_B2 0x2A10
+#endif
+#ifndef GL_SHADER_STORAGE_BLOCK
+#define GL_SHADER_STORAGE_BLOCK 0x92E6
+#endif
+#ifndef GL_BUFFER_VARIABLE
+#define GL_BUFFER_VARIABLE 0x92E5
+#endif
+#ifndef GL_BUFFER_BINDING
+#define GL_BUFFER_BINDING 0x9302
+#endif
+#ifndef GL_NAME_LENGTH
+#define GL_NAME_LENGTH 0x92F9
+#endif
+#ifndef GL_TYPE
+#define GL_TYPE 0x92FA
+#endif
+#ifndef GL_ARRAY_SIZE
+#define GL_ARRAY_SIZE 0x92FB
+#endif
+#ifndef GL_OFFSET
+#define GL_OFFSET 0x92FC
+#endif
+#ifndef GL_BLOCK_INDEX
+#define GL_BLOCK_INDEX 0x92FD
+#endif
+#ifndef GL_ARRAY_STRIDE
+#define GL_ARRAY_STRIDE 0x92FE
+#endif
+#ifndef GL_MATRIX_STRIDE
+#define GL_MATRIX_STRIDE 0x92FF
+#endif
+#ifndef GL_IS_ROW_MAJOR
+#define GL_IS_ROW_MAJOR 0x9300
+#endif
+#ifndef GL_TOP_LEVEL_ARRAY_SIZE
+#define GL_TOP_LEVEL_ARRAY_SIZE 0x930C
+#endif
+#ifndef GL_TOP_LEVEL_ARRAY_STRIDE
+#define GL_TOP_LEVEL_ARRAY_STRIDE 0x930D
+#endif
+#ifndef GL_BUFFER_DATA_SIZE
+#define GL_BUFFER_DATA_SIZE 0x9303
+#endif
+#ifndef GL_NUM_ACTIVE_VARIABLES
+#define GL_NUM_ACTIVE_VARIABLES 0x9304
+#endif
+#ifndef GL_ACTIVE_VARIABLES
+#define GL_ACTIVE_VARIABLES 0x9305
+#endif
+#ifndef GL_REFERENCED_BY_VERTEX_SHADER
+#define GL_REFERENCED_BY_VERTEX_SHADER 0x9306
+#endif
+#ifndef GL_REFERENCED_BY_FRAGMENT_SHADER
+#define GL_REFERENCED_BY_FRAGMENT_SHADER 0x930A
+#endif
+#ifndef GL_REFERENCED_BY_COMPUTE_SHADER
+#define GL_REFERENCED_BY_COMPUTE_SHADER 0x930B
+#endif
+#ifndef GL_ACTIVE_RESOURCES
+#define GL_ACTIVE_RESOURCES 0x92F5
+#endif
+#ifndef GL_MAX_NAME_LENGTH
+#define GL_MAX_NAME_LENGTH 0x92F6
+#endif
+#ifndef GL_MAX_NUM_ACTIVE_VARIABLES
+#define GL_MAX_NUM_ACTIVE_VARIABLES 0x92F7
+#endif
+#ifndef GL_INVALID_INDEX
+#define GL_INVALID_INDEX 0xFFFFFFFFu
+#endif
+#ifndef GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS
+#define GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS 0x90D6
+#endif
+#ifndef GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS
+#define GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS 0x90DA
+#endif
+#ifndef GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS
+#define GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS 0x90D7
+#endif
+#ifndef GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS
+#define GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS 0x90D8
+#endif
+#ifndef GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS
+#define GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS 0x90D9
+#endif
+#ifndef GL_REFERENCED_BY_TESS_CONTROL_SHADER
+#define GL_REFERENCED_BY_TESS_CONTROL_SHADER 0x9307
+#endif
+#ifndef GL_REFERENCED_BY_TESS_EVALUATION_SHADER
+#define GL_REFERENCED_BY_TESS_EVALUATION_SHADER 0x9308
+#endif
+#ifndef GL_REFERENCED_BY_GEOMETRY_SHADER
+#define GL_REFERENCED_BY_GEOMETRY_SHADER 0x9309
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER
+#define GL_SHADER_STORAGE_BUFFER 0x90D2
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_BINDING
+#define GL_SHADER_STORAGE_BUFFER_BINDING 0x90D3
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_START
+#define GL_SHADER_STORAGE_BUFFER_START 0x90D4
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_SIZE
+#define GL_SHADER_STORAGE_BUFFER_SIZE 0x90D5
+#endif
+#ifndef GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
+#define GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS 0x90DB
+#endif
+#ifndef GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS
+#define GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS 0x90DC
+#endif
+#ifndef GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
+#define GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 0x90DD
+#endif
+#ifndef GL_MAX_SHADER_STORAGE_BLOCK_SIZE
+#define GL_MAX_SHADER_STORAGE_BLOCK_SIZE 0x90DE
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
+#define GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT 0x90DF
+#endif
+#ifndef GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES
+#define GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES 0x8F39
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT
+#define GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT 0x00000001
+#endif
+#ifndef GL_ELEMENT_ARRAY_BARRIER_BIT
+#define GL_ELEMENT_ARRAY_BARRIER_BIT 0x00000002
+#endif
+#ifndef GL_UNIFORM_BARRIER_BIT
+#define GL_UNIFORM_BARRIER_BIT 0x00000004
+#endif
+#ifndef GL_TEXTURE_FETCH_BARRIER_BIT
+#define GL_TEXTURE_FETCH_BARRIER_BIT 0x00000008
+#endif
+#ifndef GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
+#define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT 0x00000020
+#endif
+#ifndef GL_COMMAND_BARRIER_BIT
+#define GL_COMMAND_BARRIER_BIT 0x00000040
+#endif
+#ifndef GL_PIXEL_BUFFER_BARRIER_BIT
+#define GL_PIXEL_BUFFER_BARRIER_BIT 0x00000080
+#endif
+#ifndef GL_TEXTURE_UPDATE_BARRIER_BIT
+#define GL_TEXTURE_UPDATE_BARRIER_BIT 0x00000100
+#endif
+#ifndef GL_BUFFER_UPDATE_BARRIER_BIT
+#define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
+#endif
+#ifndef GL_FRAMEBUFFER_BARRIER_BIT
+#define GL_FRAMEBUFFER_BARRIER_BIT 0x00000400
+#endif
+#ifndef GL_TRANSFORM_FEEDBACK_BARRIER_BIT
+#define GL_TRANSFORM_FEEDBACK_BARRIER_BIT 0x00000800
+#endif
+#ifndef GL_ATOMIC_COUNTER_BARRIER_BIT
+#define GL_ATOMIC_COUNTER_BARRIER_BIT 0x00001000
+#endif
+#ifndef GL_SHADER_STORAGE_BARRIER_BIT
+#define GL_SHADER_STORAGE_BARRIER_BIT 0x00002000
+#endif
+#ifndef GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT
+#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
+#endif
+#ifndef GL_QUERY_BUFFER_BARRIER_BIT
+#define GL_QUERY_BUFFER_BARRIER_BIT 0x00008000
+#endif
+#ifndef GL_ALL_BARRIER_BITS
+#define GL_ALL_BARRIER_BITS 0xFFFFFFFFu
+#endif
+
 // Some older platform GL headers expose the ARB-suffixed token only, even
 // though GL_TEXTURE_BUFFER_FORMAT is part of the OpenGL 3.1 texture-buffer API.
 // Keep the unsuffixed core spelling available to the backend on every build.
@@ -38,9 +213,11 @@
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
 #define GL4METAL_MAX_3D_TEXTURE_SIZE 2048
-#define GL4METAL_MAX_COLOR_ATTACHMENTS 8
+#define GL4METAL_MAX_COLOR_ATTACHMENTS GL4METAL_MAX_FRAGMENT_OUTPUTS
 #define GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS 36
-// Metal reserves buffer slots 16...30 for UBOs/default uniforms; compute SSBOs use 0...15.
+// Metal buffer slots: vertex attributes 0...15, fragment gl_FragCoord 15,
+// graphics/compute SSBO and UBO ranges 0...28, SPIRV-Cross OpArrayLength 29,
+// and GL loose-uniform blocks 30. Vertex SSBO/UBO slots are limited to 16...28.
 #define GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 1024
 
 // MARK: - Textures
@@ -48,7 +225,7 @@
 struct TextureObject {
 	GLenum target = 0; // 0 until the name is bound for the first time
 	id<MTLTexture> texture = nil;
-	GLenum internalformat = GL_RGBA8;
+	GLenum internalformat = 0; // 0 until level 0 or a buffer texture format is defined
 	GLsizei width = 0, height = 0, depth = 1; // level 0 size; depth > 1 for GL_TEXTURE_3D
 	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
 	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
@@ -205,6 +382,7 @@ struct ProgramObject {
 	GLboolean linked = GL_FALSE, validated = GL_FALSE, deleted = GL_FALSE;
 	std::string info_log;
 	std::unordered_map<std::string, GLuint> attrib_bindings; // glBindAttribLocation, applied at link time
+	std::unordered_map<std::string, uint32_t> frag_data_bindings; // glBindFragDataLocation, applied at link time
 
 	// results of the last successful link
 	id<MTLFunction> vertex_function = nil;
@@ -219,6 +397,7 @@ struct ProgramObject {
 	std::vector<ProgramBlock> blocks;
 	std::vector<TranslatedStorageBuffer> storage_buffers;
 	std::vector<TranslatedImage> storage_images;
+	bool needs_buffer_size_buffer[3] = {false, false, false};
 	std::vector<GLint> image_units; // GL image-unit uniform values, parallel to flattened storage_images
 	id<MTLComputePipelineState> compute_pipeline = nil;
 	uint32_t compute_workgroup_size[3] = {1, 1, 1};

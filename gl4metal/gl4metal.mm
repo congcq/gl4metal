@@ -72,6 +72,10 @@ GLboolean gl4metalInit() {
 	// repeatedly rehash the context table.
 	ctx.fbo_objects.max_load_factor(0.75f);
 	ctx.fbo_objects.reserve(128);
+	ctx.pipeline_cache.max_load_factor(0.75f);
+	ctx.pipeline_cache.reserve(256);
+	ctx.sampler_cache.max_load_factor(0.75f);
+	ctx.sampler_cache.reserve(64);
 
 	// OpenGL initial state
 	ctx.depth_write_enabled = GL_TRUE;

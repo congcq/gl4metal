@@ -36,6 +36,32 @@ void finalizeGlslang() {
 	glslang::FinalizeProcess();
 }
 
+// glslang's generic defaults are intentionally conservative (notably only eight
+// combined shader output resources). Keep parser/link-time validation in sync with
+// the limits exported by GL4Metal, otherwise valid SSBO/image shaders can fail
+// before SPIR-V translation even begins.
+TBuiltInResource makeGL4MetalShaderResources() {
+	TBuiltInResource limits = *GetDefaultResources();
+	limits.maxVertexAttribs = 16;
+	limits.maxTextureUnits = GL4METAL_MAX_FRAGMENT_TEXTURE_UNIT_BINDINGS;
+	limits.maxVertexTextureImageUnits = GL4METAL_MAX_VERTEX_TEXTURE_UNITS;
+	limits.maxCombinedTextureImageUnits = GL4METAL_MAX_TEXTURE_UNITS;
+	limits.maxTextureImageUnits = GL4METAL_MAX_FRAGMENT_TEXTURE_UNIT_BINDINGS;
+	limits.maxDrawBuffers = GL4METAL_MAX_FRAGMENT_OUTPUTS;
+	limits.maxVaryingVectors = 15;
+	limits.maxVaryingComponents = 60;
+	limits.maxImageUnits = GL4METAL_MAX_IMAGE_UNITS;
+	limits.maxVertexImageUniforms = 0;
+	limits.maxFragmentImageUniforms = 0;
+	limits.maxComputeImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
+	limits.maxCombinedImageUniforms = GL4METAL_MAX_IMAGE_UNITS;
+	limits.maxCombinedImageUnitsAndFragmentOutputs =
+		GL4METAL_MAX_IMAGE_UNITS + GL4METAL_MAX_FRAGMENT_OUTPUTS;
+	// max(graphics SSBO blocks + fragment outputs, compute SSBO blocks + images).
+	limits.maxCombinedShaderOutputResources = 49;
+	return limits;
+}
+
 // glslang's Vulkan dialect reserves `sampler` (separate samplers), GLSL 330 doesn't: Minecraft's shaders use it as the
 // name of a parameter (sampleNearest(sampler2D sampler, ...)). Whole-word occurrences only, sampler2D & co. stay.
 std::string renameSamplerIdentifier(const std::string &source) {
@@ -438,6 +464,7 @@ struct TranslationLookup {
 	std::unordered_map<std::string, size_t> uniform_indices;
 	std::unordered_map<std::string, size_t> block_indices;
 	std::unordered_map<std::string, std::pair<size_t, size_t>> block_member_indices;
+	std::unordered_map<std::string, size_t> storage_buffer_indices;
 };
 
 // SPIR-V locations emitted by glslang are not always stage-linked by name when a
@@ -460,6 +487,156 @@ static std::string interfaceResourceName(const spirv_cross::CompilerMSL &compile
 	const spirv_cross::Resource &resource) {
 	if (!resource.name.empty()) return resource.name;
 	return compiler.get_name(resource.id);
+}
+
+static bool isMslIdentifierChar(char c);
+
+static bool containsIdentifierToken(const std::string &source, const std::string &identifier) {
+	if (identifier.empty()) return false;
+	size_t position = 0;
+	while ((position = source.find(identifier, position)) != std::string::npos) {
+		const size_t end = position + identifier.size();
+		const bool leftBoundary = position == 0 || !isMslIdentifierChar(source[position - 1]);
+		const bool rightBoundary = end >= source.size() || !isMslIdentifierChar(source[end]);
+		if (leftBoundary && rightBoundary) return true;
+		position = end;
+	}
+	return false;
+}
+
+// SPIR-V generated from desktop GLSL without explicit fragment-output locations can
+// contain the same default Location decoration on multiple outputs. Metal requires
+// each active color result to target a distinct attachment. Preserve explicit GLSL
+// locations, apply glBindFragDataLocation for the remaining names, then allocate
+// deterministic free locations for outputs whose generated decorations collide.
+static std::vector<std::pair<std::string, uint32_t>> collectExplicitFragmentOutputLayouts(
+	const std::string &fragmentSource) {
+	std::vector<std::pair<std::string, uint32_t>> declarations;
+	const std::string maskedSource = maskShaderComments(fragmentSource);
+	static const std::regex declarationPattern(
+		R"(layout\s*\(([^)]*)\)\s*((?:(?:centroid|sample|patch|invariant|precise|flat|smooth|noperspective|highp|mediump|lowp)\s+)*out\s+[^;{}]*;))",
+		std::regex::ECMAScript);
+	static const std::regex locationPattern(R"(\blocation\s*=\s*([0-9]+)\b)",
+		std::regex::ECMAScript);
+	for (std::sregex_iterator it(maskedSource.begin(), maskedSource.end(), declarationPattern), end;
+		it != end; ++it) {
+		std::smatch locationMatch;
+		const std::string layoutQualifiers = (*it)[1].str();
+		if (!std::regex_search(layoutQualifiers, locationMatch, locationPattern)) continue;
+		try {
+			const unsigned long parsed = std::stoul(locationMatch[1].str());
+			if (parsed > UINT32_MAX) continue;
+			declarations.emplace_back((*it)[2].str(), (uint32_t)parsed);
+		} catch (...) {
+			// Ignore malformed/overflowing source text; glslang will report its own diagnostic.
+		}
+	}
+	return declarations;
+}
+
+static bool assignFragmentOutputLocations(spirv_cross::CompilerMSL &compiler,
+	const spirv_cross::ShaderResources &resources,
+	const std::vector<std::pair<std::string, uint32_t>> &explicitLayouts,
+	const std::unordered_map<std::string, uint32_t> &fragDataBindings,
+	std::string &log) {
+	struct OutputLocation {
+		const spirv_cross::Resource *resource = nullptr;
+		std::string name;
+		uint32_t currentLocation = 0;
+		bool hasCurrentLocation = false;
+		bool hasExplicitLocation = false;
+		uint32_t explicitLocation = 0;
+	};
+
+	std::vector<OutputLocation> outputs;
+	outputs.reserve(resources.stage_outputs.size());
+	for (const spirv_cross::Resource &resource : resources.stage_outputs) {
+		if (compiler.has_decoration(resource.id, spv::DecorationBuiltIn)) continue;
+		OutputLocation output;
+		output.resource = &resource;
+		output.name = interfaceResourceName(compiler, resource);
+		if (output.name.empty()) continue;
+		output.hasCurrentLocation = compiler.has_decoration(resource.id, spv::DecorationLocation);
+		if (output.hasCurrentLocation) {
+			output.currentLocation = compiler.get_decoration(resource.id, spv::DecorationLocation);
+		}
+		for (const auto &declaration : explicitLayouts) {
+			if (!containsIdentifierToken(declaration.first, output.name)) continue;
+			if (output.hasExplicitLocation && output.explicitLocation != declaration.second) {
+				log += "fragment output '" + output.name + "' has conflicting explicit layout locations\n";
+				return false;
+			}
+			output.hasExplicitLocation = true;
+			output.explicitLocation = declaration.second;
+		}
+		outputs.push_back(std::move(output));
+	}
+
+	if (outputs.empty()) return true;
+
+	std::unordered_map<uint32_t, std::string> occupied;
+	occupied.reserve(outputs.size());
+	auto reserveLocation = [&](uint32_t location, const std::string &name, const char *source) -> bool {
+		if (location >= GL4METAL_MAX_FRAGMENT_OUTPUTS) {
+			log += "fragment output '" + name + "' requests color location " +
+				std::to_string(location) + ", beyond the Metal attachment limit\n";
+			return false;
+		}
+		auto existing = occupied.find(location);
+		if (existing != occupied.end() && existing->second != name) {
+			log += "fragment outputs '" + existing->second + "' and '" + name +
+				"' both target color location " + std::to_string(location) + " (" + source + ")\n";
+			return false;
+		}
+		occupied.emplace(location, name);
+		return true;
+	};
+
+	// Explicit shader locations have priority over API bindings, as required by GL.
+	for (const OutputLocation &output : outputs) {
+		if (!output.hasExplicitLocation) continue;
+		if (!reserveLocation(output.explicitLocation, output.name, "explicit GLSL layout")) return false;
+		compiler.set_decoration(output.resource->id, spv::DecorationLocation, output.explicitLocation);
+	}
+
+	// glBindFragDataLocation applies only when the shader has no explicit location.
+	for (const OutputLocation &output : outputs) {
+		if (output.hasExplicitLocation) continue;
+		auto binding = fragDataBindings.find(output.name);
+		if (binding == fragDataBindings.end()) continue;
+		if (!reserveLocation(binding->second, output.name, "glBindFragDataLocation")) return false;
+		compiler.set_decoration(output.resource->id, spv::DecorationLocation, binding->second);
+		log += "fragment output '" + output.name + "' bound to color location " +
+			std::to_string(binding->second) + " by glBindFragDataLocation\n";
+	}
+
+	// Keep an already unique glslang-generated location when possible. If two
+	// unqualified outputs share the same generated default, move only the later
+	// output to the lowest free color attachment instead of aliasing color(0).
+	for (const OutputLocation &output : outputs) {
+		if (output.hasExplicitLocation || fragDataBindings.find(output.name) != fragDataBindings.end()) continue;
+		uint32_t assignedLocation = output.currentLocation;
+		bool moved = !output.hasCurrentLocation || assignedLocation >= GL4METAL_MAX_FRAGMENT_OUTPUTS ||
+			occupied.find(assignedLocation) != occupied.end();
+		if (moved) {
+			assignedLocation = 0;
+			while (assignedLocation < GL4METAL_MAX_FRAGMENT_OUTPUTS && occupied.find(assignedLocation) != occupied.end()) {
+				++assignedLocation;
+			}
+			if (assignedLocation >= GL4METAL_MAX_FRAGMENT_OUTPUTS) {
+				log += "fragment shader has more active color outputs than Metal supports\n";
+				return false;
+			}
+		}
+		if (!reserveLocation(assignedLocation, output.name, moved ? "automatic collision resolution" : "generated location")) return false;
+		compiler.set_decoration(output.resource->id, spv::DecorationLocation, assignedLocation);
+		if (moved) {
+			log += "fragment output '" + output.name + "' remapped from generated color location " +
+				(output.hasCurrentLocation ? std::to_string(output.currentLocation) : std::string("(unset)")) +
+				" to " + std::to_string(assignedLocation) + " to avoid an output collision\n";
+		}
+	}
+	return true;
 }
 
 static bool collectVertexOutputLocations(const std::vector<unsigned int> &spirv,
@@ -1238,18 +1415,59 @@ static size_t widenMslFragmentColorOutputs(std::string &source,
 	return widened;
 }
 
+static std::unordered_map<std::string, uint32_t> collectStorageBlockBindings(const std::string &source);
+
+// GL_BUFFER_DATA_SIZE for an SSBO is the minimum storage needed by the block.
+// For a final runtime-sized array, include one element's std430 stride; applications
+// can use TOP_LEVEL_ARRAY_STRIDE to size larger ranges. SPIRV-Cross provides the
+// effective member offsets, sizes and strides through this API.
+static bool storageBlockRequiredSize(spirv_cross::CompilerMSL &compiler,
+	const spirv_cross::SPIRType &storageType, uint32_t &requiredSize) {
+	size_t requiredBytes = 0;
+	try {
+		for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+			const spirv_cross::SPIRType &memberType = compiler.get_type(storageType.member_types[memberIndex]);
+			const size_t memberOffset = compiler.type_struct_member_offset(storageType, memberIndex);
+			size_t memberSize = 0;
+			if (!memberType.array.empty() && memberType.array.back() == 0) {
+				// GL_BUFFER_DATA_SIZE for an unsized tail array is the minimum block
+				// size needed for one element. This also handles runtime arrays of structs,
+				// whose element extent is represented by the std430 array stride.
+				memberSize = compiler.type_struct_member_array_stride(storageType, memberIndex);
+				if (memberSize == 0) return false;
+			} else {
+				memberSize = compiler.get_declared_struct_member_size(storageType, memberIndex);
+			}
+			if (memberOffset > std::numeric_limits<size_t>::max() - memberSize) return false;
+			requiredBytes = std::max(requiredBytes, memberOffset + memberSize);
+		}
+	} catch (const std::exception &) {
+		// Never accept an SSBO range using a partial layout: doing so could expose
+		// an undersized MTLBuffer to generated device-pointer accesses.
+		return false;
+	}
+	if (requiredBytes > (size_t)UINT32_MAX) return false;
+	requiredSize = (uint32_t)requiredBytes;
+	return true;
+}
+
 // The vertex stage is compiled once. A function constant supplies the render-to-texture
 // Y-flip variant at function-specialization time, so no runtime branch is left in the shader.
 bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, int stage,
 	const std::unordered_set<std::string> &halfVaryingNames, bool fixFragmentFragCoordY,
 	const std::unordered_map<std::string, StageVaryingInfo> &vertexOutputLocations,
-	bool alignFragmentInputs, TranslatedProgram &out, TranslationLookup &lookup) {
+	bool alignFragmentInputs,
+	const std::vector<std::pair<std::string, uint32_t>> &explicitFragmentOutputLayouts,
+	const std::unordered_map<std::string, uint32_t> &fragDataBindings,
+	const std::unordered_map<std::string, uint32_t> &storageBlockBindings,
+	TranslatedProgram &out, TranslationLookup &lookup) {
 	try {
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 
 		spirv_cross::CompilerMSL::Options options;
 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
 		options.set_msl_version(2, 4);
+		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
 		msl.set_msl_options(options);
 
 		spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
@@ -1287,12 +1505,35 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		auto activeVariables = msl.get_active_interface_variables();
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
 
+		if (stage == FS && !assignFragmentOutputLocations(msl, resources,
+			explicitFragmentOutputLayouts, fragDataBindings, out.log)) return false;
+
 		// Uniform buffers and sampled images share SPIR-V's (set, binding) key
 		// space even though Metal places them in different resource namespaces.
 		// OpenGL sampler uniforms may carry the same default binding, so uniquify
 		// all resources participating in the explicit SPIRV-Cross remap table.
+		std::unordered_map<uint32_t, uint32_t> originalStorageBindings;
+		originalStorageBindings.reserve(resources.storage_buffers.size());
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+			const std::string blockName = msl.get_name(resource.base_type_id);
+			auto sourceBinding = storageBlockBindings.find(blockName);
+			const uint32_t bindingPoint = sourceBinding != storageBlockBindings.end()
+				? sourceBinding->second
+				: (msl.has_decoration(resource.id, spv::DecorationBinding)
+					? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u);
+			originalStorageBindings.emplace(resource.id, bindingPoint);
+		}
+		std::unordered_map<uint32_t, uint32_t> originalUniformBindings;
+		originalUniformBindings.reserve(resources.uniform_buffers.size());
+		for (const spirv_cross::Resource &resource : resources.uniform_buffers) {
+			const uint32_t bindingPoint = msl.has_decoration(resource.id, spv::DecorationBinding)
+				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
+			originalUniformBindings.emplace(resource.id, bindingPoint);
+		}
+
 		std::vector<const spirv_cross::Resource *> mappedResources;
-		mappedResources.reserve(resources.uniform_buffers.size() + resources.sampled_images.size());
+		mappedResources.reserve(resources.storage_buffers.size() + resources.uniform_buffers.size() + resources.sampled_images.size());
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) mappedResources.push_back(&resource);
 		for (const spirv_cross::Resource &resource : resources.uniform_buffers) mappedResources.push_back(&resource);
 		for (const spirv_cross::Resource &resource : resources.sampled_images) mappedResources.push_back(&resource);
 		if (!makeMslResourceBindingKeysUnique(msl, mappedResources,
@@ -1312,27 +1553,129 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 		}
 		msl.set_enabled_interface_variables(std::move(activeVariables));
 
-		// Uniform blocks: GL binding points are an independent namespace (36 on this backend).
-		// Metal buffer indices are per-stage slots: 16...29 for up to 14 active UBOs, and 30
-		// for GL's default uniform block. Do not derive the MSL slot from the GL binding point.
-		uint32_t nextUniformBlockBufferSlot = 16;
+		// Vertex attribute streams occupy vertex buffer slots 0...15. Fragment slot 15
+		// is reserved for the gl_FragCoord coordinate fixup. SSBOs and named UBOs share
+		// the remaining per-stage Metal buffer namespace, while GL binding points remain
+		// an independent namespace. Allocate SSBOs first, then UBOs, densely per stage.
+		uint32_t nextStageBufferSlot = stage == VS ? 16u : 0u;
+		auto allocateStageBufferSlot = [&]() -> uint32_t {
+			if (stage == FS && nextStageBufferSlot == GL4METAL_FRAGCOORD_BUFFER_INDEX) ++nextStageBufferSlot;
+			if (nextStageBufferSlot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX) return UINT32_MAX;
+			return nextStageBufferSlot++;
+		};
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+			const uint32_t metalSlot = allocateStageBufferSlot();
+			if (metalSlot == UINT32_MAX) {
+				out.log += std::string(stage == VS ? "vertex" : "fragment") +
+					" stage exhausts Metal buffer slots while mapping shader storage blocks\n";
+				return false;
+			}
+			const std::string blockName = msl.get_name(resource.base_type_id).empty()
+				? resource.name : msl.get_name(resource.base_type_id);
+			auto originalBinding = originalStorageBindings.find(resource.id);
+			const uint32_t glBindingPoint = originalBinding == originalStorageBindings.end() ? 0u : originalBinding->second;
+			if (glBindingPoint >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) {
+				out.log += "shader storage block '" + blockName + "' uses binding point " +
+					std::to_string(glBindingPoint) + ", exceeding GL4Metal's SSBO binding-point limit\n";
+				return false;
+			}
+
+			spirv_cross::MSLResourceBinding binding;
+			binding.stage = model;
+			binding.desc_set = msl.has_decoration(resource.id, spv::DecorationDescriptorSet)
+				? msl.get_decoration(resource.id, spv::DecorationDescriptorSet) : 0u;
+			binding.binding = msl.has_decoration(resource.id, spv::DecorationBinding)
+				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
+			binding.msl_buffer = metalSlot;
+			msl.add_msl_resource_binding(binding);
+
+			TranslatedStorageBuffer *reflected = nullptr;
+			auto found = lookup.storage_buffer_indices.find(blockName);
+			if (found == lookup.storage_buffer_indices.end()) {
+				const size_t storageIndex = out.storage_buffers.size();
+				out.storage_buffers.emplace_back();
+				out.storage_buffers.back().name = blockName;
+				lookup.storage_buffer_indices.emplace(blockName, storageIndex);
+				reflected = &out.storage_buffers.back();
+			} else {
+				reflected = &out.storage_buffers[found->second];
+				if (reflected->binding != glBindingPoint) {
+					out.log += "shader storage block '" + blockName + "' has inconsistent binding points between stages\n";
+					return false;
+				}
+			}
+			reflected->binding = glBindingPoint;
+			reflected->stage[stage].present = true;
+			reflected->stage[stage].slot = metalSlot;
+
+			const spirv_cross::SPIRType &storageType = msl.get_type(resource.base_type_id);
+			uint32_t requiredSize = 0;
+			if (!storageBlockRequiredSize(msl, storageType, requiredSize)) {
+				out.log += "could not compute a safe fixed-size prefix for shader storage block '" + blockName + "'\n";
+				return false;
+			}
+			reflected->required_size = std::max(reflected->required_size, requiredSize);
+			for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+				const spirv_cross::SPIRType &memberType = msl.get_type(storageType.member_types[memberIndex]);
+				if (!memberType.array.empty() && memberType.array.back() == 0) reflected->runtime_sized = true;
+				if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+					out.log += "SSBO member '" + msl.get_member_name(resource.base_type_id, memberIndex) +
+						"' is a nested struct; nested GL_BUFFER_VARIABLE reflection is not supported\n";
+					continue;
+				}
+				const std::string memberPrefix = resource.name.empty() ? blockName : resource.name;
+				const std::string memberName = memberPrefix + "." + msl.get_member_name(resource.base_type_id, memberIndex);
+				auto memberFound = std::find_if(reflected->members.begin(), reflected->members.end(),
+					[&memberName](const TranslatedUniform &candidate) { return candidate.name == memberName; });
+				TranslatedUniform *member = nullptr;
+				if (memberFound == reflected->members.end()) {
+					reflected->members.emplace_back();
+					reflected->members.back().name = memberName;
+					member = &reflected->members.back();
+				} else {
+					member = &*memberFound;
+				}
+				member->kind = kindOf(memberType.basetype);
+				member->vecsize = (int)memberType.vecsize;
+				member->columns = (int)memberType.columns;
+				member->array_size = (!memberType.array.empty() && !memberType.array_size_literal.empty() &&
+					!memberType.array_size_literal[0] && memberType.array.back() == 0) ? 0 : arraySizeOf(memberType);
+				TranslatedUniform::Stage &memberStage = member->stage[stage];
+				memberStage.present = true;
+				memberStage.offset = msl.type_struct_member_offset(storageType, memberIndex);
+				memberStage.array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(storageType, memberIndex);
+				memberStage.matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(storageType, memberIndex) : 0;
+				memberStage.row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+			}
+			reflected->active_variable_count = (uint32_t)reflected->members.size();
+		}
+
+		uint32_t nextUniformBlockBufferSlot = nextStageBufferSlot;
+		auto allocateUniformBlockBufferSlot = [&]() -> uint32_t {
+			if (stage == FS && nextUniformBlockBufferSlot == GL4METAL_FRAGCOORD_BUFFER_INDEX)
+				++nextUniformBlockBufferSlot;
+			if (nextUniformBlockBufferSlot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX) return UINT32_MAX;
+			return nextUniformBlockBufferSlot++;
+		};
 		for (const spirv_cross::Resource &r : resources.uniform_buffers) {
 			const spirv_cross::SPIRType &type = msl.get_type(r.base_type_id);
 			bool isDefault = msl.get_name(r.base_type_id) == "gl_DefaultUniformBlock" || r.name == "gl_DefaultUniformBlock";
-			uint32_t binding = msl.get_decoration(r.id, spv::DecorationBinding);
+			const uint32_t remappedBinding = msl.get_decoration(r.id, spv::DecorationBinding);
+			auto originalBinding = originalUniformBindings.find(r.id);
+			const uint32_t glBindingPoint = originalBinding == originalUniformBindings.end() ? 0u : originalBinding->second;
 
 			spirv_cross::MSLResourceBinding b;
 			b.stage = model;
 			b.desc_set = msl.get_decoration(r.id, spv::DecorationDescriptorSet);
-			b.binding = binding;
+			b.binding = remappedBinding;
 			if (isDefault) {
 				b.msl_buffer = GL4METAL_UNIFORM_BUFFER_INDEX;
 			} else {
-				if (nextUniformBlockBufferSlot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
-					out.log += "shader stage uses more than 14 active uniform blocks; Metal buffer slots are exhausted\n";
+				b.msl_buffer = allocateUniformBlockBufferSlot();
+				if (b.msl_buffer == UINT32_MAX) {
+					out.log += "shader stage exhausts Metal buffer slots while mapping uniform blocks and SSBOs\n";
 					return false;
 				}
-				b.msl_buffer = nextUniformBlockBufferSlot++;
 			}
 			msl.add_msl_resource_binding(b);
 
@@ -1362,6 +1705,7 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 				// is safe as long as the complete member extent remains in the allocation.
 				const uint32_t memberExtent = (uint32_t)blockSize;
 				const uint32_t std140Size = (uint32_t)((blockSize + 15) & ~(size_t)15);
+				block->binding = glBindingPoint;
 				block->size = std::max(block->size, std140Size);
 				block->required_size = std::max(block->required_size, memberExtent);
 				block->stage[stage].present = true;
@@ -1501,12 +1845,17 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			}
 		} else {
 			for (const spirv_cross::Resource &r : resources.stage_outputs) {
-				out.frag_outputs.emplace_back(r.name, msl.get_decoration(r.id, spv::DecorationLocation));
+				if (msl.has_decoration(r.id, spv::DecorationBuiltIn) ||
+					!msl.has_decoration(r.id, spv::DecorationLocation)) continue;
+				const std::string outputName = interfaceResourceName(msl, r);
+				if (outputName.empty()) continue;
+				out.frag_outputs.emplace_back(outputName, msl.get_decoration(r.id, spv::DecorationLocation));
 			}
 		}
 
 		sanitizeMslIdentifiers(msl, resources, stage == VS ? "vertex" : "fragment", out.log);
 		std::string compiledMsl = msl.compile();
+		out.needs_buffer_size_buffer[stage] = msl.needs_buffer_size_buffer();
 		if (stage == FS) {
 			std::string outputNotes;
 			const size_t widenedOutputs = widenMslFragmentColorOutputs(compiledMsl, msl, resources, outputNotes);
@@ -1560,6 +1909,18 @@ static bool parseLayoutBinding(const std::string &layout, uint32_t &bindingValue
 	} catch (...) {
 		return false;
 	}
+}
+
+static std::unordered_map<std::string, uint32_t> collectStorageBlockBindings(const std::string &source) {
+	std::unordered_map<std::string, uint32_t> result;
+	const std::string masked = maskShaderComments(source);
+	static const std::regex storageBlockPattern(
+		R"(layout\s*\(([^)]*)\)\s*(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*buffer\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{)");
+	for (std::sregex_iterator it(masked.begin(), masked.end(), storageBlockPattern), end; it != end; ++it) {
+		uint32_t bindingValue = 0;
+		if (parseLayoutBinding((*it)[1].str(), bindingValue)) result[(*it)[2].str()] = bindingValue;
+	}
+	return result;
 }
 
 static ComputeSourceBindings collectComputeSourceBindings(const std::string &source) {
@@ -1637,10 +1998,29 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 		spirv_cross::CompilerMSL::Options options;
 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
 		options.set_msl_version(2, 2);
+		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
 		msl.set_msl_options(options);
 
 		auto activeVariables = msl.get_active_interface_variables();
 		spirv_cross::ShaderResources resources = msl.get_shader_resources(activeVariables);
+
+		// Preserve the original GL SSBO binding before uniquifying SPIR-V resource
+		// keys for SPIRV-Cross. The source-text parser is only an optimization for
+		// literal layout(binding=N); macro-expanded bindings must come from SPIR-V.
+		std::unordered_map<uint32_t, uint32_t> originalStorageBindings;
+		originalStorageBindings.reserve(resources.storage_buffers.size());
+		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
+			const uint32_t bindingPoint = msl.has_decoration(resource.id, spv::DecorationBinding)
+				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
+			originalStorageBindings.emplace(resource.id, bindingPoint);
+		}
+		std::unordered_map<uint32_t, uint32_t> originalUniformBindings;
+		originalUniformBindings.reserve(resources.uniform_buffers.size());
+		for (const spirv_cross::Resource &resource : resources.uniform_buffers) {
+			const uint32_t bindingPoint = msl.has_decoration(resource.id, spv::DecorationBinding)
+				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
+			originalUniformBindings.emplace(resource.id, bindingPoint);
+		}
 
 		// All resource classes below are entered into SPIRV-Cross's explicit MSL
 		// remap table. Avoid duplicate (set, binding) keys across buffer and
@@ -1657,11 +2037,14 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 		msl.set_enabled_interface_variables(std::move(activeVariables));
 
 		// In Metal, buffer, texture and sampler namespaces are separate. Keep SSBOs
-		// in slots 0...15, named UBOs in 16...29, and GL's loose uniforms in slot 30.
+		// in slots 0...15, named UBOs in 16...28, the SPIRV-Cross OpArrayLength
+		// size table in slot 29, and GL's loose uniforms in slot 30.
 		std::vector<std::pair<uint32_t, const spirv_cross::Resource *>> storageBuffers;
 		storageBuffers.reserve(resources.storage_buffers.size());
 		for (const spirv_cross::Resource &resource : resources.storage_buffers) {
-			storageBuffers.emplace_back(msl.get_decoration(resource.id, spv::DecorationBinding), &resource);
+			auto originalBinding = originalStorageBindings.find(resource.id);
+			storageBuffers.emplace_back(originalBinding == originalStorageBindings.end() ? 0u : originalBinding->second,
+				&resource);
 		}
 		std::sort(storageBuffers.begin(), storageBuffers.end(), [](const auto &a, const auto &b) {
 			return a.first < b.first;
@@ -1673,36 +2056,58 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 		for (uint32_t slot = 0; slot < storageBuffers.size(); ++slot) {
 			const auto &resource = *storageBuffers[slot].second;
 			const std::string blockTypeName = msl.get_name(resource.base_type_id);
-			auto sourceBinding = sourceBindings.storageBlocks.find(blockTypeName);
-			const uint32_t glBindingPoint = sourceBinding == sourceBindings.storageBlocks.end() ? 0 : sourceBinding->second;
+			auto originalBinding = originalStorageBindings.find(resource.id);
+			const uint32_t glBindingPoint = originalBinding == originalStorageBindings.end() ? 0u : originalBinding->second;
 			if (glBindingPoint >= GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS) {
 				out.log += "compute storage-buffer binding exceeds GL4Metal's 16 SSBO binding points\n";
 				return false;
 			}
 			spirv_cross::MSLResourceBinding binding;
 			binding.stage = spv::ExecutionModelGLCompute;
-			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
-			binding.binding = storageBuffers[slot].first;
+			binding.desc_set = msl.has_decoration(resource.id, spv::DecorationDescriptorSet)
+				? msl.get_decoration(resource.id, spv::DecorationDescriptorSet) : 0u;
+			// Use the post-uniquification internal key for SPIRV-Cross's MSL remap,
+			// while keeping the original GL binding point in reflected state above.
+			binding.binding = msl.has_decoration(resource.id, spv::DecorationBinding)
+				? msl.get_decoration(resource.id, spv::DecorationBinding) : 0u;
 			binding.msl_buffer = slot;
 			msl.add_msl_resource_binding(binding);
 
 			TranslatedStorageBuffer reflected;
-			reflected.name = resource.name;
+			reflected.name = blockTypeName.empty() ? resource.name : blockTypeName;
 			reflected.binding = glBindingPoint;
 			reflected.slot = slot;
+			reflected.stage[2].present = true;
+			reflected.stage[2].slot = slot;
 			const spirv_cross::SPIRType &storageType = msl.get_type(resource.base_type_id);
-			for (uint32_t memberTypeId : storageType.member_types) {
-				const spirv_cross::SPIRType &memberType = msl.get_type(memberTypeId);
-				if (!memberType.array.empty() && memberType.array.back() == 0) {
-					reflected.runtime_sized = true;
+			if (!storageBlockRequiredSize(msl, storageType, reflected.required_size)) {
+				out.log += "could not compute a safe fixed-size prefix for compute shader storage block '" + reflected.name + "'\n";
+				return false;
+			}
+			for (uint32_t memberIndex = 0; memberIndex < storageType.member_types.size(); ++memberIndex) {
+				const spirv_cross::SPIRType &memberType = msl.get_type(storageType.member_types[memberIndex]);
+				if (!memberType.array.empty() && memberType.array.back() == 0) reflected.runtime_sized = true;
+				if (memberType.basetype == spirv_cross::SPIRType::Struct) {
+					out.log += "compute SSBO member '" + msl.get_member_name(resource.base_type_id, memberIndex) +
+						"' is a nested struct; nested GL_BUFFER_VARIABLE reflection is not supported\n";
+					continue;
 				}
+				TranslatedUniform member;
+				const std::string memberPrefix = resource.name.empty() ? reflected.name : resource.name;
+				member.name = memberPrefix + "." + msl.get_member_name(resource.base_type_id, memberIndex);
+				member.kind = kindOf(memberType.basetype);
+				member.vecsize = (int)memberType.vecsize;
+				member.columns = (int)memberType.columns;
+				member.array_size = (!memberType.array.empty() && !memberType.array_size_literal.empty() &&
+					!memberType.array_size_literal[0] && memberType.array.back() == 0) ? 0 : arraySizeOf(memberType);
+				member.stage[2].present = true;
+				member.stage[2].offset = msl.type_struct_member_offset(storageType, memberIndex);
+				member.stage[2].array_stride = memberType.array.empty() ? 0 : msl.type_struct_member_array_stride(storageType, memberIndex);
+				member.stage[2].matrix_stride = memberType.columns > 1 ? msl.type_struct_member_matrix_stride(storageType, memberIndex) : 0;
+				member.stage[2].row_major = msl.has_member_decoration(resource.base_type_id, memberIndex, spv::DecorationRowMajor);
+				reflected.members.push_back(std::move(member));
 			}
-			try {
-				reflected.required_size = (uint32_t)msl.get_declared_struct_size(storageType);
-			} catch (...) {
-				// Runtime-sized SSBO tails have no fixed minimum size in SPIR-V reflection.
-				reflected.required_size = 0;
-			}
+			reflected.active_variable_count = (uint32_t)reflected.members.size();
 			out.storage_buffers.push_back(std::move(reflected));
 		}
 
@@ -1711,15 +2116,18 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 			const spirv_cross::SPIRType &type = msl.get_type(resource.base_type_id);
 			const bool isDefault = msl.get_name(resource.base_type_id) == "gl_DefaultUniformBlock" ||
 				resource.name == "gl_DefaultUniformBlock";
+			const uint32_t remappedBinding = msl.get_decoration(resource.id, spv::DecorationBinding);
+			auto originalBinding = originalUniformBindings.find(resource.id);
+			const uint32_t glBindingPoint = originalBinding == originalUniformBindings.end() ? 0u : originalBinding->second;
 			spirv_cross::MSLResourceBinding binding;
 			binding.stage = spv::ExecutionModelGLCompute;
 			binding.desc_set = msl.get_decoration(resource.id, spv::DecorationDescriptorSet);
-			binding.binding = msl.get_decoration(resource.id, spv::DecorationBinding);
+			binding.binding = remappedBinding;
 			if (isDefault) {
 				binding.msl_buffer = GL4METAL_UNIFORM_BUFFER_INDEX;
 			} else {
-				if (nextUniformBufferSlot >= GL4METAL_UNIFORM_BUFFER_INDEX) {
-					out.log += "compute shader uses more than 14 active uniform blocks; Metal buffer slots are exhausted\n";
+				if (nextUniformBufferSlot >= GL4METAL_BUFFER_SIZE_BUFFER_INDEX) {
+					out.log += "compute shader uses more than 13 active uniform blocks; Metal buffer slots are exhausted\n";
 					return false;
 				}
 				binding.msl_buffer = nextUniformBufferSlot++;
@@ -1741,8 +2149,7 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 				}
 				TranslatedBlock &block = out.blocks[blockIndex];
 				const size_t blockSize = msl.get_declared_struct_size(type);
-				auto sourceBinding = sourceBindings.uniformBlocks.find(blockName);
-				block.binding = sourceBinding == sourceBindings.uniformBlocks.end() ? 0 : sourceBinding->second;
+				block.binding = glBindingPoint;
 				block.size = std::max(block.size, (uint32_t)((blockSize + 15) & ~(size_t)15));
 				block.required_size = std::max(block.required_size, (uint32_t)blockSize);
 				block.stage[2].present = true;
@@ -1904,6 +2311,7 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 		sanitizeMslIdentifiers(msl, resources, "compute", out.log);
 		out.msl[2] = msl.compile();
+		out.needs_buffer_size_buffer[2] = msl.needs_buffer_size_buffer();
 		return true;
 	} catch (const std::exception &e) {
 		out.log += std::string("compute stage, SPIRV-Cross: ") + e.what() + "\n";
@@ -2051,12 +2459,15 @@ bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t max
 	return true;
 }
 
-bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out) {
+bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+	const std::unordered_map<std::string, uint32_t> &fragDataBindings) {
 	out = TranslatedProgram();
 	initGlslang();
 
 	std::string vsText = patchVersion(vertexGLSL);
 	std::string fsText = patchVersion(fragmentGLSL);
+	const std::vector<std::pair<std::string, uint32_t>> explicitFragmentOutputLayouts =
+		collectExplicitFragmentOutputLayouts(fsText);
 	const bool fragmentUsesFragCoord = usesFragmentFragCoord(fsText);
 	const bool fragmentUsesUpperLeftOrigin = declaresFragCoordOriginUpperLeft(fsText);
 	const bool fixFragmentFragCoordY = fragmentUsesFragCoord && !fragmentUsesUpperLeftOrigin;
@@ -2071,13 +2482,13 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 	setupShader(fs, EShLangFragment, &fsSource);
 
 	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
-	const TBuiltInResource *resources = GetDefaultResources();
+	const TBuiltInResource resources = makeGL4MetalShaderResources();
 
-	if (!vs.parse(resources, 410, false, messages)) {
+	if (!vs.parse(&resources, 410, false, messages)) {
 		out.log += std::string("vertex shader:\n") + vs.getInfoLog() + vs.getInfoDebugLog();
 		return false;
 	}
-	if (!fs.parse(resources, 410, false, messages)) {
+	if (!fs.parse(&resources, 410, false, messages)) {
 		out.log += std::string("fragment shader:\n") + fs.getInfoLog() + fs.getInfoDebugLog();
 		return false;
 	}
@@ -2146,14 +2557,21 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 	lookup.uniform_indices.reserve(64);
 	lookup.block_indices.reserve(16);
 	lookup.block_member_indices.reserve(128);
+	lookup.storage_buffer_indices.reserve(16);
 
 	// Compile each GLSL stage once. The vertex function constant produces normal and
 	// texture-flipped variants from one Metal library at program-link time.
 	const std::unordered_map<std::string, StageVaryingInfo> noVertexOutputLocations;
+	const std::unordered_map<std::string, uint32_t> noFragmentOutputBindings;
+	const std::vector<std::pair<std::string, uint32_t>> noExplicitFragmentOutputLayouts;
+	const auto vertexStorageBindings = collectStorageBlockBindings(vertexGLSL);
+	const auto fragmentStorageBindings = collectStorageBlockBindings(fragmentGLSL);
 	if (!compileStage(std::move(spirv[VS]), spv::ExecutionModelVertex, VS, vertexHalfVaryings, false,
-		noVertexOutputLocations, false, out, lookup) ||
+		noVertexOutputLocations, false, noExplicitFragmentOutputLayouts, noFragmentOutputBindings,
+		vertexStorageBindings, out, lookup) ||
 		!compileStage(std::move(spirv[FS]), spv::ExecutionModelFragment, FS, fragmentHalfVaryings,
-		fixFragmentFragCoordY, vertexOutputLocations, alignFragmentInputs, out, lookup)) {
+		fixFragmentFragCoordY, vertexOutputLocations, alignFragmentInputs,
+		explicitFragmentOutputLayouts, fragDataBindings, fragmentStorageBindings, out, lookup)) {
 		return false;
 	}
 	// Vulkan SPIR-V legalization may represent GLSL bool uniforms as 32-bit uints.
@@ -2173,8 +2591,8 @@ bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &
 	glslang::TShader shader(EShLangCompute);
 	setupShader(shader, EShLangCompute, &computeSource);
 	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
-	const TBuiltInResource *resources = GetDefaultResources();
-	if (!shader.parse(resources, 430, false, messages)) {
+	const TBuiltInResource resources = makeGL4MetalShaderResources();
+	if (!shader.parse(&resources, 430, false, messages)) {
 		out.log += std::string("compute shader:\n") + shader.getInfoLog() + shader.getInfoDebugLog();
 		return false;
 	}

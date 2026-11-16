@@ -11,7 +11,24 @@
 // MARK: - Helpers
 // iOS notes: CPU-visible textures use MTLStorageModeShared (Managed does not exist on iOS), depth/stencil textures are
 // Private, and there are no 24-bit depth formats nor 24-bit RGB formats, so GL_DEPTH24_* maps to Depth32Float* and
-// GL_RGB8 to RGBA8.
+// GL_RGB8 to RGBA8. RGB5_A1 uses the native packed 16-bit format whenever the device accepts it as a sampled
+// render target; simulator/unsupported configurations fall back to RGBA8.
+static MTLPixelFormat rgb5A1MetalPixelFormat(void) {
+	if (!ctx.device) return MTLPixelFormatRGBA8Unorm;
+	static const void *cachedDeviceKey = nullptr;
+	static MTLPixelFormat cachedFormat = MTLPixelFormatInvalid;
+	const void *deviceKey = (__bridge const void *)ctx.device;
+	if (cachedDeviceKey != deviceKey || cachedFormat == MTLPixelFormatInvalid) {
+		MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatA1BGR5Unorm
+			width:1 height:1 mipmapped:NO];
+		descriptor.storageMode = MTLStorageModeShared;
+		descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+		id<MTLTexture> probeTexture = [ctx.device newTextureWithDescriptor:descriptor];
+		cachedFormat = probeTexture ? MTLPixelFormatA1BGR5Unorm : MTLPixelFormatRGBA8Unorm;
+		cachedDeviceKey = deviceKey;
+	}
+	return cachedFormat;
+}
 
 MTLPixelFormat metalPixelFormat(GLenum internalformat) {
 	switch (internalformat) {
@@ -25,6 +42,9 @@ MTLPixelFormat metalPixelFormat(GLenum internalformat) {
 			return MTLPixelFormatRG8Unorm;
 		case GL_RG8_SNORM:
 			return MTLPixelFormatRG8Snorm;
+		case GL_RGB5_A1:
+			return rgb5A1MetalPixelFormat();
+		case GL_R3_G3_B2:
 		case GL_RGB8:
 		case GL_RGB:
 		case GL_RGBA8:
@@ -369,6 +389,176 @@ static bool sourceLayout(GLenum format, int &comps, int idx[4]) {
 	}
 }
 
+// GL_R3_G3_B2 has no matching Metal pixel format. RGBA8 provides at least the
+// requested channel precision, remains renderable, and supplies the implicit alpha=1.
+static bool isRGB332PackedType(GLenum type) {
+	return type == GL_UNSIGNED_BYTE_3_3_2 || type == GL_UNSIGNED_BYTE_2_3_3_REV;
+}
+
+static void decodeRGB332Pixel(const uint8_t *source, GLenum type, uint8_t rgba[4]) {
+	const uint8_t packed = *source;
+	unsigned red = 0, green = 0, blue = 0;
+	if (type == GL_UNSIGNED_BYTE_3_3_2) {
+		red = (packed >> 5) & 0x7u;
+		green = (packed >> 2) & 0x7u;
+		blue = packed & 0x3u;
+	} else {
+		red = packed & 0x7u;
+		green = (packed >> 3) & 0x7u;
+		blue = (packed >> 6) & 0x3u;
+	}
+	rgba[0] = (uint8_t)((red * 255u + 3u) / 7u);
+	rgba[1] = (uint8_t)((green * 255u + 3u) / 7u);
+	rgba[2] = (uint8_t)((blue * 255u + 1u) / 3u);
+	rgba[3] = 0xffu;
+}
+
+// RGB5_A1 uploads target A1BGR5Unorm directly when available. Decode the two GL
+// 5:5:5:1 packed layouts into source-channel order before applying GL_RGBA/GL_BGRA swizzles;
+// scalar inputs are normalized and quantized to five color bits plus one alpha bit.
+static bool isRGBA5551PackedType(GLenum type) {
+	return type == GL_UNSIGNED_SHORT_5_5_5_1 || type == GL_UNSIGNED_SHORT_1_5_5_5_REV;
+}
+
+static void decodeRGBA5551Pixel(const uint8_t *source, GLenum type, bool swapBytes, uint8_t channels[4]) {
+	uint16_t packed = 0;
+	memcpy(&packed, source, sizeof(packed));
+	if (swapBytes) packed = (uint16_t)((packed >> 8) | (packed << 8));
+	unsigned first = 0, second = 0, third = 0, alpha = 0;
+	if (type == GL_UNSIGNED_SHORT_5_5_5_1) {
+		first = (packed >> 11) & 0x1fu;
+		second = (packed >> 6) & 0x1fu;
+		third = (packed >> 1) & 0x1fu;
+		alpha = packed & 0x1u;
+	} else {
+		first = packed & 0x1fu;
+		second = (packed >> 5) & 0x1fu;
+		third = (packed >> 10) & 0x1fu;
+		alpha = (packed >> 15) & 0x1u;
+	}
+	channels[0] = (uint8_t)((first * 255u + 15u) / 31u);
+	channels[1] = (uint8_t)((second * 255u + 15u) / 31u);
+	channels[2] = (uint8_t)((third * 255u + 15u) / 31u);
+	channels[3] = alpha ? 0xffu : 0u;
+}
+
+static float readA1BGR5SourceComponent(const uint8_t *pixel, GLenum type, int component, bool swapBytes) {
+	switch (type) {
+		case GL_BYTE: {
+			int8_t value = 0;
+			memcpy(&value, pixel + (size_t)component, sizeof(value));
+			return std::max(0.0f, (float)value / 127.0f);
+		}
+		case GL_UNSIGNED_BYTE:
+			return (float)pixel[component] / 255.0f;
+		case GL_UNSIGNED_INT_8_8_8_8_REV: {
+			// On iOS (little-endian), REV stores R,G,B,A bytes in memory order.
+			// GL_UNPACK_SWAP_BYTES reverses the packed 32-bit word as a whole.
+			const int byteIndex = swapBytes ? 3 - component : component;
+			return (float)pixel[byteIndex] / 255.0f;
+		}
+		case GL_SHORT: {
+			int16_t value = 0;
+			memcpy(&value, pixel + (size_t)component * 2, sizeof(value));
+			if (swapBytes) value = (int16_t)(((uint16_t)value >> 8) | ((uint16_t)value << 8));
+			return std::max(0.0f, (float)value / 32767.0f);
+		}
+		case GL_UNSIGNED_SHORT: {
+			uint16_t value = 0;
+			memcpy(&value, pixel + (size_t)component * 2, sizeof(value));
+			if (swapBytes) value = (uint16_t)((value >> 8) | (value << 8));
+			return (float)value / 65535.0f;
+		}
+		case GL_INT: {
+			int32_t value = 0;
+			const uint8_t *bytes = pixel + (size_t)component * 4;
+			if (!swapBytes) memcpy(&value, bytes, sizeof(value));
+			else { uint8_t reversed[4] = {bytes[3], bytes[2], bytes[1], bytes[0]}; memcpy(&value, reversed, sizeof(value)); }
+			return std::max(0.0f, (float)((double)value / 2147483647.0));
+		}
+		case GL_UNSIGNED_INT: {
+			uint32_t value = 0;
+			const uint8_t *bytes = pixel + (size_t)component * 4;
+			if (!swapBytes) memcpy(&value, bytes, sizeof(value));
+			else { uint8_t reversed[4] = {bytes[3], bytes[2], bytes[1], bytes[0]}; memcpy(&value, reversed, sizeof(value)); }
+			return (float)((double)value / 4294967295.0);
+		}
+		case GL_HALF_FLOAT: {
+			uint16_t value = 0;
+			memcpy(&value, pixel + (size_t)component * 2, sizeof(value));
+			if (swapBytes) value = (uint16_t)((value >> 8) | (value << 8));
+			const uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+			uint32_t exponent = (value >> 10) & 0x1fu;
+			uint32_t mantissa = value & 0x3ffu;
+			uint32_t bits = 0;
+			if (exponent == 0) {
+				if (mantissa == 0) bits = sign;
+				else {
+					int shift = 0;
+					while ((mantissa & 0x400u) == 0) { mantissa <<= 1; ++shift; }
+					mantissa &= 0x3ffu;
+					bits = sign | (uint32_t)(127 - 14 - shift) << 23 | (mantissa << 13);
+				}
+			} else if (exponent == 31) {
+				bits = sign | 0x7f800000u | (mantissa << 13);
+			} else {
+				bits = sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+			}
+			float result = 0.0f;
+			memcpy(&result, &bits, sizeof(result));
+			return result;
+		}
+		case GL_FLOAT: {
+			float value = 0.0f;
+			const uint8_t *componentBytes = pixel + (size_t)component * 4;
+			if (!swapBytes) memcpy(&value, componentBytes, sizeof(value));
+			else {
+				uint8_t ordered[4] = { componentBytes[3], componentBytes[2], componentBytes[1], componentBytes[0] };
+				memcpy(&value, ordered, sizeof(value));
+			}
+			return value;
+		}
+		default: return 0.0f;
+	}
+}
+
+static uint16_t packA1BGR5(const float rgba[4]) {
+	auto quantize5 = [](float value) -> uint16_t {
+		if (!std::isfinite(value)) value = 0.0f;
+		value = std::max(0.0f, std::min(1.0f, value));
+		return (uint16_t)(value * 31.0f + 0.5f);
+	};
+	const uint16_t red = quantize5(rgba[0]);
+	const uint16_t green = quantize5(rgba[1]);
+	const uint16_t blue = quantize5(rgba[2]);
+	const uint16_t alpha = std::isfinite(rgba[3]) && rgba[3] >= 0.5f ? 1u : 0u;
+	return (uint16_t)((alpha << 15) | (blue << 10) | (green << 5) | red);
+}
+
+static bool packA1BGR5Pixel(const uint8_t *source, GLenum type,
+	const int channelMap[4], int sourceComponents, bool swapBytes, uint16_t &packedOut) {
+	float rgba[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	if (isRGBA5551PackedType(type)) {
+		uint8_t decoded[4];
+		decodeRGBA5551Pixel(source, type, swapBytes, decoded);
+		for (int channel = 0; channel < 4; ++channel) {
+			if (channelMap[channel] >= 0) rgba[channel] = (float)decoded[channelMap[channel]] / 255.0f;
+		}
+	} else {
+		const int scalarBytes = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
+			(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 :
+			(type == GL_INT || type == GL_UNSIGNED_INT || type == GL_FLOAT) ? 4 : 0;
+		if (scalarBytes == 0) return false;
+		for (int channel = 0; channel < 4; ++channel) {
+			if (channelMap[channel] >= 0 && channelMap[channel] < sourceComponents) {
+				rgba[channel] = readA1BGR5SourceComponent(source, type, channelMap[channel], swapBytes);
+			}
+		}
+	}
+	packedOut = packA1BGR5(rgba);
+	return true;
+}
+
 // Components and bytes per component of the Metal formats we can write from the CPU.
 static bool destLayout(MTLPixelFormat f, int &comps, int &compSize) {
 	switch (f) {
@@ -419,9 +609,19 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 
 	int srcComps = 0, idx[4];
 	int dstComps = 0, dstCompSize = 0;
-	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
-		(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 : (type == GL_FLOAT ? 4 : 0);
+	const bool sourceFormatValid = sourceLayout(format, srcComps, idx);
+	const bool packedRGB332 = sourceFormatValid && format == GL_RGB && srcComps == 3 && isRGB332PackedType(type);
+	const bool packedRGBA5551 = sourceFormatValid && srcComps == 4 &&
+		(format == GL_RGBA || format == GL_BGRA) && isRGBA5551PackedType(type);
 	const MTLPixelFormat dstFormat = t.texture.pixelFormat;
+	const bool nativeA1BGR5 = dstFormat == MTLPixelFormatA1BGR5Unorm;
+	const bool rgb5A1Fallback = t.internalformat == GL_RGB5_A1 && !nativeA1BGR5 && dstFormat == MTLPixelFormatRGBA8Unorm;
+	const bool rgb5A1Path = nativeA1BGR5 || rgb5A1Fallback;
+	if (nativeA1BGR5) { dstComps = 1; dstCompSize = 2; }
+	else destLayout(dstFormat, dstComps, dstCompSize);
+	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
+		(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 :
+		(type == GL_INT || type == GL_UNSIGNED_INT || type == GL_FLOAT) ? 4 : 0;
 	const bool dstIs16Unorm = dstFormat == MTLPixelFormatR16Unorm || dstFormat == MTLPixelFormatRG16Unorm || dstFormat == MTLPixelFormatRGBA16Unorm;
 	const bool dstIs16Float = dstFormat == MTLPixelFormatR16Float || dstFormat == MTLPixelFormatRG16Float || dstFormat == MTLPixelFormatRGBA16Float;
 	const bool dstIs8Snorm = dstFormat == MTLPixelFormatR8Snorm || dstFormat == MTLPixelFormatRG8Snorm || dstFormat == MTLPixelFormatRGBA8Snorm;
@@ -429,8 +629,13 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 	const bool incompatible16Type = (dstIs16Unorm && type != GL_UNSIGNED_SHORT) || (dstIs16Float && type != GL_HALF_FLOAT);
 	const bool incompatibleSignedType = (dstIs8Snorm && type != GL_BYTE) || (dstIs16Snorm && type != GL_SHORT) ||
 		(!dstIs8Snorm && !dstIs16Snorm && (type == GL_BYTE || type == GL_SHORT));
-	if (!sourceLayout(format, srcComps, idx) || srcCompSize == 0 || !destLayout(dstFormat, dstComps, dstCompSize) ||
-		srcCompSize != dstCompSize || incompatible16Type || incompatibleSignedType ||
+	if (!sourceFormatValid || (!packedRGB332 && !packedRGBA5551 && srcCompSize == 0) ||
+		(!rgb5A1Path && !destLayout(dstFormat, dstComps, dstCompSize)) ||
+		(!rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
+		(packedRGB332 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+		(packedRGBA5551 && !nativeA1BGR5 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+		(!rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
+		(isRGBA5551PackedType(type) && !packedRGBA5551) ||
 		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("%s: unsupported upload, format 0x%X type 0x%X into MTLPixelFormat %d", caller, format, type, (int)t.texture.pixelFormat);
@@ -441,8 +646,9 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 	size_t srcBpp = 0, rowRawBytes = 0, srcRowBytes = 0;
 	const size_t rowLength = ctx.unpack_row_length > 0 ? (size_t)ctx.unpack_row_length : (size_t)w;
 	const size_t align = ctx.unpack_alignment > 0 ? (size_t)ctx.unpack_alignment : 1;
-	if (!checkedSizeMul((size_t)srcComps, (size_t)srcCompSize, srcBpp) ||
-		!checkedSizeMul(rowLength, srcBpp, rowRawBytes) || !checkedAlignSize(rowRawBytes, align, srcRowBytes)) {
+	srcBpp = packedRGB332 ? 1u : (packedRGBA5551 ? 2u : (size_t)srcComps * (size_t)srcCompSize);
+	if (srcBpp == 0 || !checkedSizeMul(rowLength, srcBpp, rowRawBytes) ||
+		!checkedAlignSize(rowRawBytes, align, srcRowBytes)) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: unpack row layout overflows addressable memory", caller);
 		return;
@@ -476,11 +682,13 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 
 	// Metal stores GL_RGB formats in a four-component texture. Preserve GL's
 	// default alpha of +1 even when the upload source happens to be GL_RGBA.
-	const bool logicalRgb = t.internalformat == GL_RGB || t.internalformat == GL_RGB8 ||
+	const bool directNativeA1BGR5 = nativeA1BGR5 && format == GL_RGBA &&
+		type == GL_UNSIGNED_SHORT_1_5_5_5_REV && !ctx.unpack_swap_bytes;
+	const bool logicalRgb = t.internalformat == GL_R3_G3_B2 || t.internalformat == GL_RGB || t.internalformat == GL_RGB8 ||
 		t.internalformat == GL_RGB8_SNORM || t.internalformat == GL_SRGB8 ||
 		t.internalformat == GL_RGB16 || t.internalformat == GL_RGB16_SNORM ||
 		t.internalformat == GL_RGB16F || t.internalformat == GL_RGB32F;
-	bool identical = (srcComps == dstComps) && !logicalRgb;
+	bool identical = (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
 	for (int c = 0; c < dstComps && identical; c++) identical = (idx[c] == c);
 	if (srcRowBytes < copyRowBytes) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -488,7 +696,7 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 			caller, (unsigned long)srcRowBytes, (unsigned long)copyRowBytes);
 		return;
 	}
-	if (identical && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1)) {
+	if ((identical || directNativeA1BGR5) && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1)) {
 		if (freshTextureStorage) {
 			// A just-allocated texture has no earlier GPU readers, so avoid a staging blit
 			// for the common initial texture upload.
@@ -517,6 +725,33 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		const uint8_t *s = src + (size_t)row * srcRowBytes;
 		uint8_t *d = tmp.data() + (size_t)row * tmpRowBytes;
 		for (GLsizei col = 0; col < w; col++, s += srcBpp, d += dstBpp) {
+			if (rgb5A1Path) {
+				uint16_t packed = 0;
+				if (!packA1BGR5Pixel(s, type, idx, srcComps, ctx.unpack_swap_bytes != GL_FALSE, packed)) {
+					gl4metalSetError(GL_INVALID_ENUM);
+					GL4METAL_LOG("%s: unsupported source type 0x%X for RGB5_A1 upload", caller, type);
+					return;
+				}
+				if (nativeA1BGR5) {
+					memcpy(d, &packed, sizeof(packed));
+				} else {
+					d[0] = (uint8_t)((((packed & 0x1fu) * 255u) + 15u) / 31u);
+					d[1] = (uint8_t)(((((packed >> 5) & 0x1fu) * 255u) + 15u) / 31u);
+					d[2] = (uint8_t)(((((packed >> 10) & 0x1fu) * 255u) + 15u) / 31u);
+					d[3] = (packed & 0x8000u) ? 255u : 0u;
+				}
+				continue;
+			}
+			if (packedRGB332) {
+				decodeRGB332Pixel(s, type, d);
+				continue;
+			}
+			if (packedRGBA5551) {
+				uint8_t sourceChannels[4];
+				decodeRGBA5551Pixel(s, type, ctx.unpack_swap_bytes != GL_FALSE, sourceChannels);
+				for (int c = 0; c < 4; ++c) d[c] = sourceChannels[idx[c]];
+				continue;
+			}
 			for (int c = 0; c < dstComps; c++) {
 				uint8_t *out = d + (size_t)c * dstCompSize;
 				if (logicalRgb && c == 3) {
@@ -572,9 +807,21 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 	}
 	if (w == 0 || h == 0 || d == 0) return;
 	int srcComps = 0, idx[4], dstComps = 0, dstCompSize = 0;
-	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
-		(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 : (type == GL_FLOAT ? 4 : 0);
+	const bool sourceFormatValid = sourceLayout(format, srcComps, idx);
+	const bool packedRGB332 = sourceFormatValid && format == GL_RGB && srcComps == 3 && isRGB332PackedType(type);
+	const bool packedRGBA5551 = sourceFormatValid && srcComps == 4 &&
+		(format == GL_RGBA || format == GL_BGRA) && isRGBA5551PackedType(type);
 	const MTLPixelFormat dstFormat = t.texture.pixelFormat;
+	const bool nativeA1BGR5 = dstFormat == MTLPixelFormatA1BGR5Unorm;
+	const bool rgb5A1Fallback = t.internalformat == GL_RGB5_A1 && !nativeA1BGR5 && dstFormat == MTLPixelFormatRGBA8Unorm;
+	const bool rgb5A1Path = nativeA1BGR5 || rgb5A1Fallback;
+	if (nativeA1BGR5) { dstComps = 1; dstCompSize = 2; }
+	else destLayout(dstFormat, dstComps, dstCompSize);
+	const bool directNativeA1BGR5 = nativeA1BGR5 && format == GL_RGBA &&
+		type == GL_UNSIGNED_SHORT_1_5_5_5_REV && !ctx.unpack_swap_bytes;
+	const int srcCompSize = (type == GL_UNSIGNED_BYTE || type == GL_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) ? 1 :
+		(type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 :
+		(type == GL_INT || type == GL_UNSIGNED_INT || type == GL_FLOAT) ? 4 : 0;
 	const bool dstIs16Unorm = dstFormat == MTLPixelFormatR16Unorm || dstFormat == MTLPixelFormatRG16Unorm || dstFormat == MTLPixelFormatRGBA16Unorm;
 	const bool dstIs16Float = dstFormat == MTLPixelFormatR16Float || dstFormat == MTLPixelFormatRG16Float || dstFormat == MTLPixelFormatRGBA16Float;
 	const bool dstIs8Snorm = dstFormat == MTLPixelFormatR8Snorm || dstFormat == MTLPixelFormatRG8Snorm || dstFormat == MTLPixelFormatRGBA8Snorm;
@@ -582,8 +829,13 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 	const bool incompatible16Type = (dstIs16Unorm && type != GL_UNSIGNED_SHORT) || (dstIs16Float && type != GL_HALF_FLOAT);
 	const bool incompatibleSignedType = (dstIs8Snorm && type != GL_BYTE) || (dstIs16Snorm && type != GL_SHORT) ||
 		(!dstIs8Snorm && !dstIs16Snorm && (type == GL_BYTE || type == GL_SHORT));
-	if (!sourceLayout(format, srcComps, idx) || srcCompSize == 0 || !destLayout(dstFormat, dstComps, dstCompSize) ||
-		srcCompSize != dstCompSize || incompatible16Type || incompatibleSignedType ||
+	if (!sourceFormatValid || (!packedRGB332 && !packedRGBA5551 && srcCompSize == 0) ||
+		(!rgb5A1Path && !destLayout(dstFormat, dstComps, dstCompSize)) ||
+		(!rgb5A1Path && !packedRGB332 && !packedRGBA5551 && srcCompSize != dstCompSize) ||
+		(packedRGB332 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+		(packedRGBA5551 && !nativeA1BGR5 && (dstFormat != MTLPixelFormatRGBA8Unorm || dstComps != 4 || dstCompSize != 1)) ||
+		(!rgb5A1Path && (incompatible16Type || incompatibleSignedType)) ||
+		(isRGBA5551PackedType(type) && !packedRGBA5551) ||
 		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("%s: unsupported 3D upload, format 0x%X type 0x%X into MTLPixelFormat %d",
@@ -595,8 +847,9 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 	const size_t rowLength = ctx.unpack_row_length > 0 ? (size_t)ctx.unpack_row_length : (size_t)w;
 	const size_t imageHeight = ctx.unpack_image_height > 0 ? (size_t)ctx.unpack_image_height : (size_t)h;
 	const size_t align = ctx.unpack_alignment > 0 ? (size_t)ctx.unpack_alignment : 1;
-	if (!checkedSizeMul((size_t)srcComps, (size_t)srcCompSize, srcBpp) ||
-		!checkedSizeMul(rowLength, srcBpp, rowRawBytes) || !checkedAlignSize(rowRawBytes, align, srcRowBytes) ||
+	srcBpp = packedRGB332 ? 1u : (packedRGBA5551 ? 2u : (size_t)srcComps * (size_t)srcCompSize);
+	if (srcBpp == 0 || !checkedSizeMul(rowLength, srcBpp, rowRawBytes) ||
+		!checkedAlignSize(rowRawBytes, align, srcRowBytes) ||
 		!checkedSizeMul(srcRowBytes, imageHeight, srcImageBytes) || srcRowBytes < (size_t)w * srcBpp) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("%s: invalid or overflowing 3D unpack row/image layout", caller);
@@ -634,11 +887,11 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 	}
 	const MTLRegion region = MTLRegionMake3D((NSUInteger)x, (NSUInteger)y, (NSUInteger)z,
 		(NSUInteger)w, (NSUInteger)h, (NSUInteger)d);
-	const bool logicalRgb = t.internalformat == GL_RGB || t.internalformat == GL_RGB8 ||
+	const bool logicalRgb = t.internalformat == GL_R3_G3_B2 || t.internalformat == GL_RGB || t.internalformat == GL_RGB8 ||
 		t.internalformat == GL_RGB8_SNORM || t.internalformat == GL_SRGB8 ||
 		t.internalformat == GL_RGB16 || t.internalformat == GL_RGB16_SNORM ||
 		t.internalformat == GL_RGB16F || t.internalformat == GL_RGB32F;
-	bool identical = (srcComps == dstComps) && !logicalRgb;
+	bool identical = (srcComps == dstComps) && !logicalRgb && !packedRGB332 && !packedRGBA5551 && !rgb5A1Path;
 	for (int c = 0; c < dstComps && identical; ++c) identical = (idx[c] == c);
 	if (srcRowBytes < copyRowBytes) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -648,7 +901,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 
 	// An image stride shorter than all copied rows is legal input memory overlap, but
 	// not a safe bytesPerImage for Metal's replaceRegion API; route it through packing.
-	const bool directRows = identical && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1);
+	const bool directRows = (identical || directNativeA1BGR5) && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1);
 	const bool directImages = srcImageBytes >= srcRowBytes * (size_t)h && srcImageBytes % dstBpp == 0;
 	if (directRows && directImages) {
 		if (t.texture.storageMode == MTLStorageModePrivate) {
@@ -690,6 +943,33 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 			for (GLsizei col = 0; col < w; ++col) {
 				const uint8_t *sp = sourceRow + (size_t)col * srcBpp;
 				uint8_t *dp = destRow + (size_t)col * dstBpp;
+				if (rgb5A1Path) {
+					uint16_t packed = 0;
+					if (!packA1BGR5Pixel(sp, type, idx, srcComps, ctx.unpack_swap_bytes != GL_FALSE, packed)) {
+						gl4metalSetError(GL_INVALID_ENUM);
+						GL4METAL_LOG("%s: unsupported source type 0x%X for 3D RGB5_A1 upload", caller, type);
+						return;
+					}
+					if (nativeA1BGR5) {
+						memcpy(dp, &packed, sizeof(packed));
+					} else {
+						dp[0] = (uint8_t)((((packed & 0x1fu) * 255u) + 15u) / 31u);
+						dp[1] = (uint8_t)(((((packed >> 5) & 0x1fu) * 255u) + 15u) / 31u);
+						dp[2] = (uint8_t)(((((packed >> 10) & 0x1fu) * 255u) + 15u) / 31u);
+						dp[3] = (packed & 0x8000u) ? 255u : 0u;
+					}
+					continue;
+				}
+				if (packedRGB332) {
+					decodeRGB332Pixel(sp, type, dp);
+					continue;
+				}
+				if (packedRGBA5551) {
+					uint8_t sourceChannels[4];
+					decodeRGBA5551Pixel(sp, type, ctx.unpack_swap_bytes != GL_FALSE, sourceChannels);
+					for (int c = 0; c < 4; ++c) dp[c] = sourceChannels[idx[c]];
+					continue;
+				}
 				for (int c = 0; c < dstComps; ++c) {
 					uint8_t *out = dp + (size_t)c * dstCompSize;
 					if (logicalRgb && c == 3) {
@@ -1262,7 +1542,10 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	}
 	if (!valid) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glTexImage2D: invalid level %d, size %dx%d or internalformat 0x%X", level, width, height, internalformat);
+		const GLuint texture_name = ctx.bound_textures[ctx.active_texture_unit][face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D];
+		GL4METAL_LOG("glTexImage2D: rejected level=%d size=%dx%d internalformat=0x%X mappedMetalFormat=%d texture=%u priorFormat=0x%X priorSize=%dx%d hasStorage=%d",
+			level, width, height, internalformat, (int)mtlFormat, texture_name, t->internalformat,
+			t->width, t->height, t->texture ? 1 : 0);
 		return;
 	}
 
@@ -1749,6 +2032,8 @@ static bool getTexImageBytesPerPixel(MTLPixelFormat format, NSUInteger &bytesPer
 		case MTLPixelFormatRGB10A2Unorm:
 		case MTLPixelFormatRG11B10Float:
 		case MTLPixelFormatRGB9E5Float: bytesPerPixel = 4; return true;
+		case MTLPixelFormatA1BGR5Unorm:
+			bytesPerPixel = 2; return true;
 		case MTLPixelFormatR16Unorm:
 		case MTLPixelFormatR16Float:
 		case MTLPixelFormatDepth16Unorm: bytesPerPixel = 2; return true;
@@ -1949,6 +2234,14 @@ static bool decodeTexturePixel(MTLPixelFormat format, const uint8_t *src, float 
 	auto unorm16 = [](uint16_t x) { return (float)x / 65535.0f; };
 	switch (format) {
 		case MTLPixelFormatR8Unorm: rgba[0] = unorm8(src[0]); return true;
+		case MTLPixelFormatA1BGR5Unorm: {
+			uint16_t packed = 0; memcpy(&packed, src, sizeof(packed));
+			rgba[0] = (float)(packed & 0x1fu) / 31.0f;
+			rgba[1] = (float)((packed >> 5) & 0x1fu) / 31.0f;
+			rgba[2] = (float)((packed >> 10) & 0x1fu) / 31.0f;
+			rgba[3] = (packed & 0x8000u) ? 1.0f : 0.0f;
+			return true;
+		}
 		case MTLPixelFormatRG8Unorm: rgba[0] = unorm8(src[0]); rgba[1] = unorm8(src[1]); return true;
 		case MTLPixelFormatRGBA8Unorm:
 		case MTLPixelFormatRGBA8Unorm_sRGB:
@@ -2372,12 +2665,20 @@ static bool encodeClearTexel(MTLPixelFormat format, GLenum internalformat, GLenu
 		}
 	}
 
-	const bool logicalRgb = internalformat == GL_RGB || internalformat == GL_RGB8 ||
+	const bool logicalRgb = internalformat == GL_R3_G3_B2 || internalformat == GL_RGB || internalformat == GL_RGB8 ||
 		internalformat == GL_RGB8_SNORM || internalformat == GL_SRGB8 ||
 		internalformat == GL_RGB16 || internalformat == GL_RGB16_SNORM ||
 		internalformat == GL_RGB16F || internalformat == GL_RGB32F;
 	if (logicalRgb) rgba[3] = 1.0f;
-
+	// The fallback backing texture is RGBA8, but GL_RGB5_A1 semantics still quantize
+	// each clear to 5:5:5:1 before expanding it into the 8-bit Metal storage.
+	if (internalformat == GL_RGB5_A1 && format != MTLPixelFormatA1BGR5Unorm) {
+		const uint16_t packed = packA1BGR5(rgba);
+		rgba[0] = (float)(packed & 0x1fu) / 31.0f;
+		rgba[1] = (float)((packed >> 5) & 0x1fu) / 31.0f;
+		rgba[2] = (float)((packed >> 10) & 0x1fu) / 31.0f;
+		rgba[3] = (packed & 0x8000u) ? 1.0f : 0.0f;
+	}
 	memset(out, 0, 16);
 	if (format == MTLPixelFormatDepth16Unorm) {
 		bytesPerPixel = 2;
@@ -2406,6 +2707,12 @@ static bool encodeClearTexel(MTLPixelFormat format, GLenum internalformat, GLenu
 	}
 	if (format == MTLPixelFormatDepth32Float_Stencil8) return false; // combined aspect clear requires two aspect-specific blits.
 
+	if (format == MTLPixelFormatA1BGR5Unorm) {
+		bytesPerPixel = 2;
+		const uint16_t packed = packA1BGR5(rgba);
+		memcpy(out, &packed, sizeof(packed));
+		return true;
+	}
 	int destinationComponents = 0, componentBytes = 0;
 	if (destLayout(format, destinationComponents, componentBytes)) {
 		bytesPerPixel = (size_t)destinationComponents * (size_t)componentBytes;
