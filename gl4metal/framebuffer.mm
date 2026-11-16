@@ -11,11 +11,19 @@
 extern void invalidateDrawEncoderStateCache(void);
 
 #include <mutex>
+#include <atomic>
+#include <cstdint>
+#include <cstddef>
+#include <algorithm>
+#include <utility>
+#include <functional>
+#include <unordered_map>
 #include <new>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <unordered_set>
+#include <sstream>
 
 
 // MARK: - Render passes
@@ -1018,15 +1026,456 @@ static inline double clamp01(double v) {
 	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
 }
 
-void glClear(GLbitfield mask) {
-	mask &= (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-	if (mask == 0) {
+enum class ClearValueKind : uint8_t {
+	Float,
+	SignedInteger,
+	UnsignedInteger
+};
+
+enum class ClearOutputKind : uint8_t {
+	Float,
+	SignedInteger,
+	UnsignedInteger
+};
+
+struct ClearColorValue {
+	ClearValueKind kind = ClearValueKind::Float;
+	float floatValues[4] = {};
+	int32_t signedValues[4] = {};
+	uint32_t unsignedValues[4] = {};
+};
+
+// MSL uses 16-byte vector alignment. This layout intentionally mirrors ClearParams below.
+struct alignas(16) ClearFragmentParameters {
+	float floatColors[GL4METAL_MAX_COLOR_ATTACHMENTS][4] = {};
+	int32_t signedColors[GL4METAL_MAX_COLOR_ATTACHMENTS][4] = {};
+	uint32_t unsignedColors[GL4METAL_MAX_COLOR_ATTACHMENTS][4] = {};
+	float depth = 1.0f;
+};
+static_assert(GL4METAL_MAX_COLOR_ATTACHMENTS == 8, "Clear MSL arrays must match the GL color attachment limit");
+static_assert(offsetof(ClearFragmentParameters, signedColors) == 128, "Clear parameter signed-color offset mismatch");
+static_assert(offsetof(ClearFragmentParameters, unsignedColors) == 256, "Clear parameter unsigned-color offset mismatch");
+static_assert(offsetof(ClearFragmentParameters, depth) == 384, "Clear parameter depth offset mismatch");
+static_assert(sizeof(ClearFragmentParameters) == 400, "Clear parameter size mismatch");
+
+static ClearOutputKind clearOutputKindForPixelFormat(MTLPixelFormat format) {
+	switch (format) {
+		case MTLPixelFormatR8Sint: case MTLPixelFormatR16Sint: case MTLPixelFormatR32Sint:
+		case MTLPixelFormatRG8Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG32Sint:
+		case MTLPixelFormatRGBA8Sint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Sint:
+			return ClearOutputKind::SignedInteger;
+		case MTLPixelFormatR8Uint: case MTLPixelFormatR16Uint: case MTLPixelFormatR32Uint:
+		case MTLPixelFormatRG8Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRG32Uint:
+		case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA32Uint:
+		case MTLPixelFormatRGB10A2Uint:
+			return ClearOutputKind::UnsignedInteger;
+		default:
+			return ClearOutputKind::Float;
+	}
+}
+
+static bool clearMaskHasAnyComponent(const GLboolean mask[4]) {
+	return mask[0] || mask[1] || mask[2] || mask[3];
+}
+
+static MTLColorWriteMask metalClearWriteMask(const GLboolean mask[4]) {
+	MTLColorWriteMask result = MTLColorWriteMaskNone;
+	if (mask[0]) result |= MTLColorWriteMaskRed;
+	if (mask[1]) result |= MTLColorWriteMaskGreen;
+	if (mask[2]) result |= MTLColorWriteMaskBlue;
+	if (mask[3]) result |= MTLColorWriteMaskAlpha;
+	return result;
+}
+
+static bool colorMaskIsFull(const GLboolean mask[4]) {
+	return mask[0] && mask[1] && mask[2] && mask[3];
+}
+
+static bool getEffectiveClearScissor(MTLScissorRect &rect) {
+	const NSInteger width = (NSInteger)ctx.render_target_width;
+	const NSInteger height = (NSInteger)ctx.render_target_height;
+	if (width <= 0 || height <= 0) return false;
+
+	NSInteger x0 = 0, y0 = 0, x1 = width, y1 = height;
+	if (ctx.scissor_test_enabled) {
+		const NSInteger sx0 = (NSInteger)ctx.scissor.x;
+		const NSInteger sy0 = (NSInteger)ctx.scissor.y;
+		const NSInteger sx1 = sx0 + (NSInteger)ctx.scissor.w;
+		const NSInteger sy1 = sy0 + (NSInteger)ctx.scissor.h;
+		const bool mirror = !ctx.pass_flipped;
+		const NSInteger mappedY0 = mirror ? height - sy1 : sy0;
+		const NSInteger mappedY1 = mirror ? height - sy0 : sy1;
+		x0 = std::min<NSInteger>(std::max<NSInteger>(sx0, 0), width);
+		x1 = std::min<NSInteger>(std::max<NSInteger>(sx1, 0), width);
+		y0 = std::min<NSInteger>(std::max<NSInteger>(mappedY0, 0), height);
+		y1 = std::min<NSInteger>(std::max<NSInteger>(mappedY1, 0), height);
+	}
+	if (x1 <= x0 || y1 <= y0) return false;
+	rect.x = (NSUInteger)x0;
+	rect.y = (NSUInteger)y0;
+	rect.width = (NSUInteger)(x1 - x0);
+	rect.height = (NSUInteger)(y1 - y0);
+	return true;
+}
+
+static void appendClearKeyValue(std::string &key, uint64_t value) {
+	key.append(reinterpret_cast<const char *>(&value), sizeof(value));
+}
+
+static std::string clearShaderSource(uint32_t colorOutputMask, bool writeDepth,
+	const ClearOutputKind outputKinds[GL4METAL_MAX_COLOR_ATTACHMENTS]) {
+	std::ostringstream source;
+	source << R"MSL(#include <metal_stdlib>
+using namespace metal;
+
+struct ClearParams {
+    float4 floatColors[8];
+    int4 signedColors[8];
+    uint4 unsignedColors[8];
+    float depth;
+};
+)MSL";
+
+	if (colorOutputMask != 0 || writeDepth) {
+		source << "struct ClearOutput {\n";
+		for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+			if ((colorOutputMask & (1u << attachment)) == 0) continue;
+			const char *typeName = "float4";
+			if (outputKinds[attachment] == ClearOutputKind::SignedInteger) typeName = "int4";
+			else if (outputKinds[attachment] == ClearOutputKind::UnsignedInteger) typeName = "uint4";
+			source << "    " << typeName << " color" << attachment << " [[color(" << attachment << ")]];\n";
+		}
+		if (writeDepth) source << "    float depth [[depth(any)]];\n";
+		source << "};\n";
+	}
+
+	source << R"MSL(
+vertex float4 clearVertex(uint vertexIndex [[vertex_id]]) {
+    float2 position = float2(-1.0, -1.0);
+    if (vertexIndex == 1) position = float2(3.0, -1.0);
+    else if (vertexIndex == 2) position = float2(-1.0, 3.0);
+    return float4(position, 0.0, 1.0);
+}
+)MSL";
+
+	if (colorOutputMask != 0 || writeDepth) {
+		source << "fragment ClearOutput clearFragment(constant ClearParams& params [[buffer(0)]]) {\n";
+		source << "    ClearOutput output;\n";
+		for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+			if ((colorOutputMask & (1u << attachment)) == 0) continue;
+			const char *fieldName = "floatColors";
+			if (outputKinds[attachment] == ClearOutputKind::SignedInteger) fieldName = "signedColors";
+			else if (outputKinds[attachment] == ClearOutputKind::UnsignedInteger) fieldName = "unsignedColors";
+			source << "    output.color" << attachment << " = params." << fieldName << "[" << attachment << "];\n";
+		}
+		if (writeDepth) source << "    output.depth = params.depth;\n";
+		source << "    return output;\n}\n";
+	}
+	return source.str();
+}
+
+static id<MTLRenderPipelineState> clearPipeline(uint32_t colorOutputMask, bool writeDepth,
+	const ClearOutputKind outputKinds[GL4METAL_MAX_COLOR_ATTACHMENTS]) {
+	using ClearPipelineCache = std::unordered_map<std::string, id<MTLRenderPipelineState>>;
+	static thread_local ClearPipelineCache *cache = new ClearPipelineCache();
+	if (!ctx.device) return nil;
+
+	std::string key;
+	appendClearKeyValue(key, (uint64_t)(uintptr_t)(__bridge void *)ctx.device);
+	appendClearKeyValue(key, colorOutputMask);
+	appendClearKeyValue(key, writeDepth ? 1u : 0u);
+	appendClearKeyValue(key, (uint64_t)ctx.pass_depth_format);
+	appendClearKeyValue(key, (uint64_t)ctx.pass_stencil_format);
+	appendClearKeyValue(key, (uint64_t)ctx.pass_sample_count);
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		appendClearKeyValue(key, (uint64_t)ctx.pass_color_format[attachment]);
+		appendClearKeyValue(key, (uint64_t)outputKinds[attachment]);
+		appendClearKeyValue(key, (uint64_t)metalClearWriteMask(ctx.color_masks[attachment]));
+	}
+	auto cached = cache->find(key);
+	if (cached != cache->end()) return cached->second;
+
+	const std::string source = clearShaderSource(colorOutputMask, writeDepth, outputKinds);
+	NSString *sourceString = [NSString stringWithUTF8String:source.c_str()];
+	NSError *libraryError = nil;
+	id<MTLLibrary> library = sourceString ? [ctx.device newLibraryWithSource:sourceString options:nil error:&libraryError] : nil;
+	if (!library) {
+		GL4METAL_LOG("glClear: failed to compile Metal clear shader: %s",
+			libraryError ? libraryError.localizedDescription.UTF8String : "invalid MSL source");
+		cache->emplace(std::move(key), nil);
+		return nil;
+	}
+	id<MTLFunction> vertexFunction = [library newFunctionWithName:@"clearVertex"];
+	id<MTLFunction> fragmentFunction = (colorOutputMask != 0 || writeDepth)
+		? [library newFunctionWithName:@"clearFragment"] : nil;
+	if (!vertexFunction || ((colorOutputMask != 0 || writeDepth) && !fragmentFunction)) {
+		GL4METAL_LOG("glClear: Metal clear shader is missing an entry point");
+		cache->emplace(std::move(key), nil);
+		return nil;
+	}
+
+	MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+	descriptor.vertexFunction = vertexFunction;
+	// A nil fragment function is the Metal depth/stencil-only path. Rasterization
+	// still updates depth/stencil, while no color fragment outputs are generated.
+	descriptor.fragmentFunction = fragmentFunction;
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		if (ctx.pass_color_format[attachment] == MTLPixelFormatInvalid) continue;
+		MTLRenderPipelineColorAttachmentDescriptor *color = descriptor.colorAttachments[attachment];
+		color.pixelFormat = ctx.pass_color_format[attachment];
+		color.writeMask = (colorOutputMask & (1u << attachment))
+			? metalClearWriteMask(ctx.color_masks[attachment]) : MTLColorWriteMaskNone;
+	}
+	descriptor.depthAttachmentPixelFormat = ctx.pass_depth_format;
+	descriptor.stencilAttachmentPixelFormat = ctx.pass_stencil_format;
+	descriptor.rasterSampleCount = std::max<NSUInteger>(1, ctx.pass_sample_count);
+
+	NSError *pipelineError = nil;
+	id<MTLRenderPipelineState> pipeline = [ctx.device newRenderPipelineStateWithDescriptor:descriptor error:&pipelineError];
+	if (!pipeline) {
+		GL4METAL_LOG("glClear: failed to create Metal clear pipeline: %s",
+			pipelineError ? pipelineError.localizedDescription.UTF8String : "unknown Metal pipeline error");
+	}
+	cache->emplace(std::move(key), pipeline);
+	return pipeline;
+}
+
+static id<MTLDepthStencilState> clearDepthStencilState(bool writeDepth, bool writeStencil,
+	uint32_t frontStencilMask, uint32_t backStencilMask) {
+	using ClearDepthCache = std::unordered_map<std::string, id<MTLDepthStencilState>>;
+	static thread_local ClearDepthCache *cache = new ClearDepthCache();
+	std::string key;
+	appendClearKeyValue(key, (uint64_t)(uintptr_t)(__bridge void *)ctx.device);
+	appendClearKeyValue(key, (uint64_t)ctx.pass_depth_format);
+	appendClearKeyValue(key, (uint64_t)ctx.pass_stencil_format);
+	appendClearKeyValue(key, writeDepth ? 1u : 0u);
+	appendClearKeyValue(key, writeStencil ? 1u : 0u);
+	appendClearKeyValue(key, frontStencilMask);
+	appendClearKeyValue(key, backStencilMask);
+	auto cached = cache->find(key);
+	if (cached != cache->end()) return cached->second;
+
+	MTLDepthStencilDescriptor *descriptor = [[MTLDepthStencilDescriptor alloc] init];
+	descriptor.depthCompareFunction = MTLCompareFunctionAlways;
+	descriptor.depthWriteEnabled = writeDepth ? YES : NO;
+	auto makeClearStencil = [](uint32_t writeMask) {
+		MTLStencilDescriptor *stencil = [[MTLStencilDescriptor alloc] init];
+		stencil.stencilCompareFunction = MTLCompareFunctionAlways;
+		stencil.stencilFailureOperation = MTLStencilOperationKeep;
+		stencil.depthFailureOperation = MTLStencilOperationKeep;
+		stencil.depthStencilPassOperation = writeMask ? MTLStencilOperationReplace : MTLStencilOperationKeep;
+		stencil.readMask = UINT32_MAX;
+		stencil.writeMask = writeMask;
+		return stencil;
+	};
+	descriptor.frontFaceStencil = makeClearStencil(writeStencil ? frontStencilMask : 0);
+	descriptor.backFaceStencil = makeClearStencil(writeStencil ? backStencilMask : 0);
+	id<MTLDepthStencilState> state = [ctx.device newDepthStencilStateWithDescriptor:descriptor];
+	cache->emplace(std::move(key), state);
+	return state;
+}
+
+static bool drawBufferHasColorTarget(GLint drawbuffer) {
+	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) return false;
+	if (ctx.draw_fbo == 0) return drawbuffer == 0;
+	auto fbo = GL4METAL_FBO_FIND(ctx.draw_fbo);
+	return fbo != ctx.fbo_objects.end() && fbo->second.draw_buffers[drawbuffer] != GL_NONE;
+}
+
+static bool anyWritableColorTarget(GLint drawbuffer) {
+	for (int index = 0; index < GL4METAL_MAX_COLOR_ATTACHMENTS; ++index) {
+		if (drawbuffer >= 0 && index != drawbuffer) continue;
+		if (drawBufferHasColorTarget(index) && clearMaskHasAnyComponent(ctx.color_masks[index])) return true;
+	}
+	return false;
+}
+
+static bool allColorTargetsHaveFullMask() {
+	bool foundTarget = false;
+	const int limit = ctx.draw_fbo == 0 ? 1 : GL4METAL_MAX_COLOR_ATTACHMENTS;
+	for (int index = 0; index < limit; ++index) {
+		if (!drawBufferHasColorTarget(index)) continue;
+		foundTarget = true;
+		if (!colorMaskIsFull(ctx.color_masks[index])) return false;
+	}
+	return foundTarget;
+}
+
+static bool framebufferColorLoadClearIsFloatCompatible() {
+	if (ctx.draw_fbo == 0) return true;
+	auto fbo = GL4METAL_FBO_FIND(ctx.draw_fbo);
+	if (fbo == ctx.fbo_objects.end()) return false;
+	for (int index = 0; index < GL4METAL_MAX_COLOR_ATTACHMENTS; ++index) {
+		if (fbo->second.draw_buffers[index] == GL_NONE) continue;
+		const GLenum attachmentEnum = fbo->second.draw_buffers[index];
+		if (attachmentEnum < GL_COLOR_ATTACHMENT0 || attachmentEnum >= GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) continue;
+		id<MTLTexture> texture = attachmentTexture(fbo->second.color[attachmentEnum - GL_COLOR_ATTACHMENT0]);
+		if (texture && clearOutputKindForPixelFormat(texture.pixelFormat) != ClearOutputKind::Float) return false;
+	}
+	return true;
+}
+
+static void populateClearColor(ClearFragmentParameters &parameters, int attachment,
+	MTLPixelFormat pixelFormat, const ClearColorValue &value, bool allowFloatToInteger) {
+	const ClearOutputKind outputKind = clearOutputKindForPixelFormat(pixelFormat);
+	for (int component = 0; component < 4; ++component) {
+		if (outputKind == ClearOutputKind::Float) {
+			if (value.kind == ClearValueKind::Float) parameters.floatColors[attachment][component] = value.floatValues[component];
+			else if (value.kind == ClearValueKind::SignedInteger) parameters.floatColors[attachment][component] = (float)value.signedValues[component];
+			else parameters.floatColors[attachment][component] = (float)value.unsignedValues[component];
+		} else if (outputKind == ClearOutputKind::SignedInteger) {
+			if (value.kind == ClearValueKind::SignedInteger) parameters.signedColors[attachment][component] = value.signedValues[component];
+			else if (value.kind == ClearValueKind::UnsignedInteger) parameters.signedColors[attachment][component] = value.unsignedValues[component] > (uint32_t)INT32_MAX ? INT32_MAX : (int32_t)value.unsignedValues[component];
+			else if (allowFloatToInteger) {
+				const double v = value.floatValues[component];
+				parameters.signedColors[attachment][component] = v >= (double)INT32_MAX ? INT32_MAX : (v <= (double)INT32_MIN ? INT32_MIN : (int32_t)v);
+			}
+		} else {
+			if (value.kind == ClearValueKind::UnsignedInteger) parameters.unsignedColors[attachment][component] = value.unsignedValues[component];
+			else if (value.kind == ClearValueKind::SignedInteger) parameters.unsignedColors[attachment][component] = value.signedValues[component] < 0 ? 0u : (uint32_t)value.signedValues[component];
+			else if (allowFloatToInteger) {
+				const double v = value.floatValues[component];
+				parameters.unsignedColors[attachment][component] = v <= 0.0 ? 0u : (v >= (double)UINT32_MAX ? UINT32_MAX : (uint32_t)v);
+			}
+		}
+	}
+}
+
+static GLbitfield fastClearLoadMask(GLbitfield mask, bool allowFastColor) {
+	if (ctx.scissor_test_enabled) return 0;
+	GLbitfield fastMask = 0;
+	if ((mask & GL_COLOR_BUFFER_BIT) && allowFastColor && allColorTargetsHaveFullMask() && framebufferColorLoadClearIsFloatCompatible())
+		fastMask |= GL_COLOR_BUFFER_BIT;
+	if ((mask & GL_DEPTH_BUFFER_BIT) && ctx.depth_write_enabled)
+		fastMask |= GL_DEPTH_BUFFER_BIT;
+	// OpenGL glClear uses the front stencil write mask even when the back mask differs.
+	if ((mask & GL_STENCIL_BUFFER_BIT) && ctx.stencil_front.write_mask == UINT32_MAX)
+		fastMask |= GL_STENCIL_BUFFER_BIT;
+	return fastMask;
+}
+
+static void performFramebufferClear(GLbitfield mask, GLint drawbuffer,
+	const ClearColorValue *colorValue, GLfloat depthValue, GLint stencilValue, bool allowFastLoad) {
+	mask &= GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+	if (mask == 0) return;
+	if ((mask & GL_COLOR_BUFFER_BIT) && !anyWritableColorTarget(drawbuffer)) mask &= ~GL_COLOR_BUFFER_BIT;
+	if ((mask & GL_DEPTH_BUFFER_BIT) && !ctx.depth_write_enabled) mask &= ~GL_DEPTH_BUFFER_BIT;
+	const bool hasStencilWriteMask = ctx.stencil_front.write_mask != 0;
+	if ((mask & GL_STENCIL_BUFFER_BIT) && !hasStencilWriteMask) mask &= ~GL_STENCIL_BUFFER_BIT;
+	if (mask == 0) return;
+
+	const GLbitfield fastMask = allowFastLoad && drawbuffer < 0
+		? fastClearLoadMask(mask, true) : 0;
+	id<MTLRenderCommandEncoder> encoder = beginRenderPass(fastMask);
+	if (!encoder) return;
+	const GLbitfield drawMask = mask & ~fastMask;
+	if (drawMask == 0) return; // Metal performed the full-attachment clears as load actions.
+
+	MTLScissorRect scissorRect;
+	if (!getEffectiveClearScissor(scissorRect)) return;
+
+	uint32_t colorOutputMask = 0;
+	ClearOutputKind outputKinds[GL4METAL_MAX_COLOR_ATTACHMENTS];
+	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		outputKinds[attachment] = ClearOutputKind::Float;
+		if ((drawMask & GL_COLOR_BUFFER_BIT) == 0 || (drawbuffer >= 0 && drawbuffer != attachment)) continue;
+		if (ctx.pass_color_format[attachment] == MTLPixelFormatInvalid || !clearMaskHasAnyComponent(ctx.color_masks[attachment])) continue;
+		outputKinds[attachment] = clearOutputKindForPixelFormat(ctx.pass_color_format[attachment]);
+		if (colorValue && colorValue->kind == ClearValueKind::SignedInteger && outputKinds[attachment] != ClearOutputKind::SignedInteger) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		if (colorValue && colorValue->kind == ClearValueKind::UnsignedInteger && outputKinds[attachment] != ClearOutputKind::UnsignedInteger) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		if (colorValue && colorValue->kind == ClearValueKind::Float && outputKinds[attachment] != ClearOutputKind::Float && !allowFastLoad) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		colorOutputMask |= (1u << attachment);
+	}
+
+	const bool writeDepth = (drawMask & GL_DEPTH_BUFFER_BIT) != 0 && ctx.pass_depth_format != MTLPixelFormatInvalid;
+	// Per OpenGL semantics, clears always use GL_STENCIL_WRITEMASK (front face),
+	// not GL_STENCIL_BACK_WRITEMASK. Apply that same mask to both Metal faces so
+	// the fullscreen primitive's winding cannot change the clear result.
+	const uint32_t frontStencilMask = ctx.stencil_front.write_mask;
+	const bool writeStencil = (drawMask & GL_STENCIL_BUFFER_BIT) != 0 &&
+		ctx.pass_stencil_format != MTLPixelFormatInvalid && frontStencilMask != 0;
+	if (colorOutputMask == 0 && !writeDepth && !writeStencil) return;
+
+	id<MTLRenderPipelineState> pipeline = clearPipeline(colorOutputMask, writeDepth, outputKinds);
+	id<MTLDepthStencilState> depthState = clearDepthStencilState(writeDepth, writeStencil, frontStencilMask, frontStencilMask);
+	if (!pipeline || !depthState) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
 		return;
 	}
-	if (ctx.scissor_test_enabled) {
-		GL4METAL_LOG("glClear: scissor test is ignored (the clear is a render pass load action)");
+
+	ClearFragmentParameters parameters;
+	if (colorOutputMask != 0 && colorValue) {
+		for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+			if (colorOutputMask & (1u << attachment))
+				populateClearColor(parameters, attachment, ctx.pass_color_format[attachment], *colorValue, allowFastLoad);
+		}
 	}
-	beginRenderPass(mask); // a pass whose load action is "clear" performs the clear even without draws
+	parameters.depth = (float)clamp01(depthValue);
+
+	MTLViewport viewport;
+	viewport.originX = 0.0;
+	viewport.originY = 0.0;
+	viewport.width = (double)ctx.render_target_width;
+	viewport.height = (double)ctx.render_target_height;
+	viewport.znear = 0.0;
+	viewport.zfar = 1.0;
+
+	[encoder setRenderPipelineState:pipeline];
+	[encoder setDepthStencilState:depthState];
+	if (writeStencil) {
+		const uint32_t reference = (uint32_t)stencilValue;
+		[encoder setStencilFrontReferenceValue:reference backReferenceValue:reference];
+	}
+	[encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+	[encoder setCullMode:MTLCullModeNone];
+	[encoder setTriangleFillMode:MTLTriangleFillModeFill];
+	[encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+	[encoder setViewport:viewport];
+	[encoder setScissorRect:scissorRect];
+	if (colorOutputMask != 0 || writeDepth) {
+		[encoder setFragmentBytes:&parameters length:sizeof(parameters) atIndex:0];
+	}
+	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	// The clear covers the attachment rather than GL's viewport. Restore the GL
+	// viewport/scissor immediately so following draws on this still-open encoder
+	// keep their original rasterization rectangle.
+	applyViewportAndScissor();
+
+	// The clear draw bypasses draw.mm's encoder-state cache. Invalidate its shadow
+	// state without ending the render pass; the next GL draw will rebind its pipeline,
+	// depth state, viewport, buffers and resources on this same encoder.
+	invalidateDrawEncoderStateCache();
+	ctx.fragcoord_params_bound = false;
+	if (ctx.pass_uses_default_framebuffer) {
+		if (colorOutputMask != 0) ctx.default_color_has_contents = true;
+		if (writeDepth) ctx.default_depth_has_contents = true;
+		if (writeStencil) ctx.default_stencil_has_contents = true;
+	}
+}
+
+void glClear(GLbitfield mask) {
+	const GLbitfield validMask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+	if (mask & ~validMask) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (mask == 0) return;
+	ClearColorValue color;
+	color.kind = ClearValueKind::Float;
+	color.floatValues[0] = (float)ctx.clear_color.red;
+	color.floatValues[1] = (float)ctx.clear_color.green;
+	color.floatValues[2] = (float)ctx.clear_color.blue;
+	color.floatValues[3] = (float)ctx.clear_color.alpha;
+	performFramebufferClear(mask, -1, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, true);
 }
 
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
@@ -1043,71 +1492,80 @@ void glClearStencil(GLint s) {
 
 void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
 	if (buffer == GL_STENCIL) {
-		clearDepthStencil(GL_STENCIL_BUFFER_BIT, (GLfloat)ctx.clear_depth, value[0]);
+		performFramebufferClear(GL_STENCIL_BUFFER_BIT, -1, nullptr, (GLfloat)ctx.clear_depth, value[0], false);
+	} else if (buffer == GL_COLOR) {
+		if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			return;
+		}
+		ClearColorValue color;
+		color.kind = ClearValueKind::SignedInteger;
+		for (int component = 0; component < 4; ++component) color.signedValues[component] = value[component];
+		performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 	} else {
-		GL4METAL_LOG("glClearBufferiv: integer colour buffers are not supported");
+		gl4metalSetError(GL_INVALID_ENUM);
 	}
 }
 
 void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
-	GL4METAL_LOG("glClearBufferuiv: integer colour buffers are not supported");
+	if (buffer != GL_COLOR) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	ClearColorValue color;
+	color.kind = ClearValueKind::UnsignedInteger;
+	for (int component = 0; component < 4; ++component) color.unsignedValues[component] = value[component];
+	performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 }
 
 void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
 	if (buffer == GL_COLOR) {
-		clearOneColorBuffer(drawbuffer, value);
+		if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			return;
+		}
+		ClearColorValue color;
+		color.kind = ClearValueKind::Float;
+		for (int component = 0; component < 4; ++component) color.floatValues[component] = value[component];
+		performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 	} else if (buffer == GL_DEPTH) {
-		clearDepthStencil(GL_DEPTH_BUFFER_BIT, value[0], ctx.clear_stencil);
+		performFramebufferClear(GL_DEPTH_BUFFER_BIT, -1, nullptr, value[0], ctx.clear_stencil, false);
 	} else {
-		GL4METAL_LOG("glClearBufferfv: unsupported buffer 0x%X", buffer);
+		gl4metalSetError(GL_INVALID_ENUM);
 	}
 }
 
 void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
-	clearDepthStencil(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, depth, stencil);
+	(void)drawbuffer; // ignored for GL_DEPTH_STENCIL by OpenGL
+	if (buffer != GL_DEPTH_STENCIL) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	performFramebufferClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, -1, nullptr, depth, stencil, false);
 }
-
-// MARK: - Blit / read back
-
 
 // glClearBuffer*: one draw buffer of the current framebuffer.
 void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
 	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glClearBuffer*: draw buffer %d is out of range (GL_INVALID_VALUE)", drawbuffer);
 		return;
 	}
-	MTLClearColor saved = ctx.clear_color;
-	ctx.clear_color = MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3]);
-	if (ctx.draw_fbo == 0) {
-		beginRenderPass(GL_COLOR_BUFFER_BIT);
-	} else {
-		auto it = GL4METAL_FBO_FIND(ctx.draw_fbo);
-		if (it != ctx.fbo_objects.end()) {
-			FBO &fbo = it->second;
-			GLenum savedBuffers[GL4METAL_MAX_COLOR_ATTACHMENTS];
-			memcpy(savedBuffers, fbo.draw_buffers, sizeof(savedBuffers));
-			for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
-				fbo.draw_buffers[i] = GL_NONE;
-			}
-			fbo.draw_buffers[0] = savedBuffers[drawbuffer]; // only this buffer takes part in the clearing pass
-			beginRenderPass(GL_COLOR_BUFFER_BIT);
-			endRenderEncoder(); // its attachments differ from the ones draws use
-			memcpy(fbo.draw_buffers, savedBuffers, sizeof(savedBuffers));
-		}
-	}
-	ctx.clear_color = saved;
+	ClearColorValue color;
+	color.kind = ClearValueKind::Float;
+	for (int component = 0; component < 4; ++component) color.floatValues[component] = rgba[component];
+	performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 }
 
 void clearDepthStencil(GLbitfield mask, GLfloat depth, GLint stencil) {
-	double savedDepth = ctx.clear_depth;
-	GLint savedStencil = ctx.clear_stencil;
-	ctx.clear_depth = clamp01(depth);
-	ctx.clear_stencil = stencil;
-	beginRenderPass(mask);
-	ctx.clear_depth = savedDepth;
-	ctx.clear_stencil = savedStencil;
+	performFramebufferClear(mask, -1, nullptr, depth, stencil, false);
 }
+
+// MARK: - Blit / read back
+
 
 // MARK: - Blit helpers
 
@@ -1159,25 +1617,63 @@ fragment float4 blit_fs(VOut in [[stage_in]], texture2d<float> src [[texture(0)]
 )MSL"];
 }
 
-static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
-	static std::mutex *cacheMutex = new std::mutex();
-	std::lock_guard<std::mutex> lock(*cacheMutex);
-	static id<MTLLibrary> library = nil;
-	static std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> pipelines;
-
-	auto it = pipelines.find((NSUInteger)format);
-	if (it != pipelines.end()) {
-		return it->second;
+// Process-lifetime cache: the launcher may tear down JVM/GL threads while another thread is
+// still unwinding a blit. A function-local static unordered_map is destroyed during C++ exit and
+// can race that late call. Keep the registry allocated for process lifetime, matching the shader
+// stage caches in program.mm. Key by device as well as format: MTL objects are device-specific.
+struct BlitPipelineCacheKey {
+	uintptr_t device_key = 0;
+	NSUInteger pixel_format = 0;
+	bool operator==(const BlitPipelineCacheKey &other) const {
+		return device_key == other.device_key && pixel_format == other.pixel_format;
 	}
-	NSError *error = nil;
-	if (!library) {
-		library = [ctx.device newLibraryWithSource:blitSource() options:nil error:&error];
+};
+
+struct BlitPipelineCacheKeyHash {
+	size_t operator()(const BlitPipelineCacheKey &key) const {
+		const size_t a = std::hash<uintptr_t>{}(key.device_key);
+		const size_t b = std::hash<NSUInteger>{}(key.pixel_format);
+		return a ^ (b + (size_t)0x9e3779b9u + (a << 6) + (a >> 2));
+	}
+};
+
+struct BlitPipelineCache {
+	std::mutex mutex;
+	std::unordered_map<uintptr_t, id<MTLLibrary>> libraries;
+	std::unordered_map<BlitPipelineCacheKey, id<MTLRenderPipelineState>, BlitPipelineCacheKeyHash> pipelines;
+};
+
+static BlitPipelineCache &blitPipelineCache() {
+	static BlitPipelineCache *cache = new BlitPipelineCache();
+	return *cache;
+}
+
+static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
+	if (!ctx.device) return nil;
+	BlitPipelineCache &cache = blitPipelineCache();
+	std::lock_guard<std::mutex> lock(cache.mutex);
+	const uintptr_t deviceKey = reinterpret_cast<uintptr_t>((__bridge void *)ctx.device);
+	const BlitPipelineCacheKey key{deviceKey, (NSUInteger)format};
+
+	auto it = cache.pipelines.find(key);
+	if (it != cache.pipelines.end()) return it->second;
+
+	id<MTLLibrary> library = nil;
+	auto libraryIt = cache.libraries.find(deviceKey);
+	if (libraryIt != cache.libraries.end()) {
+		library = libraryIt->second;
+	} else {
+		NSError *libraryError = nil;
+		library = [ctx.device newLibraryWithSource:blitSource() options:nil error:&libraryError];
 		if (!library) {
 			GL4METAL_LOG("glBlitFramebuffer: blit shader failed to compile: %s",
-				error.localizedDescription.UTF8String ?: "unknown Metal error");
+				libraryError.localizedDescription.UTF8String ?: "unknown Metal error");
 			return nil;
 		}
+		cache.libraries.emplace(deviceKey, library);
 	}
+
+	NSError *error = nil;
 	MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
 	d.vertexFunction = [library newFunctionWithName:@"blit_vs"];
 	d.fragmentFunction = [library newFunctionWithName:@"blit_fs"];
@@ -1192,7 +1688,7 @@ static id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format) {
 			error.localizedDescription.UTF8String ?: "unknown Metal error");
 		return nil; // Do not permanently cache a transient nil allocation result.
 	}
-	pipelines[(NSUInteger)format] = pipeline;
+	cache.pipelines.emplace(key, pipeline);
 	return pipeline;
 }
 

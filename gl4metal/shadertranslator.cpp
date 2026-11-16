@@ -84,13 +84,23 @@ std::string renameSamplerIdentifier(const std::string &source) {
 	return out;
 }
 
+// Forward declaration: patchVersion uses the comment-masked source for syntax detection.
+std::string maskShaderComments(const std::string &source);
+
 // Convert pre-4.10 desktop GLSL to desktop GLSL 4.10 before glslang parses it.
 // This includes Iris-generated #version 400 core shaders: the varying-alignment pass below inserts
 // layout(location) on stage inputs/outputs, which is core syntax starting with GLSL 4.10.
 // Keep the original profile suffix (for example, "core") and do not rewrite GLSL ES versions.
-// No GL_ARB_separate_shader_objects directive is injected; GL4Metal does not claim to implement it.
+// GLSL 4.20 introduced brace-style aggregate/array initializers. For older desktop source that uses
+// `T value = { ... }`, enable only the parser extension that defines that syntax instead of raising
+// every shader's language version to 420 (which would also change __VERSION__ and feature branches).
+// This directive is internal to translation; it does not add GL_ARB_shading_language_420pack to the
+// GL extension string or make the application believe that the driver exposes the API extension.
 std::string patchVersion(const std::string &source, int minimumVersion = 410) {
 	std::string out = source;
+	bool isGlslEs = false;
+	int effectiveVersion = 110; // GLSL's default when the source has no #version directive.
+	size_t extensionInsertOffset = 0;
 	size_t lineStart = 0;
 	while (lineStart < out.size()) {
 		size_t lineEnd = out.find('\n', lineStart);
@@ -107,18 +117,38 @@ std::string patchVersion(const std::string &source, int minimumVersion = 410) {
 			size_t numberEnd = numberStart;
 			while (numberEnd < lineEnd && out[numberEnd] >= '0' && out[numberEnd] <= '9') ++numberEnd;
 			if (numberEnd > numberStart) {
-				const int version = std::stoi(out.substr(numberStart, numberEnd - numberStart));
+				effectiveVersion = std::stoi(out.substr(numberStart, numberEnd - numberStart));
 				size_t profile = numberEnd;
 				while (profile < lineEnd && (out[profile] == ' ' || out[profile] == '\t')) ++profile;
-				const bool isGlslEs = out.compare(profile, 2, "es") == 0 &&
+				isGlslEs = out.compare(profile, 2, "es") == 0 &&
 					(profile + 2 == lineEnd || out[profile + 2] == ' ' || out[profile + 2] == '\t' || out[profile + 2] == '\r');
-				if (!isGlslEs && version < minimumVersion) {
+				if (!isGlslEs && effectiveVersion < minimumVersion) {
 					out.replace(numberStart, numberEnd - numberStart, std::to_string(minimumVersion));
+					effectiveVersion = minimumVersion;
 				}
 			}
+			extensionInsertOffset = lineEnd < out.size() ? lineEnd + 1 : lineEnd;
 			break; // only the real leading #version directive controls the shader language version
 		}
 		lineStart = lineEnd + 1;
+	}
+
+	if (!isGlslEs && effectiveVersion < 420) {
+		const std::string masked = maskShaderComments(out);
+		bool hasBraceInitializer = false;
+		for (size_t i = 0; i < masked.size(); ++i) {
+			if (masked[i] != '=') continue;
+			size_t next = i + 1;
+			while (next < masked.size() && (masked[next] == ' ' || masked[next] == '\t' ||
+				masked[next] == '\r' || masked[next] == '\n')) ++next;
+			if (next < masked.size() && masked[next] == '{') {
+				hasBraceInitializer = true;
+				break;
+			}
+		}
+		if (hasBraceInitializer && out.find("#extension GL_ARB_shading_language_420pack") == std::string::npos) {
+			out.insert(extensionInsertOffset, "#extension GL_ARB_shading_language_420pack : enable\n");
+		}
 	}
 	return renameSamplerIdentifier(out);
 }
