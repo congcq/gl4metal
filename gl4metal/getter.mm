@@ -26,17 +26,38 @@ static GLint maxMetalTextureDimension2D(id<MTLDevice> metalDevice) {
 // MARK: - State queries
 
 // GL keeps the first error until glGetError reads (and clears) it.
+// Retain the first-error origin so errors reported much later by a high-level
+// renderer (for example Minecraft's texture-copy helper) can be traced to the
+// GL entry point that actually generated them.
 static GLenum sError = GL_NO_ERROR;
+static const char *sErrorFunction = nullptr;
+static const char *sErrorFile = nullptr;
+static int sErrorLine = 0;
 
-void gl4metalSetError(GLenum error) {
+void gl4metalSetErrorImpl(GLenum error, const char *function, const char *file, int line) {
 	if (sError == GL_NO_ERROR) {
 		sError = error;
+		sErrorFunction = function;
+		sErrorFile = file;
+		sErrorLine = line;
+		if (error == GL_INVALID_FRAMEBUFFER_OPERATION) {
+			GL4METAL_LOG("GL_INVALID_FRAMEBUFFER_OPERATION first set by %s at %s:%d (read_fbo=%u draw_fbo=%u)",
+				function ? function : "?", file ? file : "?", line, ctx.read_fbo, ctx.draw_fbo);
+		}
 	}
 }
 
 GLenum glGetError(void) {
 	GLenum error = sError;
+	if (error == GL_INVALID_FRAMEBUFFER_OPERATION) {
+		GL4METAL_LOG("glGetError returning 0x%X; first origin: %s at %s:%d",
+			(unsigned int)error, sErrorFunction ? sErrorFunction : "?",
+			sErrorFile ? sErrorFile : "?", sErrorLine);
+	}
 	sError = GL_NO_ERROR;
+	sErrorFunction = nullptr;
+	sErrorFile = nullptr;
+	sErrorLine = 0;
 	return error;
 }
 
@@ -228,6 +249,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = 0; // multisample storage images are not implemented
 			break;
 		case GL_MAX_COMBINED_IMAGE_UNITS_AND_FRAGMENT_OUTPUTS:
+			// GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES is an alias of this token (0x8F39).
+			// A single switch label handles both names; report the newer combined limit,
+			// which includes SSBOs, image resources, and fragment outputs.
 			*data = std::max(41 + (GLint)GL4METAL_MAX_COLOR_ATTACHMENTS,
 				(gl4metalSupportsComputeShaders() ? 16 + (GLint)GL4METAL_MAX_IMAGE_UNITS : 0));
 			break;

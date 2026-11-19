@@ -31,6 +31,14 @@ static void cycleFramePool() {
 	pool = objc_autoreleasePoolPush();
 }
 
+static bool renderPassTraceEnabled() {
+	static const bool enabled = [] {
+		const char *value = std::getenv("GL4METAL_TRACE_RENDER_PASSES");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
 struct FramePoolCycle {
 	~FramePoolCycle() { cycleFramePool(); }
 };
@@ -42,6 +50,7 @@ void glMakeCurrent(void *metalLayerPtr) {
 		return;
 	}
 	CAMetalLayer *layer = (__bridge CAMetalLayer *)metalLayerPtr;
+	if (ctx.metalLayer != layer) endRenderEncoder();
 	layer.device = ctx.device;
 	layer.framebufferOnly = YES;
 	ctx.metalLayer = layer;
@@ -56,6 +65,21 @@ void glSwapBuffers(void) {
 	// finalizes deferred Metal store actions as DontCare for this final default-FB pass.
 	ctx.discard_default_depth_stencil_on_end = true;
 	endRenderEncoder(); // a render pass must be closed before the command buffer is committed
+	if (renderPassTraceEnabled()) {
+		GL4METAL_LOG("frame render passes: created=%llu reused=%llu fboAliasCandidates=%llu fboAliasReuses=%llu fboAliasMisses=%llu mergedBlitDraws=%llu",
+			(unsigned long long)ctx.frame_render_pass_created_count,
+			(unsigned long long)ctx.frame_render_pass_reused_count,
+			(unsigned long long)ctx.frame_render_pass_alias_candidates,
+			(unsigned long long)ctx.frame_render_pass_alias_reuses,
+			(unsigned long long)ctx.frame_render_pass_alias_misses,
+			(unsigned long long)ctx.frame_merged_blit_draw_count);
+	}
+	ctx.frame_render_pass_created_count = 0;
+	ctx.frame_render_pass_reused_count = 0;
+	ctx.frame_merged_blit_draw_count = 0;
+	ctx.frame_render_pass_alias_candidates = 0;
+	ctx.frame_render_pass_alias_reuses = 0;
+	ctx.frame_render_pass_alias_misses = 0;
 	ctx.default_color_has_contents = false;
 	ctx.default_depth_has_contents = false;
 	ctx.default_stencil_has_contents = false;

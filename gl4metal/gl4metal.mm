@@ -2,10 +2,13 @@
 
 #include <mutex>
 
-thread_local MTLContext ctx; // context for Metal device
+thread_local MTLContext ctx; // independent GL/Metal state for the calling thread
 
 static std::mutex *gl4metalInitMutex = new std::mutex();
-static bool gl4metalInitialized = false;
+// MTLContext is thread_local, so its initialization guard must be thread_local too.
+// A process-wide flag made later GL threads return success while their own ctx still
+// had a null device/queue and otherwise-zero GL state.
+static thread_local bool gl4metalInitialized = false;
 
 // Compute-shader compatibility is exposed only when the active Metal device
 // meets the OpenGL compute baseline used by Iris. Device identity is stable for
@@ -73,7 +76,7 @@ GLboolean gl4metalInit() {
 	ctx.fbo_objects.max_load_factor(0.75f);
 	ctx.fbo_objects.reserve(128);
 	ctx.pipeline_cache.max_load_factor(0.75f);
-	ctx.pipeline_cache.reserve(256);
+	ctx.pipeline_cache.reserve(512);
 	ctx.sampler_cache.max_load_factor(0.75f);
 	ctx.sampler_cache.reserve(64);
 

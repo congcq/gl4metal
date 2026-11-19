@@ -12,15 +12,23 @@ static std::mutex *feedbackLoopSetMutex = new std::mutex();
 static std::mutex *fallbackTextureMutex = new std::mutex();
 static std::mutex *fallbackSamplerMutex = new std::mutex();
 
-// Large default uniform blocks and converted index lists share one transient upload
-// arena per in-flight command buffer. This avoids creating one MTLBuffer per fallback
-// draw while keeping every encoded slice alive until its command buffer completes.
+// Converted index lists use one transient upload arena per in-flight command buffer.
+// Large default-uniform blocks use command-buffer arena slices while changing, then
+// immutable per-program snapshots when stable across command buffers.
 struct DrawTransientUploadArena {
 	id<MTLCommandBuffer> commandBuffer = nil;
 	id<MTLBuffer> buffer = nil;
 	NSUInteger used = 0;
+	uint64_t generation = 0;
 	bool submitted = false;
 };
+
+static uint64_t nextDrawTransientArenaGeneration(void) {
+	static thread_local uint64_t generation = 0;
+	++generation;
+	if (generation == 0) ++generation;
+	return generation;
+}
 
 // Keep one arena per in-flight command buffer. A buffer is recycled only after
 // Metal reports that its previous command buffer completed, avoiding CPU writes
@@ -47,6 +55,7 @@ static DrawTransientUploadArena *drawTransientUploadArenaForCommandBuffer(id<MTL
 			(status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError))) {
 			arena.commandBuffer = commandBuffer;
 			arena.used = 0;
+			arena.generation = nextDrawTransientArenaGeneration();
 			arena.submitted = false;
 			return &arena;
 		}
@@ -54,6 +63,7 @@ static DrawTransientUploadArena *drawTransientUploadArenaForCommandBuffer(id<MTL
 	drawTransientUploadArenas.emplace_back();
 	DrawTransientUploadArena &arena = drawTransientUploadArenas.back();
 	arena.commandBuffer = commandBuffer;
+	arena.generation = nextDrawTransientArenaGeneration();
 	return &arena;
 }
 
@@ -91,13 +101,77 @@ static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment,
 	return true;
 }
 
-bool uploadLargeDefaultUniformBlock(const uint8_t *source, NSUInteger length,
+bool programUniformBufferForStage(ProgramObject &program, NSUInteger stage,
 	__strong id<MTLBuffer> &destinationBuffer, NSUInteger &destinationOffset) {
-	if (!source || length == 0) return false;
-	void *destination = nullptr;
-	if (!allocateDrawTransientBuffer(length, 256, 256 * 1024, destinationBuffer, destinationOffset, &destination)) return false;
-	memcpy(destination, source, (size_t)length);
-	return true;
+	destinationBuffer = nil;
+	destinationOffset = 0;
+	if (stage >= 3 || !ctx.device) return false;
+	const std::vector<uint8_t> &uniformBytes = program.uniform_data[stage];
+	if (uniformBytes.empty() || uniformBytes.size() > ctx.device.maxBufferLength) return false;
+	const uintptr_t deviceIdentity = (uintptr_t)(__bridge void *)ctx.device;
+	const uint64_t revision = program.uniform_data_revision[stage];
+	DrawTransientUploadArena *currentArena = ctx.currentCommandBuffer
+		? drawTransientUploadArenaForCommandBuffer(ctx.currentCommandBuffer) : nullptr;
+	const uint64_t currentArenaGeneration = currentArena ? currentArena->generation : 0;
+	const bool cachedRevisionMatches = program.uniform_gpu_buffer[stage] &&
+		program.uniform_gpu_revision[stage] == revision &&
+		program.uniform_gpu_device_identity[stage] == deviceIdentity &&
+		program.uniform_gpu_buffer[stage].length >= program.uniform_gpu_offset[stage] &&
+		uniformBytes.size() <= program.uniform_gpu_buffer[stage].length - program.uniform_gpu_offset[stage];
+	if (cachedRevisionMatches) {
+		if (!program.uniform_gpu_is_transient[stage] ||
+			(currentArenaGeneration != 0 &&
+			 program.uniform_gpu_arena_generation[stage] == currentArenaGeneration)) {
+			destinationBuffer = program.uniform_gpu_buffer[stage];
+			destinationOffset = program.uniform_gpu_offset[stage];
+			return true;
+		}
+
+		// The transient slice belonged to another command buffer. Promote it to
+		// an immutable snapshot before the old arena can be recycled/overwritten.
+		id<MTLBuffer> replacement = [ctx.device newBufferWithBytes:uniformBytes.data()
+			length:uniformBytes.size() options:MTLResourceStorageModeShared];
+		if (!replacement) return false;
+		replacement.label = [NSString stringWithFormat:@"GL4Metal default uniforms stage %lu revision %llu",
+			(unsigned long)stage, (unsigned long long)revision];
+		program.uniform_gpu_buffer[stage] = replacement;
+		program.uniform_gpu_offset[stage] = 0;
+		program.uniform_gpu_is_transient[stage] = false;
+		program.uniform_gpu_arena_generation[stage] = 0;
+		destinationBuffer = replacement;
+		return true;
+	}
+
+	// A changed block is copied once into the current command-buffer arena. Further
+	// draws/dispatches with the same revision bind the same immutable slice. If the
+	// revision survives into another command buffer, the slice is promoted above.
+	if (ctx.currentCommandBuffer && currentArena) {
+		void *destinationContents = nullptr;
+		__strong id<MTLBuffer> arenaBuffer = nil;
+		NSUInteger arenaOffset = 0;
+		if (!allocateDrawTransientBuffer(uniformBytes.size(), 256, 64 * 1024,
+			arenaBuffer, arenaOffset, &destinationContents) || !destinationContents) return false;
+		memcpy(destinationContents, uniformBytes.data(), uniformBytes.size());
+		program.uniform_gpu_buffer[stage] = arenaBuffer;
+		program.uniform_gpu_offset[stage] = arenaOffset;
+		program.uniform_gpu_is_transient[stage] = true;
+		program.uniform_gpu_arena_generation[stage] = currentArenaGeneration;
+	} else {
+		id<MTLBuffer> replacement = [ctx.device newBufferWithBytes:uniformBytes.data()
+			length:uniformBytes.size() options:MTLResourceStorageModeShared];
+		if (!replacement) return false;
+		replacement.label = [NSString stringWithFormat:@"GL4Metal default uniforms stage %lu revision %llu",
+			(unsigned long)stage, (unsigned long long)revision];
+		program.uniform_gpu_buffer[stage] = replacement;
+		program.uniform_gpu_offset[stage] = 0;
+		program.uniform_gpu_is_transient[stage] = false;
+		program.uniform_gpu_arena_generation[stage] = 0;
+	}
+	program.uniform_gpu_revision[stage] = revision;
+	program.uniform_gpu_device_identity[stage] = deviceIdentity;
+	destinationBuffer = program.uniform_gpu_buffer[stage];
+	destinationOffset = program.uniform_gpu_offset[stage];
+	return destinationBuffer != nil;
 }
 
 static bool diagnosticsMasterEnabled() {
@@ -896,9 +970,16 @@ struct DrawEncoderSamplerSlot {
 	__strong id<MTLSamplerState> sampler = nil;
 };
 
-// The default uniform blocks use set*Bytes for small payloads (up to Metal's
-// 4 KiB inline-data limit). Keep a per-stage copy so stable uniforms do not
-// repeatedly cross the Objective-C/Metal encoder boundary on every draw.
+// Small default-uniform blocks are keyed by the program's mutation revision,
+// avoiding a 4 KiB memcmp/copy on every draw. The byte slots below are retained
+// only for compact OpArrayLength metadata, whose values are derived per draw.
+struct DrawEncoderRevisionSlot {
+	bool valid = false;
+	NSUInteger length = 0;
+	GLuint source_program = 0;
+	uint64_t source_revision = 0;
+};
+
 struct DrawEncoderBytesSlot {
 	bool valid = false;
 	NSUInteger length = 0;
@@ -931,13 +1012,17 @@ struct DrawEncoderStateCache {
 	DrawEncoderTextureSlot fragmentTextures[kDrawTextureSlots];
 	DrawEncoderSamplerSlot vertexSamplers[kDrawTextureSlots];
 	DrawEncoderSamplerSlot fragmentSamplers[kDrawTextureSlots];
-	DrawEncoderBytesSlot vertexDefaultBytes;
-	DrawEncoderBytesSlot fragmentDefaultBytes;
+	DrawEncoderRevisionSlot vertexDefaultBytes;
+	DrawEncoderRevisionSlot fragmentDefaultBytes;
+	DrawEncoderBytesSlot vertexBufferSizeBytes;
+	DrawEncoderBytesSlot fragmentBufferSizeBytes;
 
 	void resetForEncoder(id<MTLRenderCommandEncoder> newEncoder) {
 		pipelineValid = depthStateValid = stencilReferenceValid = false;
 		vertexDefaultBytes.valid = fragmentDefaultBytes.valid = false;
+		vertexBufferSizeBytes.valid = fragmentBufferSizeBytes.valid = false;
 		vertexDefaultBytes.length = fragmentDefaultBytes.length = 0;
+		vertexBufferSizeBytes.length = fragmentBufferSizeBytes.length = 0;
 		windingValid = cullValid = fillValid = depthBiasValid = blendColorValid = false;
 		pipeline = nil;
 		depthState = nil;
@@ -1005,12 +1090,15 @@ static inline void bindFragmentBufferCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexDefaultBytesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
-	DrawEncoderBytesSlot &binding = cache.vertexDefaultBytes;
-	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
+	const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderRevisionSlot &binding = cache.vertexDefaultBytes;
+	if (binding.valid && binding.length == length && binding.source_program == programId &&
+		binding.source_revision == revision) return;
 	[encoder setVertexBytes:bytes length:length atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
-	if (length != 0) memcpy(binding.bytes, bytes, length);
 	binding.length = length;
+	binding.source_program = programId;
+	binding.source_revision = revision;
 	binding.valid = true;
 	cache.vertexBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].kind = 0;
 	cache.vertexBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].buffer = nil;
@@ -1018,16 +1106,39 @@ static inline void bindVertexDefaultBytesCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentDefaultBytesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
-	DrawEncoderBytesSlot &binding = cache.fragmentDefaultBytes;
-	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
+	const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderRevisionSlot &binding = cache.fragmentDefaultBytes;
+	if (binding.valid && binding.length == length && binding.source_program == programId &&
+		binding.source_revision == revision) return;
 	[encoder setFragmentBytes:bytes length:length atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
-	if (length != 0) memcpy(binding.bytes, bytes, length);
 	binding.length = length;
+	binding.source_program = programId;
+	binding.source_revision = revision;
 	binding.valid = true;
 	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].kind = 0;
 	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].buffer = nil;
 	cache.fragmentBuffers[GL4METAL_UNIFORM_BUFFER_INDEX].offset = 0;
+}
+
+static inline void bindVertexBufferSizesCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderBytesSlot &binding = cache.vertexBufferSizeBytes;
+	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	[encoder setVertexBytes:bytes length:length atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+	if (length != 0) memcpy(binding.bytes, bytes, length);
+	binding.length = length;
+	binding.valid = true;
+}
+
+static inline void bindFragmentBufferSizesCached(DrawEncoderStateCache &cache,
+	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	DrawEncoderBytesSlot &binding = cache.fragmentBufferSizeBytes;
+	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
+	[encoder setFragmentBytes:bytes length:length atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+	if (length != 0) memcpy(binding.bytes, bytes, length);
+	binding.length = length;
+	binding.valid = true;
 }
 
 static inline void bindVertexConstantCached(DrawEncoderStateCache &cache,
@@ -1084,11 +1195,15 @@ static inline void bindFragmentSamplerCached(DrawEncoderStateCache &cache,
 	binding.valid = true;
 }
 
+static uint64_t nextPipelineCacheUse(void) {
+	static thread_local uint64_t clock = 0;
+	++clock;
+	if (clock == 0) ++clock;
+	return clock;
+}
+
 static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p, std::vector<ActiveAttrib> &attribs, const char *caller) {
 	bool flip = ctx.pass_flipped;
-	bool blend = false;
-	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment)
-		blend = blend || ctx.blend_enabled[attachment];
 
 	NSUInteger slot = 0;
 	for (ActiveAttrib &aa : attribs) {
@@ -1107,6 +1222,8 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	key.clear();
 	if (key.capacity() < 1024) key.reserve(1024);
 	auto put = [&key](uint64_t v) { putBytes(key, &v, sizeof(v)); };
+	const uintptr_t deviceIdentity = (uintptr_t)(__bridge void *)ctx.device;
+	put((uint64_t)deviceIdentity);
 	put(p.vertex_stage_cache_id);
 	put(p.fragment_stage_cache_id);
 	put(flip ? 1 : 0);
@@ -1116,10 +1233,13 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 	put((uint64_t)ctx.pass_depth_format);
 	put((uint64_t)ctx.pass_stencil_format);
 	put((uint64_t)ctx.pass_sample_count);
-	put(blend ? 1 : 0);
 	put(capOn(GL_SAMPLE_ALPHA_TO_COVERAGE) ? 1 : 0);
 	put(capOn(GL_SAMPLE_ALPHA_TO_ONE) ? 1 : 0);
+	// State on absent attachments cannot affect the Metal pipeline. Omitting it
+	// avoids cache variants when shader packs change blend/mask state for draw
+	// buffers that are not attached to the current framebuffer.
 	for (int attachment = 0; attachment < GL4METAL_MAX_COLOR_ATTACHMENTS; ++attachment) {
+		if (ctx.pass_color_format[attachment] == MTLPixelFormatInvalid) continue;
 		const BlendBufferState &blendState = ctx.blend_buffers[attachment];
 		put(ctx.blend_enabled[attachment] ? 1 : 0);
 		put((uint64_t)ctx.color_masks[attachment][0] | ((uint64_t)ctx.color_masks[attachment][1] << 1) |
@@ -1152,10 +1272,11 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 
 	auto cached = ctx.pipeline_cache.find(key);
 	if (cached != ctx.pipeline_cache.end()) {
+		cached->second.last_used = nextPipelineCacheUse();
 		lastPipelineCache.key = key;
-		lastPipelineCache.pipeline = cached->second;
+		lastPipelineCache.pipeline = cached->second.pipeline;
 		lastPipelineCache.valid = true;
-		return cached->second; // may be nil: a combination that already failed was reported once
+		return cached->second.pipeline; // may be nil: a combination that already failed was reported once
 	}
 
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -1223,11 +1344,19 @@ static id<MTLRenderPipelineState> pipelineFor(GLuint programId, ProgramObject &p
 			error ? error.localizedDescription.UTF8String : "unknown Metal pipeline error");
 	}
 	// Pipeline cache belongs to this thread-local context; no shared lock is needed.
-	auto inserted = ctx.pipeline_cache.emplace(key, pipeline);
-	if (!inserted.second) pipeline = inserted.first->second;
+	RenderPipelineCacheEntry cacheEntry;
+	cacheEntry.pipeline = pipeline;
+	cacheEntry.last_used = nextPipelineCacheUse();
+	auto inserted = ctx.pipeline_cache.emplace(key, cacheEntry);
+	if (!inserted.second) {
+		inserted.first->second.last_used = cacheEntry.last_used;
+		pipeline = inserted.first->second.pipeline;
+	}
 	if (ctx.pipeline_cache.size() > 512) {
 		auto victim = ctx.pipeline_cache.begin();
-		if (victim == inserted.first) ++victim;
+		for (auto candidate = ctx.pipeline_cache.begin(); candidate != ctx.pipeline_cache.end(); ++candidate) {
+			if (candidate->second.last_used < victim->second.last_used) victim = candidate;
+		}
 		if (victim != ctx.pipeline_cache.end()) ctx.pipeline_cache.erase(victim);
 	}
 	lastPipelineCache.key = key;
@@ -1430,7 +1559,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// expanding (count - 2), which is unsigned and would otherwise underflow.
 	if (fan && dc.count < 3) return;
 
-	id<MTLRenderCommandEncoder> enc = ctx.currentEncoder ? ctx.currentEncoder : beginRenderPass(0);
+	// Avoid a function call for the common same-FBO draw, but resolve a pending
+	// framebuffer bind before using an encoder created for a different GL FBO.
+	id<MTLRenderCommandEncoder> enc = ctx.currentEncoder;
+	if (!enc || ctx.pass_draw_fbo != ctx.draw_fbo) enc = beginRenderPass(0);
 	if (!enc) {
 		return;
 	}
@@ -1682,9 +1814,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 		if (data.size() <= 4096) { // setBytes limit
 			if (s == 0) {
-				bindVertexDefaultBytesCached(encoderCache, enc, data.data(), (NSUInteger)data.size());
+				bindVertexDefaultBytesCached(encoderCache, enc, ctx.current_program, p.uniform_data_revision[s], data.data(), (NSUInteger)data.size());
 			} else {
-				bindFragmentDefaultBytesCached(encoderCache, enc, data.data(), (NSUInteger)data.size());
+				bindFragmentDefaultBytesCached(encoderCache, enc, ctx.current_program, p.uniform_data_revision[s], data.data(), (NSUInteger)data.size());
 			}
 		} else {
 			if (data.size() > ctx.device.maxBufferLength) {
@@ -1694,9 +1826,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			}
 			id<MTLBuffer> buffer = nil;
 			NSUInteger offset = 0;
-			if (!uploadLargeDefaultUniformBlock(data.data(), (NSUInteger)data.size(), buffer, offset)) {
+			if (!programUniformBufferForStage(p, (NSUInteger)s, buffer, offset)) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
-				GL4METAL_LOG("%s: failed to reserve %lu bytes in the default-uniform upload arena; draw skipped", caller, (unsigned long)data.size());
+				GL4METAL_LOG("%s: failed to allocate %lu-byte immutable default-uniform snapshot for stage %d; draw skipped", caller, (unsigned long)data.size(), s);
 				return;
 			}
 			if (s == 0) {
@@ -1797,12 +1929,12 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	}
 
 	if (p.needs_buffer_size_buffer[0]) {
-		[enc setVertexBytes:vertexBufferSizes.data() length:sizeof(vertexBufferSizes)
-			atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+		bindVertexBufferSizesCached(encoderCache, enc,
+			(const uint8_t *)vertexBufferSizes.data(), sizeof(vertexBufferSizes));
 	}
 	if (p.needs_buffer_size_buffer[1]) {
-		[enc setFragmentBytes:fragmentBufferSizes.data() length:sizeof(fragmentBufferSizes)
-			atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+		bindFragmentBufferSizesCached(encoderCache, enc,
+			(const uint8_t *)fragmentBufferSizes.data(), sizeof(fragmentBufferSizes));
 	}
 
 	// Uniform blocks: never leave an active MSL buffer slot unset or reuse a stale binding.

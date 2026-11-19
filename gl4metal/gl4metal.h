@@ -25,181 +25,6 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
-#ifndef GL_R3_G3_B2
-#define GL_R3_G3_B2 0x2A10
-#endif
-#ifndef GL_SHADER_STORAGE_BLOCK
-#define GL_SHADER_STORAGE_BLOCK 0x92E6
-#endif
-#ifndef GL_BUFFER_VARIABLE
-#define GL_BUFFER_VARIABLE 0x92E5
-#endif
-#ifndef GL_BUFFER_BINDING
-#define GL_BUFFER_BINDING 0x9302
-#endif
-#ifndef GL_NAME_LENGTH
-#define GL_NAME_LENGTH 0x92F9
-#endif
-#ifndef GL_TYPE
-#define GL_TYPE 0x92FA
-#endif
-#ifndef GL_ARRAY_SIZE
-#define GL_ARRAY_SIZE 0x92FB
-#endif
-#ifndef GL_OFFSET
-#define GL_OFFSET 0x92FC
-#endif
-#ifndef GL_BLOCK_INDEX
-#define GL_BLOCK_INDEX 0x92FD
-#endif
-#ifndef GL_ARRAY_STRIDE
-#define GL_ARRAY_STRIDE 0x92FE
-#endif
-#ifndef GL_MATRIX_STRIDE
-#define GL_MATRIX_STRIDE 0x92FF
-#endif
-#ifndef GL_IS_ROW_MAJOR
-#define GL_IS_ROW_MAJOR 0x9300
-#endif
-#ifndef GL_TOP_LEVEL_ARRAY_SIZE
-#define GL_TOP_LEVEL_ARRAY_SIZE 0x930C
-#endif
-#ifndef GL_TOP_LEVEL_ARRAY_STRIDE
-#define GL_TOP_LEVEL_ARRAY_STRIDE 0x930D
-#endif
-#ifndef GL_BUFFER_DATA_SIZE
-#define GL_BUFFER_DATA_SIZE 0x9303
-#endif
-#ifndef GL_NUM_ACTIVE_VARIABLES
-#define GL_NUM_ACTIVE_VARIABLES 0x9304
-#endif
-#ifndef GL_ACTIVE_VARIABLES
-#define GL_ACTIVE_VARIABLES 0x9305
-#endif
-#ifndef GL_REFERENCED_BY_VERTEX_SHADER
-#define GL_REFERENCED_BY_VERTEX_SHADER 0x9306
-#endif
-#ifndef GL_REFERENCED_BY_FRAGMENT_SHADER
-#define GL_REFERENCED_BY_FRAGMENT_SHADER 0x930A
-#endif
-#ifndef GL_REFERENCED_BY_COMPUTE_SHADER
-#define GL_REFERENCED_BY_COMPUTE_SHADER 0x930B
-#endif
-#ifndef GL_ACTIVE_RESOURCES
-#define GL_ACTIVE_RESOURCES 0x92F5
-#endif
-#ifndef GL_MAX_NAME_LENGTH
-#define GL_MAX_NAME_LENGTH 0x92F6
-#endif
-#ifndef GL_MAX_NUM_ACTIVE_VARIABLES
-#define GL_MAX_NUM_ACTIVE_VARIABLES 0x92F7
-#endif
-#ifndef GL_INVALID_INDEX
-#define GL_INVALID_INDEX 0xFFFFFFFFu
-#endif
-#ifndef GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS
-#define GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS 0x90D6
-#endif
-#ifndef GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS
-#define GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS 0x90DA
-#endif
-#ifndef GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS
-#define GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS 0x90D7
-#endif
-#ifndef GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS
-#define GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS 0x90D8
-#endif
-#ifndef GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS
-#define GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS 0x90D9
-#endif
-#ifndef GL_REFERENCED_BY_TESS_CONTROL_SHADER
-#define GL_REFERENCED_BY_TESS_CONTROL_SHADER 0x9307
-#endif
-#ifndef GL_REFERENCED_BY_TESS_EVALUATION_SHADER
-#define GL_REFERENCED_BY_TESS_EVALUATION_SHADER 0x9308
-#endif
-#ifndef GL_REFERENCED_BY_GEOMETRY_SHADER
-#define GL_REFERENCED_BY_GEOMETRY_SHADER 0x9309
-#endif
-#ifndef GL_SHADER_STORAGE_BUFFER
-#define GL_SHADER_STORAGE_BUFFER 0x90D2
-#endif
-#ifndef GL_SHADER_STORAGE_BUFFER_BINDING
-#define GL_SHADER_STORAGE_BUFFER_BINDING 0x90D3
-#endif
-#ifndef GL_SHADER_STORAGE_BUFFER_START
-#define GL_SHADER_STORAGE_BUFFER_START 0x90D4
-#endif
-#ifndef GL_SHADER_STORAGE_BUFFER_SIZE
-#define GL_SHADER_STORAGE_BUFFER_SIZE 0x90D5
-#endif
-#ifndef GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
-#define GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS 0x90DB
-#endif
-#ifndef GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS
-#define GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS 0x90DC
-#endif
-#ifndef GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
-#define GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 0x90DD
-#endif
-#ifndef GL_MAX_SHADER_STORAGE_BLOCK_SIZE
-#define GL_MAX_SHADER_STORAGE_BLOCK_SIZE 0x90DE
-#endif
-#ifndef GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT
-#define GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT 0x90DF
-#endif
-#ifndef GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES
-#define GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES 0x8F39
-#endif
-#ifndef GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT
-#define GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT 0x00000001
-#endif
-#ifndef GL_ELEMENT_ARRAY_BARRIER_BIT
-#define GL_ELEMENT_ARRAY_BARRIER_BIT 0x00000002
-#endif
-#ifndef GL_UNIFORM_BARRIER_BIT
-#define GL_UNIFORM_BARRIER_BIT 0x00000004
-#endif
-#ifndef GL_TEXTURE_FETCH_BARRIER_BIT
-#define GL_TEXTURE_FETCH_BARRIER_BIT 0x00000008
-#endif
-#ifndef GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
-#define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT 0x00000020
-#endif
-#ifndef GL_COMMAND_BARRIER_BIT
-#define GL_COMMAND_BARRIER_BIT 0x00000040
-#endif
-#ifndef GL_PIXEL_BUFFER_BARRIER_BIT
-#define GL_PIXEL_BUFFER_BARRIER_BIT 0x00000080
-#endif
-#ifndef GL_TEXTURE_UPDATE_BARRIER_BIT
-#define GL_TEXTURE_UPDATE_BARRIER_BIT 0x00000100
-#endif
-#ifndef GL_BUFFER_UPDATE_BARRIER_BIT
-#define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
-#endif
-#ifndef GL_FRAMEBUFFER_BARRIER_BIT
-#define GL_FRAMEBUFFER_BARRIER_BIT 0x00000400
-#endif
-#ifndef GL_TRANSFORM_FEEDBACK_BARRIER_BIT
-#define GL_TRANSFORM_FEEDBACK_BARRIER_BIT 0x00000800
-#endif
-#ifndef GL_ATOMIC_COUNTER_BARRIER_BIT
-#define GL_ATOMIC_COUNTER_BARRIER_BIT 0x00001000
-#endif
-#ifndef GL_SHADER_STORAGE_BARRIER_BIT
-#define GL_SHADER_STORAGE_BARRIER_BIT 0x00002000
-#endif
-#ifndef GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT
-#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
-#endif
-#ifndef GL_QUERY_BUFFER_BARRIER_BIT
-#define GL_QUERY_BUFFER_BARRIER_BIT 0x00008000
-#endif
-#ifndef GL_ALL_BARRIER_BITS
-#define GL_ALL_BARRIER_BITS 0xFFFFFFFFu
-#endif
-
 // Some older platform GL headers expose the ARB-suffixed token only, even
 // though GL_TEXTURE_BUFFER_FORMAT is part of the OpenGL 3.1 texture-buffer API.
 // Keep the unsuffixed core spelling available to the backend on every build.
@@ -408,6 +233,18 @@ struct ProgramObject {
 	bool is_compute = false;
 	bool uses_gl_frag_coord = false; // fragment MSL needs the per-render-pass coordinate parameters
 
+	// Large default-uniform blocks use a per-command-buffer arena slice while
+	// changing, then an immutable GPU snapshot when stable across command buffers.
+	// Arena generations prevent a recycled upload buffer from being reused by a
+	// later command buffer. Appended to preserve the established member layout.
+	uint64_t uniform_data_revision[3] = {1, 1, 1};
+	uint64_t uniform_gpu_revision[3] = {0, 0, 0};
+	uintptr_t uniform_gpu_device_identity[3] = {0, 0, 0};
+	uint64_t uniform_gpu_arena_generation[3] = {0, 0, 0};
+	NSUInteger uniform_gpu_offset[3] = {0, 0, 0};
+	bool uniform_gpu_is_transient[3] = {false, false, false};
+	__strong id<MTLBuffer> uniform_gpu_buffer[3] = {nil, nil, nil};
+
 };
 
 struct ShaderStorageBufferBinding {
@@ -423,6 +260,11 @@ struct ImageUnitBinding {
 	GLint layer = 0;
 	GLenum access = GL_READ_ONLY;
 	GLenum format = GL_RGBA8;
+};
+
+struct RenderPipelineCacheEntry {
+	__strong id<MTLRenderPipelineState> pipeline = nil;
+	uint64_t last_used = 0;
 };
 
 struct MTLContext {
@@ -507,7 +349,7 @@ struct MTLContext {
 	id<MTLDepthStencilState> no_depth_state;  // used when the pass has no depth attachment
 	id<MTLBuffer> constant_attrib_buffer;     // 32 bytes: float (0,0,0,1) then int (0,0,0,1), GL's default generic attribute
 	id<MTLTexture> fallback_texture;          // what an unbound/incomplete texture samples: (0,0,0,1)
-	std::unordered_map<std::string, id<MTLRenderPipelineState>> pipeline_cache;
+	std::unordered_map<std::string, RenderPipelineCacheEntry> pipeline_cache;
 	std::unordered_map<std::string, id<MTLSamplerState>> sampler_cache;
 
 	// Sampler objects, uniform buffer bindings, fences (appended at the end, see the note above).
@@ -585,6 +427,18 @@ struct MTLContext {
 	uint32_t pass_discard_color_store_mask = 0;
 	bool pass_discard_depth_store = false;
 	bool pass_discard_stencil_store = false;
+
+	// Active render-pass identity and per-frame counters. Keep these appended so
+	// every Objective-C++ translation unit retains the established MTLContext layout.
+	GLuint pass_draw_fbo = UINT32_MAX;
+	uint64_t frame_render_pass_created_count = 0;
+	uint64_t frame_render_pass_reused_count = 0;
+	uint64_t frame_merged_blit_draw_count = 0;
+	// FBO names may differ while their physical Metal attachment set is identical.
+	// These counters report render-encoder retargeting without creating a new pass.
+	uint64_t frame_render_pass_alias_candidates = 0;
+	uint64_t frame_render_pass_alias_reuses = 0;
+	uint64_t frame_render_pass_alias_misses = 0;
 };
 
 extern thread_local MTLContext ctx;
@@ -662,7 +516,8 @@ void updateDepthStencilState();
 // MARK: - Internal helpers (C++ linkage, not part of the GL API)
 
 MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.mm
-void gl4metalSetError(GLenum error);                                // getter.mm: what the next glGetError returns
+void gl4metalSetErrorImpl(GLenum error, const char *function, const char *file, int line); // getter.mm
+#define gl4metalSetError(error) gl4metalSetErrorImpl((error), __func__, __FILE__, __LINE__)
 void genericAttribValue(GLuint index, bool integer, void *out16);   // vertexarray.mm: glVertexAttrib* current value
 void invalidateConvertedVertexBuffers(GLuint buffer);               // draw.mm: invalidate cached integer attribute repacks
 void markBufferUsed(GLuint buffer);                                 // buffers.mm: record one GPU buffer use

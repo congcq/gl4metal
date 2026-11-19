@@ -12,6 +12,21 @@
 
 // MARK: - Helpers
 
+static uint64_t nextProgramCacheUse(uint64_t &clock) {
+	++clock;
+	if (clock == 0) ++clock;
+	return clock;
+}
+
+static std::string deviceScopedMSLCacheKey(id<MTLDevice> device, const std::string &mslSource) {
+	const uintptr_t deviceIdentity = (uintptr_t)(__bridge void *)device;
+	std::string key;
+	key.reserve(sizeof(deviceIdentity) + mslSource.size());
+	key.append((const char *)&deviceIdentity, sizeof(deviceIdentity));
+	key.append(mslSource);
+	return key;
+}
+
 static ProgramObject *findProgram(GLuint program) {
 	auto it = ctx.program_objects.find(program);
 	return it == ctx.program_objects.end() ? nullptr : &it->second;
@@ -56,48 +71,60 @@ static std::string threadgroupDeclarationsForLog(const std::string &mslSource) {
 // more than once during one shader-pack reload. The cache is intentionally process-
 // lifetime so late JVM/Metal teardown cannot lock a destroyed static mutex.
 struct ComputePipelineCacheEntry {
+	__strong id<MTLDevice> device = nil;
 	__strong id<MTLComputePipelineState> pipeline = nil;
 	std::string error;
+	uint64_t last_used = 0;
 };
 
 struct ComputePipelineCache {
 	std::mutex mutex;
 	std::unordered_map<std::string, ComputePipelineCacheEntry> entries;
+	uint64_t use_clock = 0;
 };
 
 static ComputePipelineCache &computePipelineCache() {
-	static ComputePipelineCache *cache = new ComputePipelineCache();
+	static ComputePipelineCache *cache = [] {
+		auto *created = new ComputePipelineCache();
+		created->entries.max_load_factor(0.75f);
+		created->entries.reserve(64);
+		return created;
+	}();
 	return *cache;
 }
 
 static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslSource, std::string &errorText) {
-	if (!ctx.device) {
+	id<MTLDevice> compileDevice = ctx.device;
+	if (!compileDevice) {
 		errorText = "Metal device is not initialized";
 		return nil;
 	}
+	const std::string cacheKey = deviceScopedMSLCacheKey(compileDevice, mslSource);
 	ComputePipelineCache &cache = computePipelineCache();
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto cached = cache.entries.find(mslSource);
+		auto cached = cache.entries.find(cacheKey);
 		if (cached != cache.entries.end()) {
+			cached->second.last_used = nextProgramCacheUse(cache.use_clock);
 			errorText = cached->second.error;
 			return cached->second.pipeline;
 		}
 	}
 
 	ComputePipelineCacheEntry compiled;
+	compiled.device = compileDevice;
 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 	options.languageVersion = MTLLanguageVersion2_2;
 	NSError *libraryError = nil;
 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
-	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	id<MTLLibrary> library = source ? [compileDevice newLibraryWithSource:source options:options error:&libraryError] : nil;
 	id<MTLFunction> computeFunction = [library newFunctionWithName:@"main0"];
 	if (!computeFunction) {
 		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal library compilation failed") :
 			(source ? "no main0 compute entry point" : "compute MSL is not valid UTF-8");
 	} else {
 		NSError *pipelineError = nil;
-		compiled.pipeline = [ctx.device newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
+		compiled.pipeline = [compileDevice newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
 		if (!compiled.pipeline) {
 			compiled.error = pipelineError ? (pipelineError.localizedDescription.UTF8String ?: "Metal compute pipeline creation failed") :
 				"unknown Metal compute pipeline error";
@@ -106,11 +133,17 @@ static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslS
 
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto inserted = cache.entries.emplace(mslSource, compiled);
-		if (!inserted.second) compiled = inserted.first->second;
+		compiled.last_used = nextProgramCacheUse(cache.use_clock);
+		auto inserted = cache.entries.emplace(cacheKey, compiled);
+		if (!inserted.second) {
+			inserted.first->second.last_used = compiled.last_used;
+			compiled = inserted.first->second;
+		}
 		if (cache.entries.size() > 64) {
 			auto victim = cache.entries.begin();
-			if (victim == inserted.first) ++victim;
+			for (auto candidate = cache.entries.begin(); candidate != cache.entries.end(); ++candidate) {
+				if (candidate->second.last_used < victim->second.last_used) victim = candidate;
+			}
 			if (victim != cache.entries.end()) cache.entries.erase(victim);
 		}
 	}
@@ -119,9 +152,11 @@ static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslS
 }
 
 struct VertexStageCacheEntry {
+	__strong id<MTLDevice> device = nil;
 	__strong id<MTLFunction> normalFunction = nil;
 	__strong id<MTLFunction> flippedFunction = nil;
 	uint64_t cacheId = 0;
+	uint64_t last_used = 0;
 	std::string error;
 };
 
@@ -129,30 +164,41 @@ struct VertexStageCache {
 	std::mutex mutex;
 	std::unordered_map<std::string, VertexStageCacheEntry> entries;
 	uint64_t nextCacheId = 1;
+	uint64_t use_clock = 0;
 };
 
 static VertexStageCache &vertexStageCache() {
-	static VertexStageCache *cache = new VertexStageCache();
+	static VertexStageCache *cache = [] {
+		auto *created = new VertexStageCache();
+		created->entries.max_load_factor(0.75f);
+		created->entries.reserve(96);
+		return created;
+	}();
 	return *cache;
 }
 
 static bool vertexStageFunctionsForMSL(const std::string &mslSource, VertexStageCacheEntry &outEntry) {
+	id<MTLDevice> compileDevice = ctx.device;
+	if (!compileDevice) { outEntry.error = "Metal device is not initialized"; return false; }
+	const std::string cacheKey = deviceScopedMSLCacheKey(compileDevice, mslSource);
 	VertexStageCache &cache = vertexStageCache();
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto cached = cache.entries.find(mslSource);
+		auto cached = cache.entries.find(cacheKey);
 		if (cached != cache.entries.end()) {
+			cached->second.last_used = nextProgramCacheUse(cache.use_clock);
 			outEntry = cached->second;
 			return outEntry.normalFunction && outEntry.flippedFunction;
 		}
 	}
 
 	VertexStageCacheEntry compiled;
+	compiled.device = compileDevice;
 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 	options.languageVersion = MTLLanguageVersion2_2;
 	NSError *libraryError = nil;
-	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	id<MTLLibrary> library = source ? [compileDevice newLibraryWithSource:source options:options error:&libraryError] : nil;
 	if (!library) {
 		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal vertex library compilation failed") :
 			(source ? "no Metal vertex library" : "vertex MSL is not valid UTF-8");
@@ -175,16 +221,20 @@ static bool vertexStageFunctionsForMSL(const std::string &mslSource, VertexStage
 
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto existing = cache.entries.find(mslSource);
+		auto existing = cache.entries.find(cacheKey);
 		if (existing != cache.entries.end()) {
+			existing->second.last_used = nextProgramCacheUse(cache.use_clock);
 			compiled = existing->second;
 		} else {
 			compiled.cacheId = cache.nextCacheId++;
 			if (compiled.cacheId == 0) compiled.cacheId = cache.nextCacheId++;
-			cache.entries.emplace(mslSource, compiled);
+			compiled.last_used = nextProgramCacheUse(cache.use_clock);
+			cache.entries.emplace(cacheKey, compiled);
 			if (cache.entries.size() > 96) {
 				auto victim = cache.entries.begin();
-				if (victim->first == mslSource) ++victim;
+				for (auto candidate = cache.entries.begin(); candidate != cache.entries.end(); ++candidate) {
+					if (candidate->second.last_used < victim->second.last_used) victim = candidate;
+				}
 				if (victim != cache.entries.end()) cache.entries.erase(victim);
 			}
 		}
@@ -194,8 +244,10 @@ static bool vertexStageFunctionsForMSL(const std::string &mslSource, VertexStage
 }
 
 struct FragmentStageCacheEntry {
+	__strong id<MTLDevice> device = nil;
 	__strong id<MTLFunction> function = nil;
 	uint64_t cacheId = 0;
+	uint64_t last_used = 0;
 	std::string error;
 };
 
@@ -203,30 +255,41 @@ struct FragmentStageCache {
 	std::mutex mutex;
 	std::unordered_map<std::string, FragmentStageCacheEntry> entries;
 	uint64_t nextCacheId = 1;
+	uint64_t use_clock = 0;
 };
 
 static FragmentStageCache &fragmentStageCache() {
-	static FragmentStageCache *cache = new FragmentStageCache();
+	static FragmentStageCache *cache = [] {
+		auto *created = new FragmentStageCache();
+		created->entries.max_load_factor(0.75f);
+		created->entries.reserve(96);
+		return created;
+	}();
 	return *cache;
 }
 
 static bool fragmentStageFunctionForMSL(const std::string &mslSource, FragmentStageCacheEntry &outEntry) {
+	id<MTLDevice> compileDevice = ctx.device;
+	if (!compileDevice) { outEntry.error = "Metal device is not initialized"; return false; }
+	const std::string cacheKey = deviceScopedMSLCacheKey(compileDevice, mslSource);
 	FragmentStageCache &cache = fragmentStageCache();
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto cached = cache.entries.find(mslSource);
+		auto cached = cache.entries.find(cacheKey);
 		if (cached != cache.entries.end()) {
+			cached->second.last_used = nextProgramCacheUse(cache.use_clock);
 			outEntry = cached->second;
 			return outEntry.function != nil;
 		}
 	}
 
 	FragmentStageCacheEntry compiled;
+	compiled.device = compileDevice;
 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 	options.languageVersion = MTLLanguageVersion2_2;
 	NSError *libraryError = nil;
-	id<MTLLibrary> library = source ? [ctx.device newLibraryWithSource:source options:options error:&libraryError] : nil;
+	id<MTLLibrary> library = source ? [compileDevice newLibraryWithSource:source options:options error:&libraryError] : nil;
 	compiled.function = [library newFunctionWithName:@"main0"];
 	if (!compiled.function) {
 		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal fragment library compilation failed") :
@@ -235,22 +298,175 @@ static bool fragmentStageFunctionForMSL(const std::string &mslSource, FragmentSt
 
 	{
 		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto existing = cache.entries.find(mslSource);
+		auto existing = cache.entries.find(cacheKey);
 		if (existing != cache.entries.end()) {
+			existing->second.last_used = nextProgramCacheUse(cache.use_clock);
 			compiled = existing->second;
 		} else {
 			compiled.cacheId = cache.nextCacheId++;
 			if (compiled.cacheId == 0) compiled.cacheId = cache.nextCacheId++;
-			cache.entries.emplace(mslSource, compiled);
+			compiled.last_used = nextProgramCacheUse(cache.use_clock);
+			cache.entries.emplace(cacheKey, compiled);
 			if (cache.entries.size() > 96) {
 				auto victim = cache.entries.begin();
-				if (victim->first == mslSource) ++victim;
+				for (auto candidate = cache.entries.begin(); candidate != cache.entries.end(); ++candidate) {
+					if (candidate->second.last_used < victim->second.last_used) victim = candidate;
+				}
 				if (victim != cache.entries.end()) cache.entries.erase(victim);
 			}
 		}
 	}
 	outEntry = compiled;
 	return outEntry.function != nil;
+}
+
+// Compute encoders remain open across consecutive dispatches. Avoid repeating
+// Metal state calls when a kernel reuses the same pipeline and resource bindings.
+static constexpr NSUInteger kComputeBufferBindingSlots = GL4METAL_UNIFORM_BUFFER_INDEX + 1;
+static constexpr NSUInteger kComputeTextureBindingSlots = 32;
+
+struct ComputeEncoderBufferSlot {
+	bool valid = false;
+	__strong id<MTLBuffer> buffer = nil;
+	NSUInteger offset = 0;
+};
+
+struct ComputeEncoderTextureSlot {
+	bool valid = false;
+	__strong id<MTLTexture> texture = nil;
+};
+
+struct ComputeEncoderSamplerSlot {
+	bool valid = false;
+	__strong id<MTLSamplerState> sampler = nil;
+};
+
+struct ComputeEncoderUniformSlot {
+	bool valid = false;
+	GLuint program = 0;
+	uint64_t revision = 0;
+	NSUInteger length = 0;
+};
+
+struct ComputeEncoderStateCache {
+	__weak id<MTLComputeCommandEncoder> encoder = nil;
+	bool pipelineValid = false;
+	__strong id<MTLComputePipelineState> pipeline = nil;
+	std::array<ComputeEncoderBufferSlot, kComputeBufferBindingSlots> buffers{};
+	std::array<ComputeEncoderTextureSlot, kComputeTextureBindingSlots> textures{};
+	std::array<ComputeEncoderSamplerSlot, kComputeTextureBindingSlots> samplers{};
+	bool bufferSizesValid = false;
+	std::array<uint32_t, GL4METAL_BUFFER_SIZE_BUFFER_INDEX + 1> bufferSizes{};
+	ComputeEncoderUniformSlot defaultUniform{};
+
+	void resetForEncoder(id<MTLComputeCommandEncoder> newEncoder) {
+		pipelineValid = false;
+		pipeline = nil;
+		bufferSizesValid = false;
+		defaultUniform.valid = false;
+		for (auto &binding : buffers) {
+			binding.valid = false;
+			binding.buffer = nil;
+			binding.offset = 0;
+		}
+		for (auto &binding : textures) {
+			binding.valid = false;
+			binding.texture = nil;
+		}
+		for (auto &binding : samplers) {
+			binding.valid = false;
+			binding.sampler = nil;
+		}
+		encoder = newEncoder;
+	}
+};
+
+static ComputeEncoderStateCache &threadComputeEncoderStateCache(void) {
+	static thread_local ComputeEncoderStateCache cache;
+	return cache;
+}
+
+static ComputeEncoderStateCache &computeEncoderStateFor(id<MTLComputeCommandEncoder> encoder) {
+	ComputeEncoderStateCache &cache = threadComputeEncoderStateCache();
+	if (cache.encoder != encoder) cache.resetForEncoder(encoder);
+	return cache;
+}
+
+void invalidateComputeEncoderStateCache(void) {
+	threadComputeEncoderStateCache().resetForEncoder(nil);
+}
+
+static inline void bindComputePipelineCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline) {
+	if (cache.pipelineValid && cache.pipeline == pipeline) return;
+	[encoder setComputePipelineState:pipeline];
+	cache.pipeline = pipeline;
+	cache.pipelineValid = true;
+}
+
+static inline void bindComputeBufferCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	if (slot >= cache.buffers.size()) {
+		[encoder setBuffer:buffer offset:offset atIndex:slot];
+		return;
+	}
+	ComputeEncoderBufferSlot &binding = cache.buffers[slot];
+	if (slot == GL4METAL_UNIFORM_BUFFER_INDEX) cache.defaultUniform.valid = false;
+	if (slot == GL4METAL_BUFFER_SIZE_BUFFER_INDEX) cache.bufferSizesValid = false;
+	if (binding.valid && binding.buffer == buffer && binding.offset == offset) return;
+	[encoder setBuffer:buffer offset:offset atIndex:slot];
+	binding.buffer = buffer;
+	binding.offset = offset;
+	binding.valid = true;
+}
+
+static inline void bindComputeBufferSizesCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, const std::array<uint32_t, GL4METAL_BUFFER_SIZE_BUFFER_INDEX + 1> &sizes) {
+	if (cache.bufferSizesValid && cache.bufferSizes == sizes) return;
+	[encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+	cache.bufferSizes = sizes;
+	cache.bufferSizesValid = true;
+	cache.buffers[GL4METAL_BUFFER_SIZE_BUFFER_INDEX].valid = false;
+}
+
+static inline void bindComputeDefaultUniformCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, GLuint programId, uint64_t revision,
+	const std::vector<uint8_t> &bytes) {
+	ComputeEncoderUniformSlot &binding = cache.defaultUniform;
+	if (binding.valid && binding.program == programId && binding.revision == revision &&
+		binding.length == bytes.size()) return;
+	[encoder setBytes:bytes.data() length:bytes.size() atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+	binding.program = programId;
+	binding.revision = revision;
+	binding.length = bytes.size();
+	binding.valid = true;
+	cache.buffers[GL4METAL_UNIFORM_BUFFER_INDEX].valid = false;
+}
+
+static inline void bindComputeTextureCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger slot) {
+	if (slot >= cache.textures.size()) {
+		[encoder setTexture:texture atIndex:slot];
+		return;
+	}
+	ComputeEncoderTextureSlot &binding = cache.textures[slot];
+	if (binding.valid && binding.texture == texture) return;
+	[encoder setTexture:texture atIndex:slot];
+	binding.texture = texture;
+	binding.valid = true;
+}
+
+static inline void bindComputeSamplerCached(ComputeEncoderStateCache &cache,
+	id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger slot) {
+	if (slot >= cache.samplers.size()) {
+		[encoder setSamplerState:sampler atIndex:slot];
+		return;
+	}
+	ComputeEncoderSamplerSlot &binding = cache.samplers[slot];
+	if (binding.valid && binding.sampler == sampler) return;
+	[encoder setSamplerState:sampler atIndex:slot];
+	binding.sampler = sampler;
+	binding.valid = true;
 }
 
 // Active-uniform type mapping for ordinary uniforms and samplers. Opaque image
@@ -820,39 +1036,41 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 		}
 		ctx.currentComputeEncoder = computeEncoder;
 	}
-	[computeEncoder setComputePipelineState:program->compute_pipeline];
+	ComputeEncoderStateCache &encoderCache = computeEncoderStateFor(computeEncoder);
+	bindComputePipelineCached(encoderCache, computeEncoder, program->compute_pipeline);
 	for (const ComputeBufferBinding &binding : storageBufferBindings) {
-		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
+		bindComputeBufferCached(encoderCache, computeEncoder, binding.buffer, binding.offset, binding.slot);
 	}
 	for (const ComputeBufferBinding &binding : uniformBufferBindings) {
-		[computeEncoder setBuffer:binding.buffer offset:binding.offset atIndex:binding.slot];
+		bindComputeBufferCached(encoderCache, computeEncoder, binding.buffer, binding.offset, binding.slot);
 	}
 	if (program->needs_buffer_size_buffer[2]) {
-		[computeEncoder setBytes:computeBufferSizes.data()
-			length:sizeof(computeBufferSizes) atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
+		bindComputeBufferSizesCached(encoderCache, computeEncoder, computeBufferSizes);
 	}
 	if (!program->uniform_data[2].empty()) {
 		const std::vector<uint8_t> &uniformBytes = program->uniform_data[2];
 		if (uniformBytes.size() <= 4096) {
-			[computeEncoder setBytes:uniformBytes.data() length:uniformBytes.size() atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+			bindComputeDefaultUniformCached(encoderCache, computeEncoder, ctx.current_program,
+				program->uniform_data_revision[2], uniformBytes);
 		} else {
 			__strong id<MTLBuffer> uniformBuffer = nil;
 			NSUInteger uniformOffset = 0;
-			if (!uploadLargeDefaultUniformBlock(uniformBytes.data(), uniformBytes.size(), uniformBuffer, uniformOffset)) {
+			if (!programUniformBufferForStage(*program, 2, uniformBuffer, uniformOffset)) {
 				[computeEncoder endEncoding];
 				ctx.currentComputeEncoder = nil;
+				invalidateComputeEncoderStateCache();
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				return;
 			}
-			[computeEncoder setBuffer:uniformBuffer offset:uniformOffset atIndex:GL4METAL_UNIFORM_BUFFER_INDEX];
+			bindComputeBufferCached(encoderCache, computeEncoder, uniformBuffer, uniformOffset, GL4METAL_UNIFORM_BUFFER_INDEX);
 		}
 	}
 	for (const ComputeTextureBinding &binding : sampledTextureBindings) {
-		[computeEncoder setTexture:binding.texture atIndex:binding.slot];
-		if (binding.usesSampler) [computeEncoder setSamplerState:binding.sampler atIndex:binding.slot];
+		bindComputeTextureCached(encoderCache, computeEncoder, binding.texture, binding.slot);
+		if (binding.usesSampler) bindComputeSamplerCached(encoderCache, computeEncoder, binding.sampler, binding.slot);
 	}
 	for (const ComputeTextureBinding &binding : imageTextureBindings) {
-		[computeEncoder setTexture:binding.texture atIndex:binding.slot];
+		bindComputeTextureCached(encoderCache, computeEncoder, binding.texture, binding.slot);
 	}
 	if (!usedBufferNames.empty()) markBuffersUsed(usedBufferNames.data(), usedBufferNames.size());
 	const MTLSize threadsPerGroup = MTLSizeMake(program->compute_workgroup_size[0],
@@ -969,6 +1187,16 @@ void glLinkProgram(GLuint program) {
 	p.uniform_data[0].clear();
 	p.uniform_data[1].clear();
 	p.uniform_data[2].clear();
+	for (NSUInteger stage = 0; stage < 3; ++stage) {
+		p.uniform_gpu_buffer[stage] = nil;
+		p.uniform_gpu_revision[stage] = 0;
+		p.uniform_gpu_device_identity[stage] = 0;
+		p.uniform_gpu_arena_generation[stage] = 0;
+		p.uniform_gpu_offset[stage] = 0;
+		p.uniform_gpu_is_transient[stage] = false;
+		++p.uniform_data_revision[stage];
+		if (p.uniform_data_revision[stage] == 0) ++p.uniform_data_revision[stage];
+	}
 	p.frag_outputs.clear();
 	p.blocks.clear();
 	p.uses_gl_frag_coord = false;

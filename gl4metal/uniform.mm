@@ -3,9 +3,9 @@
 #include <atomic>
 
 // MARK: - Helpers
-// glUniform* writes into the CPU copy of the current program's default uniform block (std140 layout taken from the
-// SPIR-V reflection). The copy is uploaded when a draw is issued: setVertexBytes/setFragmentBytes at
-// GL4METAL_UNIFORM_BUFFER_INDEX.
+// glUniform* writes into the CPU copy of the current program's default uniform block (std140 layout taken from
+// SPIR-V reflection). Per-stage revisions let the draw/compute paths skip unchanged encoder uploads and create
+// immutable or command-buffer-scoped Metal buffer snapshots for blocks larger than Metal's 4 KiB setBytes limit.
 
 enum SrcKind { SrcFloat, SrcInt, SrcUInt };
 
@@ -58,6 +58,12 @@ static void storeComponent(uint8_t *dst, TranslatedUniform::Kind kind, double va
 	}
 }
 
+static inline void bumpUniformDataRevision(ProgramObject &program, int stage) {
+	uint64_t &revision = program.uniform_data_revision[stage];
+	++revision;
+	if (revision == 0) ++revision; // reserve zero for an uninitialized GPU snapshot
+}
+
 // glUniform{1,2,3,4}{f,i,ui}[v]: `count` consecutive array elements starting at `location`.
 static void writeVector(GLint location, GLsizei count, int comps, SrcKind kind, const void *data, const char *caller) {
 	if (location == -1) {
@@ -103,21 +109,26 @@ static void writeVector(GLint location, GLsizei count, int comps, SrcKind kind, 
 		return;
 	}
 
+	bool stageDirty[3] = {false, false, false};
 	for (GLsizei i = 0; i < count && element + i < u->info.array_size; i++) {
 		for (int s = 0; s < 3; s++) { // the same uniform may live in vertex, fragment or compute
 			const TranslatedUniform::Stage &st = u->info.stage[s];
-			if (!st.present) {
-				continue;
-			}
+			if (!st.present) continue;
 			size_t base = st.offset + (size_t)(element + i) * st.array_stride;
-			if (base + (size_t)comps * 4 > p->uniform_data[s].size()) {
-				continue;
-			}
+			if (base + (size_t)comps * 4 > p->uniform_data[s].size()) continue;
 			for (int c = 0; c < comps; c++) {
-				storeComponent(p->uniform_data[s].data() + base + (size_t)c * 4, u->info.kind,
-							   srcValue(kind, data, (size_t)i * comps + c));
+				uint8_t encoded[4];
+				storeComponent(encoded, u->info.kind, srcValue(kind, data, (size_t)i * comps + c));
+				uint8_t *destination = p->uniform_data[s].data() + base + (size_t)c * 4;
+				if (memcmp(destination, encoded, sizeof(encoded)) != 0) {
+					memcpy(destination, encoded, sizeof(encoded));
+					stageDirty[s] = true;
+				}
 			}
 		}
+	}
+	for (int s = 0; s < 3; ++s) {
+		if (stageDirty[s]) bumpUniformDataRevision(*p, s);
 	}
 }
 
@@ -140,24 +151,28 @@ static void writeMatrix(GLint location, GLsizei count, int cols, int rows, GLboo
 		return;
 	}
 
+	bool stageDirty[3] = {false, false, false};
 	for (GLsizei i = 0; i < count && element + i < u->info.array_size; i++) {
 		const GLfloat *m = value + (size_t)i * cols * rows;
 		for (int s = 0; s < 3; s++) {
 			const TranslatedUniform::Stage &st = u->info.stage[s];
-			if (!st.present) {
-				continue;
-			}
+			if (!st.present) continue;
 			size_t base = st.offset + (size_t)(element + i) * st.array_stride;
-			if (base + (size_t)(cols - 1) * st.matrix_stride + (size_t)rows * 4 > p->uniform_data[s].size()) {
-				continue;
-			}
+			if (base + (size_t)(cols - 1) * st.matrix_stride + (size_t)rows * 4 > p->uniform_data[s].size()) continue;
 			for (int c = 0; c < cols; c++) {
 				for (int r = 0; r < rows; r++) {
 					float f = transpose ? m[r * cols + c] : m[c * rows + r];
-					memcpy(p->uniform_data[s].data() + base + (size_t)c * st.matrix_stride + (size_t)r * 4, &f, 4);
+					uint8_t *destination = p->uniform_data[s].data() + base + (size_t)c * st.matrix_stride + (size_t)r * 4;
+					if (memcmp(destination, &f, sizeof(f)) != 0) {
+						memcpy(destination, &f, sizeof(f));
+						stageDirty[s] = true;
+					}
 				}
 			}
 		}
+	}
+	for (int s = 0; s < 3; ++s) {
+		if (stageDirty[s]) bumpUniformDataRevision(*p, s);
 	}
 }
 

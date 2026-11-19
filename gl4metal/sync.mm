@@ -1,6 +1,8 @@
 #import "sync.h"
 #import "draw.h"
 
+extern void invalidateComputeEncoderStateCache(void);
+
 #include <unistd.h>
 
 // A fence completes when the command buffer that holds the commands recorded before it has completed.
@@ -48,6 +50,7 @@ void flushCommandBuffer(bool waitUntilCompleted) {
 	if (ctx.currentComputeEncoder) {
 		[ctx.currentComputeEncoder endEncoding];
 		ctx.currentComputeEncoder = nil;
+		invalidateComputeEncoderStateCache();
 	}
 	if (ctx.currentCommandBuffer) {
 		[ctx.currentCommandBuffer commit];
