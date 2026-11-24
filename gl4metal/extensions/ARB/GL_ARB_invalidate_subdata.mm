@@ -17,6 +17,7 @@ void glInvalidateBufferData(GLuint buffer) {
 		invalidateConvertedVertexBuffers(buffer);
 		it->second = nil;
 		ctx.buffer_last_use.erase(buffer);
+		ctx.buffer_last_use_event_value.erase(buffer);
 		refreshTextureBufferViews(buffer);
 		return;
 	}
@@ -35,6 +36,7 @@ void glInvalidateBufferData(GLuint buffer) {
 	}
 	it->second = replacement;
 	ctx.buffer_last_use.erase(buffer);
+	ctx.buffer_last_use_event_value.erase(buffer);
 	refreshTextureBufferViews(buffer);
 }
 

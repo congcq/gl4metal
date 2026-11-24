@@ -35,9 +35,11 @@ void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean laye
 		textureFound->second.texture.textureType == MTLTextureType2D;
 	const bool is3D = textureTarget == GL_TEXTURE_3D && layered == GL_TRUE &&
 		textureFound->second.depth > 0 && textureFound->second.texture.textureType == MTLTextureType3D;
-	if (!is2D && !is3D) {
+	const bool isArray = textureTarget == GL_TEXTURE_2D_ARRAY && layered == GL_TRUE &&
+		textureFound->second.depth > 0 && textureFound->second.texture.textureType == MTLTextureType2DArray;
+	if (!is2D && !is3D && !isArray) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glBindImageTexture: supported bindings are GL_TEXTURE_2D (layered flag ignored, layer 0) and layered GL_TEXTURE_3D (texture=%u target=0x%X layered=%u layer=%d)",
+		GL4METAL_LOG("glBindImageTexture: supported bindings are GL_TEXTURE_2D (layered flag ignored, layer 0), layered GL_TEXTURE_3D and layered GL_TEXTURE_2D_ARRAY (texture=%u target=0x%X layered=%u layer=%d)",
 			texture, textureTarget, (unsigned)layered, layer);
 		return;
 	}
@@ -74,8 +76,30 @@ void glMemoryBarrier(GLbitfield barriers) {
 	}
 	// A zero mask has no visibility requirements and must not split a Metal encoder.
 	if (barriers == 0) return;
-	// End the active encoder to establish a resource-visibility boundary. The
-	// command buffer uses tracked MTLBuffers/MTLTextures, so Metal orders hazards
-	// between the preceding and following encoders without a CPU-side wait.
+	// Metal 4 keeps consecutive compute dispatches in one encoder. Encode an
+	// intra-pass device-visibility barrier so shader writes from earlier dispatches
+	// are visible to later dispatches in this same encoder.
+	if (ctx.currentMetal4ComputeEncoder) {
+		if (ctx.metal4LastWorkStage == 2) {
+			[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
+				beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+		} else if (ctx.metal4LastWorkStage == 1) {
+			[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageDispatch
+				beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+		}
+		// The barrier prepares the next GL compute access to resources written by
+		// either a prior dispatch or a prior MTL4 blit command.
+		ctx.metal4LastWorkStage = 1;
+		return;
+	}
+
+	// Classic Metal uses tracked resources and a new encoder in the same command
+	// buffer to establish the boundary without stalling the CPU.
 	endRenderEncoder();
+	if (ctx.currentComputeEncoder) {
+		[ctx.currentComputeEncoder endEncoding];
+		ctx.currentComputeEncoder = nil;
+		extern void invalidateComputeEncoderStateCache(void);
+		invalidateComputeEncoderStateCache();
+	}
 }

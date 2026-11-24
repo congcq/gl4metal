@@ -1,6 +1,9 @@
 #import "gl4metal.h"
 
 #include <mutex>
+#include <unistd.h>
+#include <chrono>
+#include <limits>
 
 thread_local MTLContext ctx; // independent GL/Metal state for the calling thread
 
@@ -10,33 +13,504 @@ static std::mutex *gl4metalInitMutex = new std::mutex();
 // had a null device/queue and otherwise-zero GL state.
 static thread_local bool gl4metalInitialized = false;
 
+bool gl4metalWaitForMetal4Event(uint64_t targetValue, uint64_t timeoutMilliseconds) {
+	if (!ctx.metal4InteropEvent || targetValue == 0) return true;
+	const auto startTime = std::chrono::steady_clock::now();
+	while (ctx.metal4InteropEvent.signaledValue < targetValue) {
+		if (timeoutMilliseconds != UINT64_MAX) {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - startTime).count();
+			if ((uint64_t)elapsed >= timeoutMilliseconds) return false;
+		}
+		usleep(200);
+	}
+	return true;
+}
+
+static bool initializeMetal4Backend(void) {
+	if (!ctx.device) return false;
+	const char *disableValue = std::getenv("GL4METAL_DISABLE_METAL4");
+	if (disableValue && disableValue[0] == '1') {
+		GL4METAL_LOG("Metal 4 disabled by GL4METAL_DISABLE_METAL4=1");
+		return false;
+	}
+	// Metal 4 command APIs are not available on Apple6 (A13). Do not infer
+	// support from the OS version alone: require both the Apple7 GPU feature set
+	// and the Metal4 feature set before creating any MTL4 object.
+	if (@available(iOS 26.0, *)) {
+		const bool apple7 = [ctx.device supportsFamily:MTLGPUFamilyApple7];
+		const bool metal4 = [ctx.device supportsFamily:MTLGPUFamilyMetal4];
+		if (!apple7 || !metal4) {
+			const bool apple6 = [ctx.device supportsFamily:MTLGPUFamilyApple6];
+			if (apple6 && !apple7 && !metal4) {
+				GL4METAL_LOG("Metal 4 unavailable on Apple6 (A13); using complete classic Metal path");
+			} else {
+				GL4METAL_LOG("Metal 4 command path unavailable: Apple7=%d Metal4=%d; using classic Metal",
+					apple7 ? 1 : 0, metal4 ? 1 : 0);
+			}
+			return false;
+		}
+
+		NSError *error = nil;
+		MTL4CompilerDescriptor *compilerDescriptor = [[MTL4CompilerDescriptor alloc] init];
+		compilerDescriptor.label = @"GL4Metal Metal 4 compiler";
+		ctx.metal4Compiler = [ctx.device newCompilerWithDescriptor:compilerDescriptor error:&error];
+		ctx.metal4CommandQueue = [ctx.device newMTL4CommandQueue];
+		ctx.metal4InteropEvent = [ctx.device newSharedEvent];
+		MTLResidencySetDescriptor *residencyDescriptor = [[MTLResidencySetDescriptor alloc] init];
+		residencyDescriptor.initialCapacity = 64;
+		for (NSUInteger slot = 0; slot < 3; ++slot) {
+			ctx.metal4CommandAllocators[slot] = [ctx.device newCommandAllocator];
+			ctx.metal4CommandBuffers[slot] = [ctx.device newCommandBuffer];
+			residencyDescriptor.label = [NSString stringWithFormat:@"GL4Metal compute residency slot %lu", (unsigned long)slot];
+			ctx.metal4ResidencySets[slot] = [ctx.device newResidencySetWithDescriptor:residencyDescriptor error:&error];
+		}
+		MTL4ArgumentTableDescriptor *tableDescriptor = [[MTL4ArgumentTableDescriptor alloc] init];
+		tableDescriptor.maxBufferBindCount = GL4METAL_UNIFORM_BUFFER_INDEX + 1;
+		tableDescriptor.maxTextureBindCount = 32;
+		tableDescriptor.maxSamplerStateBindCount = 32;
+		ctx.metal4ComputeArgumentTable = [ctx.device newArgumentTableWithDescriptor:tableDescriptor error:&error];
+		// Every ring slot needs a residency set as well as an allocator and command
+		// buffer. Enabling Metal 4 with a nil residency set makes BeginMetal4Compute()
+		// fail on every submission and silently routes work back to the classic queue.
+		if (!ctx.metal4CommandQueue || !ctx.metal4InteropEvent || !ctx.metal4Compiler ||
+			!ctx.metal4CommandAllocators[0] || !ctx.metal4CommandAllocators[1] ||
+			!ctx.metal4CommandAllocators[2] || !ctx.metal4CommandBuffers[0] ||
+			!ctx.metal4CommandBuffers[1] || !ctx.metal4CommandBuffers[2] ||
+			!ctx.metal4ResidencySets[0] || !ctx.metal4ResidencySets[1] ||
+			!ctx.metal4ResidencySets[2] || !ctx.metal4ComputeArgumentTable) {
+			GL4METAL_LOG("Metal 4 initialization incomplete; using classic path: %s",
+				error.localizedDescription.UTF8String ?: "queue/event/allocator/residency-set/argument-table creation failed");
+			ctx.metal4Compiler = nil;
+			ctx.metal4CommandQueue = nil;
+			ctx.metal4InteropEvent = nil;
+			ctx.metal4ComputeArgumentTable = nil;
+			for (NSUInteger slot = 0; slot < 3; ++slot) {
+				ctx.metal4CommandAllocators[slot] = nil;
+				ctx.metal4CommandBuffers[slot] = nil;
+				ctx.metal4ResidencySets[slot] = nil;
+				ctx.metal4TransientBuffers[slot] = nil;
+				ctx.metal4TransientBufferOffsets[slot] = 0;
+			}
+			return false;
+		}
+		ctx.metal4Enabled = true;
+		GL4METAL_LOG("Metal 4 compute command path enabled on %s (Apple7=1 Metal4=1)",
+			ctx.device.name.UTF8String ?: "(unnamed)");
+		return true;
+	}
+	return false;
+}
+
+void gl4metalReapMetal4Submissions(void) {
+	if (!ctx.metal4Enabled || !ctx.metal4InteropEvent) return;
+	const uint64_t completedValue = ctx.metal4InteropEvent.signaledValue;
+	while (!ctx.metal4InFlightSubmissions.empty() &&
+		ctx.metal4InFlightSubmissions.front().event_value <= completedValue) {
+		Metal4InFlightSubmission &completed = ctx.metal4InFlightSubmissions.front();
+		// Reusable residency sets hold allocation references after command completion.
+		// Remove them now (not only when the ring slot is reused) to bound idle memory.
+		if (completed.residency_set) {
+			[completed.residency_set removeAllAllocations];
+			[completed.residency_set commit];
+		}
+		ctx.metal4InFlightSubmissions.pop_front();
+	}
+}
+
+static void registerMetal4Resource(id<MTLResource> resource) {
+	if (!resource || !ctx.currentMetal4ResidencySet) return;
+	const void *resourceKey = (__bridge const void *)resource;
+	if (!ctx.metal4CurrentResourceKeys.insert(resourceKey).second) return;
+	[ctx.currentMetal4ResidencySet addAllocation:resource];
+	ctx.metal4CurrentResources.push_back(resource);
+}
+
+static void registerMetal4Sampler(id<MTLSamplerState> sampler) {
+	if (!sampler) return;
+	for (const auto &existing : ctx.metal4CurrentSamplers) {
+		if (existing == sampler) return;
+	}
+	ctx.metal4CurrentSamplers.push_back(sampler);
+}
+
+bool gl4metalBeginMetal4Compute(void) {
+	if (!ctx.metal4Enabled || !ctx.metal4CommandQueue || !ctx.metal4InteropEvent ||
+		!ctx.metal4ComputeArgumentTable) return false;
+	if (ctx.currentMetal4CommandBuffer && ctx.currentMetal4ComputeEncoder) return true;
+
+	// Metal 4 and classic work are on distinct queues. Finish any classic work and
+	// make the Metal 4 queue wait on its event before submitting dependent compute.
+	if (ctx.currentEncoder) endRenderEncoder();
+	if (ctx.currentComputeEncoder) {
+		[ctx.currentComputeEncoder endEncoding];
+		ctx.currentComputeEncoder = nil;
+		extern void invalidateComputeEncoderStateCache(void);
+		invalidateComputeEncoderStateCache();
+	}
+	if (ctx.currentCommandBuffer) gl4metalCommitClassicCommandBuffer();
+
+	const uint32_t allocatorIndex = ctx.metal4AllocatorCursor++ % 3u;
+	const uint64_t allocatorCompletionValue = ctx.metal4AllocatorEventValues[allocatorIndex];
+	if (allocatorCompletionValue && !gl4metalWaitForMetal4Event(allocatorCompletionValue, 5000)) {
+		GL4METAL_LOG("Metal 4 allocator %u is still in flight at event value %llu; falling back to classic compute",
+			allocatorIndex, (unsigned long long)allocatorCompletionValue);
+		return false;
+	}
+	gl4metalReapMetal4Submissions();
+	id<MTL4CommandAllocator> allocator = ctx.metal4CommandAllocators[allocatorIndex];
+	if (!allocator || !ctx.metal4CommandBuffers[allocatorIndex] ||
+		!ctx.metal4ResidencySets[allocatorIndex]) return false;
+	[allocator reset];
+	ctx.metal4CurrentAllocatorIndex = allocatorIndex;
+	ctx.metal4TransientBufferOffsets[allocatorIndex] = 0;
+
+	if (ctx.metal4LastClassicEventValue > 0) {
+		[ctx.metal4CommandQueue waitForEvent:ctx.metal4InteropEvent value:ctx.metal4LastClassicEventValue];
+	}
+
+	id<MTL4CommandBuffer> commandBuffer = ctx.metal4CommandBuffers[allocatorIndex];
+	if (!commandBuffer) return false;
+	[commandBuffer beginCommandBufferWithAllocator:allocator];
+	commandBuffer.label = @"GL4Metal compute workload";
+
+	id<MTLResidencySet> residencySet = ctx.metal4ResidencySets[allocatorIndex];
+	// gl4metalReapMetal4Submissions() clears this slot's previous completed set.
+	// Keep the set attached while new allocations are staged and committed below.
+	[commandBuffer useResidencySet:residencySet];
+	id<MTL4ComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
+	if (!computeEncoder) {
+		[commandBuffer endCommandBuffer];
+		return false;
+	}
+
+	// Metal 4 doesn't automatically track resource hazards. A residency set only
+	// makes allocations resident; it does not make writes visible to later stages.
+	// Carry producer stages across command-buffer boundaries and place the consumer
+	// barrier in the new encoder, before any command can access those resources.
+	const MTLStages queue_producer_stages = (MTLStages)ctx.metal4PendingQueueBarrierStages;
+	if (queue_producer_stages != 0) {
+		const MTLStages queue_consumer_stages = (MTLStages)(MTLStageDispatch | MTLStageBlit);
+		[computeEncoder barrierAfterQueueStages:queue_producer_stages
+			beforeStages:queue_consumer_stages visibilityOptions:MTL4VisibilityOptionDevice];
+		ctx.metal4PendingQueueBarrierStages = 0;
+	}
+
+	ctx.currentMetal4CommandBuffer = commandBuffer;
+	ctx.currentMetal4ComputeEncoder = computeEncoder;
+	ctx.currentMetal4ResidencySet = residencySet;
+	ctx.metal4CurrentResources.clear();
+	ctx.metal4CurrentSamplers.clear();
+	ctx.metal4CurrentComputePipelines.clear();
+	ctx.metal4CurrentResourceKeys.clear();
+	ctx.metal4CurrentEventValue = ++ctx.metal4NextEventValue;
+	ctx.metal4LastWorkStage = 0;
+	ctx.metal4CurrentEncoderStages = 0;
+	return true;
+}
+
+bool gl4metalMetal4PrepareDispatch(void) {
+	if (!gl4metalBeginMetal4Compute() || !ctx.currentMetal4ComputeEncoder) return false;
+	if (ctx.metal4LastWorkStage == 2) {
+		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
+			beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+	}
+	ctx.metal4LastWorkStage = 1;
+	ctx.metal4CurrentEncoderStages |= (uint32_t)MTLStageDispatch;
+	return true;
+}
+
+static bool prepareMetal4BlitStage(void) {
+	if (!gl4metalBeginMetal4Compute() || !ctx.currentMetal4ComputeEncoder) return false;
+	if (ctx.metal4LastWorkStage == 1) {
+		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageDispatch
+			beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+	} else if (ctx.metal4LastWorkStage == 2) {
+		// A compute encoder can issue multiple blits in one pass. Metal 4 treats
+		// resources as untracked, so sequential GL copies that may read a previous
+		// copy's destination need an explicit blit->blit visibility boundary too.
+		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
+			beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+	}
+	ctx.metal4LastWorkStage = 2;
+	ctx.metal4CurrentEncoderStages |= (uint32_t)MTLStageBlit;
+	return true;
+}
+
+bool gl4metalMetal4StageBytes(const void *bytes, NSUInteger length, id<MTLBuffer> __strong *out_buffer, NSUInteger *out_offset) {
+	if (!bytes || length == 0 || !out_buffer || !out_offset || !ctx.device ||
+		length > ctx.device.maxBufferLength || !gl4metalBeginMetal4Compute()) return false;
+	const uint32_t allocatorIndex = ctx.metal4CurrentAllocatorIndex;
+	const NSUInteger currentOffset = ctx.metal4TransientBufferOffsets[allocatorIndex];
+	if (currentOffset > std::numeric_limits<NSUInteger>::max() - 255u) return false;
+	const NSUInteger alignedOffset = (currentOffset + 255u) & ~(NSUInteger)255u;
+	if (alignedOffset > std::numeric_limits<NSUInteger>::max() - length) return false;
+	const NSUInteger requiredEnd = alignedOffset + length;
+	id<MTLBuffer> transientBuffer = ctx.metal4TransientBuffers[allocatorIndex];
+	if (!transientBuffer || requiredEnd > transientBuffer.length) {
+		NSUInteger capacity = transientBuffer ? transientBuffer.length : (NSUInteger)(256u * 1024u);
+		capacity = std::max<NSUInteger>(capacity, 256u * 1024u);
+		while (capacity < requiredEnd) {
+			if (capacity > ctx.device.maxBufferLength / 2u) {
+				capacity = ctx.device.maxBufferLength;
+				break;
+			}
+			capacity *= 2u;
+		}
+		if (capacity < requiredEnd || capacity > ctx.device.maxBufferLength) return false;
+		id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+		if (!replacement) return false;
+		ctx.metal4TransientBuffers[allocatorIndex] = replacement;
+		transientBuffer = replacement;
+	}
+	memcpy((uint8_t *)transientBuffer.contents + alignedOffset, bytes, (size_t)length);
+	registerMetal4Resource(transientBuffer);
+	ctx.metal4TransientBufferOffsets[allocatorIndex] = requiredEnd;
+	*out_buffer = transientBuffer;
+	*out_offset = alignedOffset;
+	return true;
+}
+
+bool gl4metalMetal4CopyBuffer(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	id<MTLBuffer> destination_buffer, NSUInteger destination_offset, NSUInteger size) {
+	if (!source_buffer || !destination_buffer || size == 0 ||
+		source_offset > source_buffer.length || size > source_buffer.length - source_offset ||
+		destination_offset > destination_buffer.length || size > destination_buffer.length - destination_offset) return false;
+	if (source_buffer == destination_buffer) {
+		const NSUInteger source_end = source_offset + size;
+		const NSUInteger destination_end = destination_offset + size;
+		if (source_offset < destination_end && destination_offset < source_end) return false;
+	}
+	if (!prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(source_buffer);
+	registerMetal4Resource(destination_buffer);
+	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
+		toBuffer:destination_buffer destinationOffset:destination_offset size:size];
+	return true;
+}
+
+bool gl4metalMetal4CopyBufferToTexture(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	NSUInteger source_bytes_per_row, NSUInteger source_bytes_per_image, MTLSize source_size,
+	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin) {
+	if (!source_buffer || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
+		source_offset > source_buffer.length || !prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(source_buffer);
+	registerMetal4Resource(destination_texture);
+	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
+		sourceBytesPerRow:source_bytes_per_row sourceBytesPerImage:source_bytes_per_image sourceSize:source_size
+		toTexture:destination_texture destinationSlice:destination_slice destinationLevel:destination_level
+		destinationOrigin:destination_origin];
+	return true;
+}
+
+bool gl4metalMetal4CopyBufferToTextureOptions(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	NSUInteger source_bytes_per_row, NSUInteger source_bytes_per_image, MTLSize source_size,
+	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level,
+	MTLOrigin destination_origin, MTLBlitOption options) {
+	if (!source_buffer || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
+		source_offset > source_buffer.length || !prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(source_buffer);
+	registerMetal4Resource(destination_texture);
+	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
+		sourceBytesPerRow:source_bytes_per_row sourceBytesPerImage:source_bytes_per_image sourceSize:source_size
+		toTexture:destination_texture destinationSlice:destination_slice destinationLevel:destination_level
+		destinationOrigin:destination_origin options:options];
+	return true;
+}
+
+bool gl4metalMetal4CopyTextureRegion(id<MTLTexture> source_texture, NSUInteger source_slice, NSUInteger source_level,
+	MTLOrigin source_origin, MTLSize source_size, id<MTLTexture> destination_texture,
+	NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin) {
+	if (!source_texture || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
+		source_texture == destination_texture || source_texture.pixelFormat != destination_texture.pixelFormat ||
+		source_texture.sampleCount != destination_texture.sampleCount || !prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(source_texture);
+	registerMetal4Resource(destination_texture);
+	[ctx.currentMetal4ComputeEncoder copyFromTexture:source_texture sourceSlice:source_slice sourceLevel:source_level
+		sourceOrigin:source_origin sourceSize:source_size toTexture:destination_texture
+		destinationSlice:destination_slice destinationLevel:destination_level destinationOrigin:destination_origin];
+	return true;
+}
+
+bool gl4metalMetal4GenerateMipmaps(id<MTLTexture> texture) {
+	if (!texture || texture.mipmapLevelCount < 2 || !prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(texture);
+	[ctx.currentMetal4ComputeEncoder generateMipmapsForTexture:texture];
+	return true;
+}
+
+bool gl4metalMetal4CopyTextureToBuffer(id<MTLTexture> source_texture, NSUInteger source_slice, NSUInteger source_level,
+	MTLOrigin source_origin, MTLSize source_size, id<MTLBuffer> destination_buffer,
+	NSUInteger destination_offset, NSUInteger destination_bytes_per_row, NSUInteger destination_bytes_per_image, MTLBlitOption options) {
+	if (!source_texture || !destination_buffer || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
+		destination_offset > destination_buffer.length || !prepareMetal4BlitStage()) return false;
+	registerMetal4Resource(source_texture);
+	registerMetal4Resource(destination_buffer);
+	[ctx.currentMetal4ComputeEncoder copyFromTexture:source_texture sourceSlice:source_slice sourceLevel:source_level
+		sourceOrigin:source_origin sourceSize:source_size toBuffer:destination_buffer destinationOffset:destination_offset
+		destinationBytesPerRow:destination_bytes_per_row destinationBytesPerImage:destination_bytes_per_image options:options];
+	return true;
+}
+
+bool gl4metalMetal4BindBuffer(id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	if (!ctx.metal4Enabled || !ctx.currentMetal4ComputeEncoder || !ctx.metal4ComputeArgumentTable ||
+		!buffer || slot > GL4METAL_UNIFORM_BUFFER_INDEX || offset > buffer.length || buffer.gpuAddress == 0) return false;
+	const MTLGPUAddress baseAddress = buffer.gpuAddress;
+	if (UINT64_MAX - baseAddress < (MTLGPUAddress)offset) return false;
+	registerMetal4Resource(buffer);
+	[ctx.metal4ComputeArgumentTable setAddress:baseAddress + (MTLGPUAddress)offset atIndex:slot];
+	return true;
+}
+
+bool gl4metalMetal4UseBuffer(id<MTLBuffer> buffer) {
+	if (!ctx.metal4Enabled || !ctx.currentMetal4ComputeEncoder || !buffer || buffer.gpuAddress == 0) return false;
+	registerMetal4Resource(buffer);
+	return true;
+}
+
+bool gl4metalMetal4BindTexture(id<MTLTexture> texture, NSUInteger slot) {
+	if (!ctx.metal4Enabled || !ctx.currentMetal4ComputeEncoder || !ctx.metal4ComputeArgumentTable ||
+		!texture || slot >= 32) return false;
+	registerMetal4Resource(texture);
+	[ctx.metal4ComputeArgumentTable setTexture:texture.gpuResourceID atIndex:slot];
+	return true;
+}
+
+bool gl4metalMetal4BindSampler(id<MTLSamplerState> sampler, NSUInteger slot) {
+	if (!ctx.metal4Enabled || !ctx.currentMetal4ComputeEncoder || !ctx.metal4ComputeArgumentTable ||
+		!sampler || slot >= 32) return false;
+	registerMetal4Sampler(sampler);
+	[ctx.metal4ComputeArgumentTable setSamplerState:sampler.gpuResourceID atIndex:slot];
+	return true;
+}
+
+bool gl4metalMetal4BindBytes(const void *bytes, NSUInteger length, NSUInteger slot) {
+	if (slot > GL4METAL_UNIFORM_BUFFER_INDEX) return false;
+	id<MTLBuffer> transientBuffer = nil;
+	NSUInteger alignedOffset = 0;
+	if (!gl4metalMetal4StageBytes(bytes, length, &transientBuffer, &alignedOffset)) return false;
+	return gl4metalMetal4BindBuffer(transientBuffer, alignedOffset, slot);
+}
+
+void gl4metalMetal4UseComputePipeline(id<MTLComputePipelineState> pipeline) {
+	if (!pipeline || !ctx.currentMetal4CommandBuffer) return;
+	for (const auto &existing : ctx.metal4CurrentComputePipelines) {
+		if (existing == pipeline) return;
+	}
+	ctx.metal4CurrentComputePipelines.push_back(pipeline);
+}
+
+void gl4metalMarkMetal4BufferUsed(GLuint buffer_id) {
+	if (!ctx.currentMetal4CommandBuffer || buffer_id == 0) return;
+	ctx.buffer_last_use_event_value[buffer_id] = ctx.metal4CurrentEventValue;
+}
+
+void gl4metalCommitMetal4Compute(void) {
+	if (!ctx.metal4Enabled || !ctx.currentMetal4CommandBuffer) return;
+	if (ctx.currentMetal4ComputeEncoder) {
+		[ctx.currentMetal4ComputeEncoder endEncoding];
+		ctx.currentMetal4ComputeEncoder = nil;
+	}
+	// Preserve all producer stages so the next MTL4 encoder can insert a
+	// consumer queue barrier. The next command buffer may access resources
+	// written by any stage in this submission.
+	ctx.metal4PendingQueueBarrierStages |= ctx.metal4CurrentEncoderStages;
+	ctx.metal4CurrentEncoderStages = 0;
+	[ctx.currentMetal4ResidencySet commit];
+	[ctx.currentMetal4CommandBuffer endCommandBuffer];
+	id<MTL4CommandBuffer> commandBuffer = ctx.currentMetal4CommandBuffer;
+	const uint64_t completionValue = ctx.metal4CurrentEventValue;
+	const uint32_t allocatorIndex = (ctx.metal4AllocatorCursor - 1u) % 3u;
+	ctx.metal4AllocatorEventValues[allocatorIndex] = completionValue;
+	[ctx.metal4CommandQueue commit:&commandBuffer count:1];
+	[ctx.metal4CommandQueue signalEvent:ctx.metal4InteropEvent value:completionValue];
+
+	Metal4InFlightSubmission submission;
+	submission.event_value = completionValue;
+	submission.command_buffer = commandBuffer;
+	submission.residency_set = ctx.currentMetal4ResidencySet;
+	submission.resources.swap(ctx.metal4CurrentResources);
+	submission.samplers.swap(ctx.metal4CurrentSamplers);
+	submission.compute_pipelines.swap(ctx.metal4CurrentComputePipelines);
+	ctx.metal4InFlightSubmissions.push_back(std::move(submission));
+	ctx.metal4LastComputeEventValue = completionValue;
+	ctx.currentMetal4CommandBuffer = nil;
+	ctx.currentMetal4ResidencySet = nil;
+	ctx.metal4CurrentEventValue = 0;
+	ctx.metal4LastWorkStage = 0;
+	ctx.metal4CurrentResourceKeys.clear();
+	gl4metalReapMetal4Submissions();
+	extern void resetTextureUploadArenaMetal4(id<MTL4CommandBuffer> command_buffer);
+	resetTextureUploadArenaMetal4(commandBuffer);
+}
+
+bool gl4metalEnsureClassicCommandBuffer(void) {
+	if (ctx.metal4Enabled && ctx.currentMetal4CommandBuffer) gl4metalCommitMetal4Compute();
+
+	if (!ctx.currentCommandBuffer) {
+		if (!ctx.commandQueue) return false;
+		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+		if (!ctx.currentCommandBuffer) return false;
+
+		if (ctx.metal4Enabled && ctx.metal4LastComputeEventValue > ctx.classicWaitEventValue) {
+			[ctx.currentCommandBuffer encodeWaitForEvent:ctx.metal4InteropEvent value:ctx.metal4LastComputeEventValue];
+			ctx.classicWaitEventValue = ctx.metal4LastComputeEventValue;
+		}
+	}
+	return ctx.currentCommandBuffer != nil;
+}
+
+void gl4metalCommitClassicCommandBuffer(void) {
+	if (!ctx.currentCommandBuffer) return;
+
+	if (ctx.metal4Enabled && ctx.metal4InteropEvent) {
+		const uint64_t signalValue = ++ctx.metal4NextEventValue;
+		[ctx.currentCommandBuffer encodeSignalEvent:ctx.metal4InteropEvent value:signalValue];
+		ctx.metal4LastClassicEventValue = signalValue;
+	}
+	[ctx.currentCommandBuffer commit];
+	resetDrawTransientUploadArena(ctx.currentCommandBuffer);
+	resetTextureUploadArena(ctx.currentCommandBuffer);
+	ctx.last_committed_buffer = ctx.currentCommandBuffer;
+	ctx.currentCommandBuffer = nil;
+}
+
 // Compute-shader compatibility is exposed only when the active Metal device
 // meets the OpenGL compute baseline used by Iris. Device identity is stable for
 // the lifetime of MTLContext, so cache this capability instead of repeating
 // Objective-C feature queries from every GL limit/string query.
 bool gl4metalSupportsComputeShaders(void) {
-	static bool capabilityCached = false;
-	static bool capabilitySupported = false;
 	if (!ctx.device) return false;
-	if (capabilityCached) return capabilitySupported;
+	// MTLContext is thread-local, so cache this query per context/device. Querying a
+	// separate system-default device behind ctx.device can advertise compute support
+	// for a different adapter and hide a capability mismatch from the active device.
+	struct ComputeCapabilityCache {
+		__strong id<MTLDevice> device = nil;
+		bool initialized = false;
+		bool supported = false;
+	};
+	static thread_local ComputeCapabilityCache cache;
+	if (cache.initialized && cache.device == ctx.device) return cache.supported;
 
+	cache.device = ctx.device;
+	cache.initialized = true;
 	NSUInteger sharedMemoryLimit = 0;
 	MTLSize threadgroupLimits = MTLSizeMake(0, 0, 0);
 	bool apple6 = false;
+	bool supported = false;
 	if (@available(iOS 14.0, *)) {
 		apple6 = [ctx.device supportsFamily:MTLGPUFamilyApple6];
 		sharedMemoryLimit = ctx.device.maxThreadgroupMemoryLength;
 		threadgroupLimits = ctx.device.maxThreadsPerThreadgroup;
-		capabilitySupported = apple6 && sharedMemoryLimit >= 32768 &&
-			threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 &&
-			threadgroupLimits.depth >= 64;
+		supported = apple6 && sharedMemoryLimit >= 32768 &&
+			threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 && threadgroupLimits.depth >= 64;
 	}
-	capabilityCached = true;
+	cache.supported = supported;
 	GL4METAL_LOG("Compute capability: Apple6=%d, threads/group=%lu x %lu x %lu, threadgroup memory=%lu, enabled=%d",
 		apple6 ? 1 : 0, (unsigned long)threadgroupLimits.width,
 		(unsigned long)threadgroupLimits.height, (unsigned long)threadgroupLimits.depth,
-		(unsigned long)sharedMemoryLimit, capabilitySupported ? 1 : 0);
-	return capabilitySupported;
+		(unsigned long)sharedMemoryLimit, supported ? 1 : 0);
+	return cache.supported;
 }
 
 NSUInteger gl4metalMaxComputeWorkGroupInvocations(void) {
@@ -55,6 +529,7 @@ void initDevice() {
 	if (ctx.device && !ctx.commandQueue) {
 		ctx.commandQueue = [ctx.device newCommandQueue];
 	}
+	if (ctx.device && !ctx.metal4Enabled) initializeMetal4Backend();
 }
 
 GLboolean gl4metalInit() {
@@ -62,7 +537,7 @@ GLboolean gl4metalInit() {
 	if (gl4metalInitialized) return GL_TRUE;
 	initDevice();
 	if (!ctx.device || !ctx.commandQueue) {
-		GL4METAL_LOG("gl4metalInit: Metal device or command queue creation failed");
+		GL4METAL_LOG("gl4metalInit: Metal device or classic command queue creation failed");
 		return GL_FALSE;
 	}
 	const char *check = getenv("GL4METAL_CHECK_EXPORTS");

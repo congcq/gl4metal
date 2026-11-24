@@ -13,8 +13,8 @@ cd build && cmake \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_SYSROOT=$SDKPATH \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-    -DCMAKE_C_FLAGS="-arch arm64 -isysroot $SDKPATH -target arm64-apple-ios14" \
-    -DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $SDKPATH -target arm64-apple-ios14" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+    -DCMAKE_C_FLAGS="-arch arm64 -isysroot $SDKPATH -target arm64-apple-ios26.0" \
+    -DCMAKE_CXX_FLAGS="-arch arm64 -isysroot $SDKPATH -target arm64-apple-ios26.0" \
     ..
 cmake --build . --config Release --target gl4metal

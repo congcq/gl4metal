@@ -41,11 +41,32 @@ void pruneCompletedBufferUses(void) {
 		if (!commandBufferPending(it->second)) it = ctx.buffer_last_use.erase(it);
 		else ++it;
 	}
+
+	if (ctx.metal4InteropEvent) {
+		const uint64_t completedValue = ctx.metal4InteropEvent.signaledValue;
+		for (auto it = ctx.buffer_last_use_event_value.begin(); it != ctx.buffer_last_use_event_value.end();) {
+			if (it->second <= completedValue) it = ctx.buffer_last_use_event_value.erase(it);
+			else ++it;
+		}
+	}
 }
 
 void markBuffersUsed(const GLuint *buf_ids, size_t objectCount) {
+	if (!buf_ids || objectCount == 0) return;
+
+	if (ctx.metal4Enabled && ctx.currentMetal4CommandBuffer) {
+		for (size_t index = 0; index < objectCount; ++index) {
+			if (buf_ids[index] != 0) gl4metalMarkMetal4BufferUsed(buf_ids[index]);
+		}
+		if (++bufferUsePruneCounter >= 128 || ctx.buffer_last_use_event_value.size() > 2048) {
+			bufferUsePruneCounter = 0;
+			pruneCompletedBufferUses();
+		}
+		return;
+	}
+
 	id<MTLCommandBuffer> activeBuffer = ctx.currentCommandBuffer;
-	if (!activeBuffer || !buf_ids || objectCount == 0) return;
+	if (!activeBuffer) return;
 	for (size_t index = 0; index < objectCount; ++index) {
 		const GLuint buf_id = buf_ids[index];
 		if (buf_id == 0) continue;
@@ -66,6 +87,12 @@ void markBufferUsed(GLuint buf_id) {
 }
 
 static bool bufferHasPendingGPUUse(GLuint buf_id) {
+	auto eventIt = ctx.buffer_last_use_event_value.find(buf_id);
+	if (eventIt != ctx.buffer_last_use_event_value.end()) {
+		if (ctx.metal4InteropEvent && eventIt->second > ctx.metal4InteropEvent.signaledValue) return true;
+		ctx.buffer_last_use_event_value.erase(eventIt);
+	}
+
 	auto it = ctx.buffer_last_use.find(buf_id);
 	if (it == ctx.buffer_last_use.end()) return false;
 	if (commandBufferPending(it->second)) return true;
@@ -73,8 +100,17 @@ static bool bufferHasPendingGPUUse(GLuint buf_id) {
 	return false;
 }
 
+static void waitForBufferGPUUse(GLuint buf_id);
+
 static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
 	if (!bufferHasPendingGPUUse(buf_id)) return true;
+	// A CPU-side clone of shared storage is not a safe substitute for waiting when
+	// the GPU may have written the buffer. Preserve-content updates must observe all
+	// prior GL commands; only whole-store/invalidate renames may skip the wait.
+	if (preserveContents) {
+		waitForBufferGPUUse(buf_id);
+		if (!bufferHasPendingGPUUse(buf_id)) return true;
+	}
 	if (!ctx.device || !buffer || buffer.length > ctx.device.maxBufferLength) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		return false;
@@ -92,6 +128,7 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
 	}
 	ctx.buffer_objects[buf_id] = replacement;
 	ctx.buffer_last_use.erase(buf_id);
+	ctx.buffer_last_use_event_value.erase(buf_id);
 	buffer = replacement;
 	refreshTextureBufferViews(buf_id);
 	// Rebuilding linear texture-buffer views may grow the replacement again to add
@@ -107,6 +144,20 @@ static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer>
 }
 
 static void waitForBufferGPUUse(GLuint buf_id) {
+	auto eventIt = ctx.buffer_last_use_event_value.find(buf_id);
+	if (eventIt != ctx.buffer_last_use_event_value.end()) {
+		const uint64_t targetValue = eventIt->second;
+		if (targetValue > (ctx.metal4InteropEvent ? ctx.metal4InteropEvent.signaledValue : 0)) {
+			if (ctx.currentMetal4CommandBuffer && ctx.metal4CurrentEventValue == targetValue) {
+				gl4metalCommitMetal4Compute();
+			}
+			gl4metalWaitForMetal4Event(targetValue, UINT64_MAX);
+		}
+		auto completedIt = ctx.buffer_last_use_event_value.find(buf_id);
+		if (completedIt != ctx.buffer_last_use_event_value.end() && completedIt->second == targetValue)
+			ctx.buffer_last_use_event_value.erase(completedIt);
+	}
+
 	id<MTLCommandBuffer> lastUse = nil;
 	auto useIt = ctx.buffer_last_use.find(buf_id);
 	if (useIt == ctx.buffer_last_use.end()) return;
@@ -215,7 +266,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 			if (textureObject.buffer_object == buf_id) {
 				textureObject.buffer_object = 0;
 				textureObject.buffer_sampler_type = 0;
-				textureObject.texture = nil;
+				gl4metalSetTextureStorage(textureObject, nil);
 				textureObject.width = 0;
 				textureObject.height = 0;
 			}
@@ -226,6 +277,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 		// GL name creates a new buffer without changing those VAOs' backing storage.
 		invalidateConvertedVertexBuffers(buf_id);
 		ctx.buffer_last_use.erase(buf_id);
+		ctx.buffer_last_use_event_value.erase(buf_id);
 		ctx.buffer_objects.erase(buf_id);
 		gl4metalEraseBufferLogicalSize(buf_id);
 
@@ -401,6 +453,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		}
 		invalidateConvertedVertexBuffers(buf_id);
 		ctx.buffer_last_use.erase(buf_id);
+		ctx.buffer_last_use_event_value.erase(buf_id);
 		gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
 		refreshTextureBufferViews(buf_id);
 		return;
@@ -422,6 +475,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 	}
 	invalidateConvertedVertexBuffers(buf_id);
 	ctx.buffer_last_use.erase(buf_id);
+	ctx.buffer_last_use_event_value.erase(buf_id);
 	ctx.buffer_objects[buf_id] = buffer;
 	gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
 	refreshTextureBufferViews(buf_id);
@@ -519,12 +573,29 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 			return;
 		}
 	}
-	// Shared storage: a CPU copy. If the destination is still referenced by GPU work,
-	// rename it instead of serializing the full command queue. `from` remains the prior
-	// version when readTarget and writeTarget name the same object.
+	// Prefer an asynchronous MTL4 blit-stage copy on Apple7+/Metal4. The command
+	// encoder records resource dependencies and the per-buffer event tracker prevents
+	// later CPU mappings/updates from racing this copy. Keep the shared-storage CPU
+	// copy as the compatibility fallback.
 	if (size > 0) {
-		GLuint destinationName = boundBuffer(writeTarget);
+		const GLuint sourceName = boundBuffer(readTarget);
+		const GLuint destinationName = boundBuffer(writeTarget);
+		if (ctx.metal4Enabled && gl4metalMetal4CopyBuffer(from, (NSUInteger)readOffset,
+			to, (NSUInteger)writeOffset, (NSUInteger)size)) {
+			invalidateConvertedVertexBuffers(destinationName);
+			gl4metalMarkMetal4BufferUsed(sourceName);
+			gl4metalMarkMetal4BufferUsed(destinationName);
+			return;
+		}
+		waitForBufferGPUUse(sourceName);
+		auto sourceIt = ctx.buffer_objects.find(sourceName);
+		if (sourceIt == ctx.buffer_objects.end() || !sourceIt->second) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		from = sourceIt->second;
 		if (!makeBufferWritableWithoutStall(destinationName, to)) return;
+		if (sourceName == destinationName) from = to;
 		invalidateConvertedVertexBuffers(destinationName);
 		memmove((uint8_t *)to.contents + (NSUInteger)writeOffset, (const uint8_t *)from.contents + (NSUInteger)readOffset, (size_t)size);
 	}

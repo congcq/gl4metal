@@ -16,6 +16,7 @@ extern void invalidateComputeEncoderStateCache(void);
 #include <cstdint>
 #include <cstddef>
 #include <algorithm>
+#include <cmath>
 #include <utility>
 #include <functional>
 #include <unordered_map>
@@ -75,6 +76,37 @@ static bool renderPassDetailTraceEnabled(void) {
 
 static void traceRenderPassAttachmentSet(const char *phase, const char *callerFile, int callerLine);
 
+// The render encoder is reused across many Minecraft chunk draws. Re-encoding
+// unchanged viewport/scissor state on every draw adds avoidable CPU encoder cost.
+// Keep this cache per GL thread and tie it to the exact encoder; a new encoder
+// always starts with an invalid cache, even if Metal reuses an object address.
+struct ViewportScissorStateCache {
+	const void *encoder_key = nullptr;
+	bool viewport_valid = false;
+	bool scissor_valid = false;
+	MTLViewport viewport{};
+	MTLScissorRect scissor{};
+};
+
+static thread_local ViewportScissorStateCache viewportScissorStateCache;
+
+static void invalidateViewportAndScissorCache(void) {
+	viewportScissorStateCache.encoder_key = nullptr;
+	viewportScissorStateCache.viewport_valid = false;
+	viewportScissorStateCache.scissor_valid = false;
+}
+
+static bool sameViewport(const MTLViewport &lhs, const MTLViewport &rhs) {
+	return lhs.originX == rhs.originX && lhs.originY == rhs.originY &&
+		lhs.width == rhs.width && lhs.height == rhs.height &&
+		lhs.znear == rhs.znear && lhs.zfar == rhs.zfar;
+}
+
+static bool sameScissorRect(const MTLScissorRect &lhs, const MTLScissorRect &rhs) {
+	return lhs.x == rhs.x && lhs.y == rhs.y &&
+		lhs.width == rhs.width && lhs.height == rhs.height;
+}
+
 void endRenderEncoderAt(const char *callerFile, int callerLine) {
 	// Metal encoders on one command buffer are sequential. Close a cached compute
 	// encoder before any render-pass, blit, or resource-update path that uses this
@@ -111,6 +143,7 @@ void endRenderEncoderAt(const char *callerFile, int callerLine) {
 		[ctx.currentEncoder endEncoding];
 		ctx.currentEncoder = nil;
 	}
+	invalidateViewportAndScissorCache();
 	invalidateDrawEncoderStateCache();
 	ctx.fragcoord_params_bound = false;
 	ctx.discard_default_depth_stencil_on_end = false;
@@ -149,8 +182,24 @@ static id<MTLTexture> attachmentTexture(const FBOAttachment &a) {
 	} else {
 		auto object = ctx.texture_objects.find(a.texture);
 		if (object == ctx.texture_objects.end() || !object->second.texture) return nil;
-		texture = object->second.texture;
-		if ((NSUInteger)a.level >= texture.mipmapLevelCount) return nil;
+		id<MTLTexture> baseTexture = object->second.texture;
+		if ((NSUInteger)a.level >= baseTexture.mipmapLevelCount) return nil;
+		if (a.layer >= 0) {
+			if (baseTexture.textureType != MTLTextureType2DArray ||
+				(NSUInteger)a.layer >= baseTexture.arrayLength) return nil;
+			// The GL attachment references the texture object, not a particular
+			// Metal allocation. Rebuild the single-layer view after glTexImage*
+			// replaces the texture object's backing storage.
+			if (!a.view || a.view_source != baseTexture) {
+				a.view = [baseTexture newTextureViewWithPixelFormat:baseTexture.pixelFormat
+					textureType:MTLTextureType2D levels:NSMakeRange(0, baseTexture.mipmapLevelCount)
+					slices:NSMakeRange((NSUInteger)a.layer, 1)];
+				a.view_source = a.view ? baseTexture : nil;
+			}
+			texture = a.view;
+		} else {
+			texture = baseTexture;
+		}
 	}
 	if ((texture.textureType != MTLTextureType2D && texture.textureType != MTLTextureType2DMultisample) ||
 		(texture.usage & MTLTextureUsageRenderTarget) == 0) return nil;
@@ -353,7 +402,19 @@ void applyViewportAndScissor(void) {
 	}
 	vp.znear = ctx.depth_range_near;
 	vp.zfar = ctx.depth_range_far;
-	[ctx.currentEncoder setViewport:vp];
+
+	const void *encoder_key = (__bridge const void *)ctx.currentEncoder;
+	if (viewportScissorStateCache.encoder_key != encoder_key) {
+		viewportScissorStateCache.encoder_key = encoder_key;
+		viewportScissorStateCache.viewport_valid = false;
+		viewportScissorStateCache.scissor_valid = false;
+	}
+	if (!viewportScissorStateCache.viewport_valid ||
+		!sameViewport(viewportScissorStateCache.viewport, vp)) {
+		[ctx.currentEncoder setViewport:vp];
+		viewportScissorStateCache.viewport = vp;
+		viewportScissorStateCache.viewport_valid = true;
+	}
 
 	// Metal requires the scissor rect to lie inside the render target.
 	NSInteger x0 = 0, y0 = 0, x1 = (NSInteger)W, y1 = (NSInteger)H;
@@ -372,7 +433,12 @@ void applyViewportAndScissor(void) {
 	sr.y = (NSUInteger)y0;
 	sr.width = (NSUInteger)std::max<NSInteger>(x1 - x0, 0);
 	sr.height = (NSUInteger)std::max<NSInteger>(y1 - y0, 0);
-	[ctx.currentEncoder setScissorRect:sr];
+	if (!viewportScissorStateCache.scissor_valid ||
+		!sameScissorRect(viewportScissorStateCache.scissor, sr)) {
+		[ctx.currentEncoder setScissorRect:sr];
+		viewportScissorStateCache.scissor = sr;
+		viewportScissorStateCache.scissor_valid = true;
+	}
 }
 
 static bool retargetOpenRenderPassForBoundFramebuffer(GLuint newFramebuffer, bool preservePassSerial);
@@ -572,10 +638,7 @@ id<MTLRenderCommandEncoder> beginRenderPass(GLbitfield clearMask, bool preserveP
 		GL4METAL_LOG("beginRenderPass: Metal command queue is unavailable");
 		return nil;
 	}
-	if (!ctx.currentCommandBuffer) {
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-	}
-	if (!ctx.currentCommandBuffer) return nil;
+	if (!gl4metalEnsureClassicCommandBuffer()) return nil;
 	ctx.currentEncoder = [ctx.currentCommandBuffer renderCommandEncoderWithDescriptor:rp];
 	if (!ctx.currentEncoder) {
 		GL4METAL_LOG("beginRenderPass: Metal could not create render encoder (FBO=%u, size=%lux%lu)",
@@ -1120,12 +1183,49 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 // MARK: - Framebuffer attachments
 
 void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
-	glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+	GLenum imageTarget = GL_TEXTURE_2D;
+	if (texture != 0) {
+		auto object = ctx.texture_objects.find(texture);
+		if (object != ctx.texture_objects.end() && object->second.target == GL_TEXTURE_2D_MULTISAMPLE)
+			imageTarget = GL_TEXTURE_2D_MULTISAMPLE;
+	}
+	glFramebufferTexture2D(target, attachment, imageTarget, texture, level);
 }
 
 void glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+	if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (textarget != GL_TEXTURE_1D) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (level < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	const bool validAttachment =
+		(attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) ||
+		attachment == GL_DEPTH_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT ||
+		attachment == GL_DEPTH_STENCIL_ATTACHMENT;
+	if (!validAttachment) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	// Detaching is supported even though a live 1D texture cannot be used as
+	// a Metal render-pass attachment. Keep GL object/FBO state consistent.
+	if (texture == 0) {
+		glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, 0, level);
+		return;
+	}
+	auto textureIt = ctx.texture_objects.find(texture);
+	if (textureIt == ctx.texture_objects.end() || textureIt->second.target != GL_TEXTURE_1D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
 	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glFramebufferTexture1D: Unimplemented");
+	GL4METAL_LOG("glFramebufferTexture1D: 1D render-target attachments are not supported by iOS Metal");
 }
 
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
@@ -1145,16 +1245,21 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 		GL4METAL_LOG("glFramebufferTexture2D: the default framebuffer is bound (GL_INVALID_OPERATION)");
 		return;
 	}
-	if (texture != 0 && textarget != GL_TEXTURE_2D) {
+	if (texture != 0 && textarget != GL_TEXTURE_2D && textarget != GL_TEXTURE_2D_MULTISAMPLE) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glFramebufferTexture2D: unsupported textarget 0x%X", textarget);
 		return;
 	}
 	if (texture != 0) {
 		auto object = ctx.texture_objects.find(texture);
-		if (object == ctx.texture_objects.end() || object->second.target != GL_TEXTURE_2D) {
+		if (object == ctx.texture_objects.end() || object->second.target != textarget) {
 			gl4metalSetError(GL_INVALID_OPERATION);
-			GL4METAL_LOG("glFramebufferTexture2D: texture %u is not an initialized GL_TEXTURE_2D object", texture);
+			GL4METAL_LOG("glFramebufferTexture2D: texture %u target 0x%X does not match attachment target 0x%X",
+				texture, object == ctx.texture_objects.end() ? 0 : object->second.target, textarget);
+			return;
+		}
+		if (textarget == GL_TEXTURE_2D_MULTISAMPLE && level != 0) {
+			gl4metalSetError(GL_INVALID_VALUE);
 			return;
 		}
 	}
@@ -1189,13 +1294,108 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, 
 }
 
 void glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) {
+	if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (textarget != GL_TEXTURE_3D) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (level < 0 || zoffset < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	const bool validAttachment =
+		(attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) ||
+		attachment == GL_DEPTH_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT ||
+		attachment == GL_DEPTH_STENCIL_ATTACHMENT;
+	if (!validAttachment) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (texture == 0) {
+		glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, 0, level);
+		return;
+	}
+	auto textureIt = ctx.texture_objects.find(texture);
+	if (textureIt == ctx.texture_objects.end() || textureIt->second.target != GL_TEXTURE_3D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	// Metal texture views cannot reinterpret a 3D volume as a 2D render-target
+	// slice. glFramebufferTextureLayer on GL_TEXTURE_2D_ARRAY is the supported
+	// layered-render-target path on iPhone/iPad.
 	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glFramebufferTexture3D: Unimplemented");
+	GL4METAL_LOG("glFramebufferTexture3D: a 3D-volume slice cannot be attached as a 2D Metal render target; use GL_TEXTURE_2D_ARRAY");
 }
 
 void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glFramebufferTextureLayer: Unimplemented");
+	if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (level < 0 || layer < 0) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	const GLuint framebufferName = (target == GL_READ_FRAMEBUFFER) ? ctx.read_fbo : ctx.draw_fbo;
+	if (framebufferName == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	const bool colorAttachment = attachment >= GL_COLOR_ATTACHMENT0 &&
+		attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS;
+	const bool depthStencilAttachment = attachment == GL_DEPTH_ATTACHMENT ||
+		attachment == GL_STENCIL_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT;
+	if (!colorAttachment && !depthStencilAttachment) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	FBOAttachment newAttachment;
+	newAttachment.texture = texture;
+	newAttachment.level = level;
+	newAttachment.layer = layer;
+	if (texture != 0) {
+		auto textureIt = ctx.texture_objects.find(texture);
+		if (textureIt == ctx.texture_objects.end() || !textureIt->second.texture ||
+			textureIt->second.target != GL_TEXTURE_2D_ARRAY ||
+			textureIt->second.texture.textureType != MTLTextureType2DArray) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glFramebufferTextureLayer: texture %u is not an allocated GL_TEXTURE_2D_ARRAY", texture);
+			return;
+		}
+		id<MTLTexture> baseTexture = textureIt->second.texture;
+		if ((NSUInteger)level >= baseTexture.mipmapLevelCount || (NSUInteger)layer >= baseTexture.arrayLength) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			return;
+		}
+		if (!attachmentTexture(newAttachment)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glFramebufferTextureLayer: Metal could not create a renderable 2D view for texture %u layer %d", texture, layer);
+			return;
+		}
+	}
+	FBO &fbo = ctx.fbo_objects[framebufferName];
+	if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+		fbo.color[attachment - GL_COLOR_ATTACHMENT0] = newAttachment;
+		fbo.invalidated_color_mask &= ~(1u << (attachment - GL_COLOR_ATTACHMENT0));
+	} else if (attachment == GL_DEPTH_ATTACHMENT) {
+		fbo.depth = newAttachment;
+		fbo.invalidated_depth = false;
+	} else if (attachment == GL_STENCIL_ATTACHMENT) {
+		fbo.stencil = newAttachment;
+		fbo.invalidated_stencil = false;
+	} else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+		fbo.depth = newAttachment;
+		fbo.stencil = newAttachment;
+		fbo.invalidated_depth = false;
+		fbo.invalidated_stencil = false;
+	} else {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (framebufferName == ctx.draw_fbo) endRenderEncoder();
 }
 
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
@@ -1277,6 +1477,14 @@ void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLe
 		case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:
 			*params = (a && a->texture) ? a->level : 0;
 			break;
+		case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER:
+			*params = (a && a->texture && a->layer >= 0) ? a->layer : 0;
+			break;
+		case GL_FRAMEBUFFER_ATTACHMENT_LAYERED:
+			// The backend supports explicit single-layer views only; whole-array
+			// layered rendering (gl_Layer) is not implemented by the shader path.
+			*params = GL_FALSE;
+			break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetFramebufferAttachmentParameteriv: unhandled pname 0x%X", pname);
@@ -1286,6 +1494,56 @@ void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLe
 }
 
 // MARK: - Draw / read buffers
+
+// The legacy Metal render-pass API used by this backend fixes its color
+// attachment layout when the encoder is created. A glDrawBuffers change can
+// therefore keep the current encoder only when every logical output slot still
+// resolves to the exact same Metal image and mip level. This commonly catches
+// redundant routing changes involving aliased GL attachment points without
+// relying on the Metal 4 color-attachment-mapping pipeline state.
+static bool drawBufferSelectionMatchesOpenMetalPass(const FBO &fbo,
+	GLsizei requestedCount, const GLenum *requestedBuffers) {
+	if (!ctx.currentEncoder || ctx.pass_draw_fbo != ctx.draw_fbo || ctx.draw_fbo == 0) {
+		return false;
+	}
+
+	for (int logicalSlot = 0; logicalSlot < GL4METAL_MAX_COLOR_ATTACHMENTS; ++logicalSlot) {
+		const GLenum oldSelector = fbo.draw_buffers[logicalSlot];
+		const GLenum newSelector = logicalSlot < requestedCount
+			? requestedBuffers[logicalSlot] : GL_NONE;
+
+		id<MTLTexture> oldTexture = nil;
+		id<MTLTexture> newTexture = nil;
+		GLint oldLevel = 0;
+		GLint newLevel = 0;
+
+		if (oldSelector >= GL_COLOR_ATTACHMENT0 &&
+			oldSelector < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+			const FBOAttachment &oldAttachment = fbo.color[oldSelector - GL_COLOR_ATTACHMENT0];
+			oldTexture = attachmentTexture(oldAttachment);
+			oldLevel = oldAttachment.level;
+		}
+		if (newSelector >= GL_COLOR_ATTACHMENT0 &&
+			newSelector < GL_COLOR_ATTACHMENT0 + GL4METAL_MAX_COLOR_ATTACHMENTS) {
+			const FBOAttachment &newAttachment = fbo.color[newSelector - GL_COLOR_ATTACHMENT0];
+			newTexture = attachmentTexture(newAttachment);
+			newLevel = newAttachment.level;
+		}
+
+		const uint32_t slotBit = 1u << logicalSlot;
+		const bool passHasAttachment = (ctx.pass_color_attachment_mask & slotBit) != 0;
+		if (oldTexture != newTexture || (oldTexture && oldLevel != newLevel)) {
+			return false;
+		}
+		if ((oldTexture != nil) != passHasAttachment) {
+			return false;
+		}
+		if (oldTexture && ctx.pass_color_format[logicalSlot] != oldTexture.pixelFormat) {
+			return false;
+		}
+	}
+	return true;
+}
 
 void glDrawBuffers(GLsizei n, const GLenum *bufs) {
 	if (n < 0 || n > GL4METAL_MAX_COLOR_ATTACHMENTS || (n > 0 && !bufs)) {
@@ -1315,6 +1573,11 @@ void glDrawBuffers(GLsizei n, const GLenum *bufs) {
 		if (it->second.draw_buffers[i] != requested) drawBufferMappingChanged = true;
 	}
 	// Draw buffer i writes to the colour attachment named by bufs[i] (GL_NONE: not written).
+	// Preserve an open legacy Metal encoder only when the new routing resolves to
+	// exactly the same attachment objects at the same logical output slots. A
+	// different target set/order still requires a new render pass.
+	const bool openPassTargetsUnchanged = drawBufferMappingChanged &&
+		drawBufferSelectionMatchesOpenMetalPass(it->second, n, bufs);
 	if (drawBufferMappingChanged) {
 		for (int i = 0; i < GL4METAL_MAX_COLOR_ATTACHMENTS; i++) {
 			it->second.draw_buffers[i] = (i < n) ? bufs[i] : GL_NONE;
@@ -1352,7 +1615,21 @@ void glDrawBuffers(GLsizei n, const GLenum *bufs) {
 			GL4METAL_LOG("glDrawBuffers: framebuffer=%u count=%d selected=[%s]", ctx.draw_fbo, n, stateList.c_str());
 		}
 	}
-	if (drawBufferMappingChanged) endRenderEncoder(); // only a changed mapping requires a new pass
+	// Do not tear down an encoder that belongs to a previously bound FBO: r4
+	// deliberately defers transient framebuffer binds until the next draw.
+	// Likewise, changing draw-buffer state before a render pass exists must not
+	// flush an unrelated compute encoder. If the active pass belongs to this FBO,
+	// end it only when the physical attachment layout really changed.
+	if (drawBufferMappingChanged && ctx.currentEncoder &&
+		ctx.pass_draw_fbo == ctx.draw_fbo && !openPassTargetsUnchanged) {
+		endRenderEncoder();
+	} else if (drawBufferTraceEnabled() && drawBufferMappingChanged) {
+		const char *reason = !ctx.currentEncoder ? "no-active-render-encoder" :
+			(ctx.pass_draw_fbo != ctx.draw_fbo ? "encoder-belongs-to-other-fbo" :
+			(openPassTargetsUnchanged ? "same-physical-attachment-layout" : "deferred"));
+		GL4METAL_LOG("glDrawBuffers: kept encoder state (%s) fbo=%u activeFbo=%u",
+			reason, ctx.draw_fbo, ctx.pass_draw_fbo);
+	}
 }
 
 void glDrawBuffer(GLenum buf) {
@@ -1377,6 +1654,7 @@ void glReadBuffer(GLenum src) {
 // MARK: - Clear
 
 static inline double clamp01(double v) {
+	if (std::isnan(v)) return 0.0;
 	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
 }
 
@@ -1796,6 +2074,7 @@ static void performFramebufferClear(GLbitfield mask, GLint drawbuffer,
 	[encoder setCullMode:MTLCullModeNone];
 	[encoder setTriangleFillMode:MTLTriangleFillModeFill];
 	[encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+	invalidateViewportAndScissorCache();
 	[encoder setViewport:viewport];
 	[encoder setScissorRect:scissorRect];
 	if (colorOutputMask != 0 || writeDepth) {
@@ -1848,6 +2127,7 @@ void glClearStencil(GLint s) {
 }
 
 void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
+	if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	if (buffer == GL_STENCIL) {
 		performFramebufferClear(GL_STENCIL_BUFFER_BIT, -1, nullptr, (GLfloat)ctx.clear_depth, value[0], false);
 	} else if (buffer == GL_COLOR) {
@@ -1865,6 +2145,7 @@ void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) {
 }
 
 void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
+	if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	if (buffer != GL_COLOR) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		return;
@@ -1880,6 +2161,7 @@ void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) {
 }
 
 void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
+	if (!value) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	if (buffer == GL_COLOR) {
 		if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
 			gl4metalSetError(GL_INVALID_VALUE);
@@ -1887,7 +2169,8 @@ void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) {
 		}
 		ClearColorValue color;
 		color.kind = ClearValueKind::Float;
-		for (int component = 0; component < 4; ++component) color.floatValues[component] = value[component];
+		for (int component = 0; component < 4; ++component)
+			color.floatValues[component] = std::isnan(value[component]) ? 0.0f : value[component];
 		performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 	} else if (buffer == GL_DEPTH) {
 		performFramebufferClear(GL_DEPTH_BUFFER_BIT, -1, nullptr, value[0], ctx.clear_stencil, false);
@@ -1907,13 +2190,15 @@ void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stenc
 
 // glClearBuffer*: one draw buffer of the current framebuffer.
 void clearOneColorBuffer(GLint drawbuffer, const GLfloat *rgba) {
+	if (!rgba) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	if (drawbuffer < 0 || drawbuffer >= GL4METAL_MAX_COLOR_ATTACHMENTS) {
 		gl4metalSetError(GL_INVALID_VALUE);
 		return;
 	}
 	ClearColorValue color;
 	color.kind = ClearValueKind::Float;
-	for (int component = 0; component < 4; ++component) color.floatValues[component] = rgba[component];
+	for (int component = 0; component < 4; ++component)
+		color.floatValues[component] = std::isnan(rgba[component]) ? 0.0f : rgba[component];
 	performFramebufferClear(GL_COLOR_BUFFER_BIT, drawbuffer, &color, (GLfloat)ctx.clear_depth, ctx.clear_stencil, false);
 }
 
@@ -2138,10 +2423,14 @@ static bool encodeDepthStencilPlaneCopy(id<MTLTexture> source, NSUInteger source
 			gl4metalSetError(GL_INVALID_OPERATION);
 			return false;
 		}
-		if (!ctx.currentCommandBuffer) {
-			if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
-			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+
+		if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(source, 0, sourceLevel,
+			MTLOriginMake(sourceX, sourceY, 0), MTLSizeMake(width, height, 1),
+			destination, 0, destinationLevel, MTLOriginMake(destinationX, destinationY, 0))) {
+			return true;
 		}
+
+		if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
 		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 		[copyEncoder copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
@@ -2163,13 +2452,21 @@ static bool encodeDepthStencilPlaneCopy(id<MTLTexture> source, NSUInteger source
 	if (scratchLength > ctx.device.maxBufferLength) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 	id<MTLBuffer> scratch = [ctx.device newBufferWithLength:scratchLength options:MTLResourceStorageModeShared];
 	if (!scratch) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
-	if (!ctx.currentCommandBuffer) {
-		if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	const MTLBlitOption aspectOption = depthPlane ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionStencilFromDepthStencil;
+
+	if (ctx.metal4Enabled &&
+		gl4metalMetal4CopyTextureToBuffer(source, 0, sourceLevel,
+			MTLOriginMake(sourceX, sourceY, 0), MTLSizeMake(width, height, 1),
+			scratch, 0, rowBytes, 0, aspectOption) &&
+		gl4metalMetal4CopyBufferToTextureOptions(scratch, 0, rowBytes, 0,
+			MTLSizeMake(width, height, 1), destination, 0, destinationLevel,
+			MTLOriginMake(destinationX, destinationY, 0), aspectOption)) {
+		return true;
 	}
+
+	if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 	id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
 	if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
-	const MTLBlitOption aspectOption = depthPlane ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionStencilFromDepthStencil;
 	[copyEncoder copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
 		sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
 		sourceSize:MTLSizeMake(width, height, 1)
@@ -2283,14 +2580,20 @@ static bool performDepthStencilBlit(GLint srcX0, GLint srcY0, GLint srcX1, GLint
 		}
 		if (sourceDepth == destinationDepth) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
 		endRenderEncoder();
-		if (!ctx.currentCommandBuffer) {
-			if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
-			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-		}
-		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
-		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 		const NSUInteger sourceMetalY = blitMetalY(ctx.read_fbo, sourceDepth, sourceDepthLevel, srcY0, height);
 		const NSUInteger destinationMetalY = blitMetalY(ctx.draw_fbo, destinationDepth, destinationDepthLevel, dstY0, height);
+
+		if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(sourceDepth, 0, sourceDepthLevel,
+			MTLOriginMake((NSUInteger)srcX0, sourceMetalY, 0), MTLSizeMake(width, height, 1),
+			destinationDepth, 0, destinationDepthLevel,
+			MTLOriginMake((NSUInteger)dstX0, destinationMetalY, 0))) {
+			markDefaultDepthStencilContents(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			return true;
+		}
+
+		if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
+		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
 		[copyEncoder copyFromTexture:sourceDepth sourceSlice:0 sourceLevel:sourceDepthLevel
 			sourceOrigin:MTLOriginMake((NSUInteger)srcX0, sourceMetalY, 0)
 			sourceSize:MTLSizeMake(width, height, 1)
@@ -2384,6 +2687,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 
 	// Source: colour attachment of the read framebuffer.
 	if (ctx.read_fbo == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glBlitFramebuffer: reading the default framebuffer is not supported (the drawable is framebuffer-only)");
 		return;
 	}
@@ -2494,10 +2798,16 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 				(long long)sourceWidth, (long long)sourceHeight, dstX0, dstY0);
 		}
 		endRenderEncoder();
-		if (!ctx.currentCommandBuffer) {
-			if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return; }
-			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+
+		if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(src, 0, sourceLevel,
+			MTLOriginMake((NSUInteger)srcX0, (NSUInteger)srcY0, 0),
+			MTLSizeMake((NSUInteger)sourceWidth, (NSUInteger)sourceHeight, 1),
+			dst, 0, dstLevel, MTLOriginMake((NSUInteger)dstX0, (NSUInteger)dstY0, 0))) {
+			markDestinationColorWritten();
+			return;
 		}
+
+		if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
 		if (!ctx.currentCommandBuffer) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
 		id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
 		if (!copyEncoder) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
@@ -2553,11 +2863,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 		// Different attachment sets still require their own pass. Do not try to
 		// merge these into the current GL encoder.
 		endRenderEncoder();
-		if (!ctx.currentCommandBuffer) {
-			if (!ctx.commandQueue) return;
-			ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-		}
-		if (!ctx.currentCommandBuffer) return;
+		if (!gl4metalEnsureClassicCommandBuffer()) return;
 		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 		rp.colorAttachments[0].texture = dst;
 		rp.colorAttachments[0].level = dstLevel;
@@ -2618,6 +2924,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 	[enc setCullMode:MTLCullModeNone];
 	[enc setTriangleFillMode:MTLTriangleFillModeFill];
 	[enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+	invalidateViewportAndScissorCache();
 	[enc setViewport:vp];
 	[enc setScissorRect:sr];
 	[enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
@@ -2731,10 +3038,9 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 	const NSUInteger levelW = std::max<NSUInteger>(tex.width >> a.level, 1);
 	const NSUInteger levelH = std::max<NSUInteger>(tex.height >> a.level, 1);
 	if (x < 0 || y < 0 || (NSUInteger)x > levelW || (NSUInteger)y > levelH ||
-		(NSUInteger)width > levelW - (NSUInteger)x || (NSUInteger)height > levelH - (NSUInteger)y ||
-		tex.storageMode == MTLStorageModePrivate) {
+		(NSUInteger)width > levelW - (NSUInteger)x || (NSUInteger)height > levelH - (NSUInteger)y) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glReadPixels: region %d,%d %dx%d is outside the %lux%lu attachment or its storage is private", x, y, width, height, (unsigned long)levelW, (unsigned long)levelH);
+		GL4METAL_LOG("glReadPixels: region %d,%d %dx%d is outside the %lux%lu attachment", x, y, width, height, (unsigned long)levelW, (unsigned long)levelH);
 		return;
 	}
 
@@ -2789,7 +3095,6 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 	}
 	dst += skipRowsBytes + skipPixelsBytes;
 
-	flushCommandBuffer(true); // the rendering has to be finished before the CPU reads it
 	std::vector<uint8_t> raw;
 	try {
 		raw.resize(rawBytes);
@@ -2798,7 +3103,59 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
 		GL4METAL_LOG("glReadPixels: CPU readback staging allocation failed (%lu bytes)", (unsigned long)rawBytes);
 		return;
 	}
-	[tex getBytes:raw.data() bytesPerRow:rawRowBytes fromRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)width, (NSUInteger)height) mipmapLevel:(NSUInteger)a.level];
+	if (tex.storageMode == MTLStorageModeShared) {
+		flushCommandBuffer(true); // finish the rendering before CPU reads shared texture storage
+		[tex getBytes:raw.data() bytesPerRow:rawRowBytes
+			fromRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)width, (NSUInteger)height)
+			mipmapLevel:(NSUInteger)a.level];
+	} else {
+		size_t stagingRowBytes = 0, stagingLength = 0;
+		if (!checkedReadAlign(rawRowBytes, 256, stagingRowBytes) ||
+			!checkedReadSizeMul(stagingRowBytes, (size_t)height, stagingLength) ||
+			stagingLength == 0 || stagingLength > ctx.device.maxBufferLength) {
+			gl4metalSetError(GL_OUT_OF_MEMORY);
+			GL4METAL_LOG("glReadPixels: Metal readback staging buffer size is invalid");
+			return;
+		}
+		id<MTLBuffer> staging = [ctx.device newBufferWithLength:stagingLength options:MTLResourceStorageModeShared];
+		if (!staging) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+		bool readbackSucceeded = false;
+
+		if (ctx.metal4Enabled && gl4metalMetal4CopyTextureToBuffer(tex, 0, (NSUInteger)a.level,
+			MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0), MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+			staging, 0, stagingRowBytes, 0, MTLBlitOptionNone)) {
+			flushCommandBuffer(true);
+			readbackSucceeded = ctx.metal4LastComputeEventValue == 0 ||
+				(ctx.metal4InteropEvent && ctx.metal4InteropEvent.signaledValue >= ctx.metal4LastComputeEventValue);
+		}
+
+		if (!readbackSucceeded) {
+			// Drain any partial Metal 4 attempt before submitting the classic blit.
+			flushCommandBuffer(true);
+			id<MTLCommandQueue> queue = ctx.commandQueue;
+			id<MTLCommandBuffer> command_buffer = queue ? [queue commandBuffer] : nil;
+			id<MTLBlitCommandEncoder> blit = command_buffer ? [command_buffer blitCommandEncoder] : nil;
+			if (!command_buffer || !blit) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+			[blit copyFromTexture:tex sourceSlice:0 sourceLevel:(NSUInteger)a.level
+				sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+				sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+				toBuffer:staging destinationOffset:0 destinationBytesPerRow:stagingRowBytes destinationBytesPerImage:0];
+			[blit endEncoding];
+			[command_buffer commit];
+			[command_buffer waitUntilCompleted];
+			if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+				gl4metalSetError(GL_INVALID_OPERATION);
+				GL4METAL_LOG("glReadPixels: classic private-texture readback failed: %s",
+					command_buffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
+				return;
+			}
+		}
+		const uint8_t *stagingBytes = (const uint8_t *)staging.contents;
+		for (GLsizei row = 0; row < height; ++row) {
+			memcpy(raw.data() + (size_t)row * rawRowBytes,
+				stagingBytes + (size_t)row * stagingRowBytes, rawRowBytes);
+		}
+	}
 	for (GLsizei row = 0; row < height; row++) {
 		const uint8_t *src = raw.data() + (size_t)row * rawRowBytes;
 		uint8_t *rowDst = dst + (size_t)row * rowBytes;

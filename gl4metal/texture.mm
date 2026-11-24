@@ -4,9 +4,6 @@
 #include <limits>
 #include <new>
 
-#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
-#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
-#endif
 
 // MARK: - Helpers
 // iOS notes: CPU-visible textures use MTLStorageModeShared (Managed does not exist on iOS), depth/stencil textures are
@@ -117,6 +114,54 @@ static bool isDepthStencilFormat(MTLPixelFormat f) {
 		f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8;
 }
 
+static bool isCompressedMetalPixelFormat(MTLPixelFormat format) {
+	switch (format) {
+		case MTLPixelFormatEAC_R11Unorm: case MTLPixelFormatEAC_R11Snorm:
+		case MTLPixelFormatEAC_RG11Unorm: case MTLPixelFormatEAC_RG11Snorm:
+		case MTLPixelFormatEAC_RGBA8: case MTLPixelFormatEAC_RGBA8_sRGB:
+		case MTLPixelFormatETC2_RGB8: case MTLPixelFormatETC2_RGB8_sRGB:
+		case MTLPixelFormatETC2_RGB8A1: case MTLPixelFormatETC2_RGB8A1_sRGB:
+		case MTLPixelFormatASTC_4x4_LDR: case MTLPixelFormatASTC_5x4_LDR: case MTLPixelFormatASTC_5x5_LDR:
+		case MTLPixelFormatASTC_6x5_LDR: case MTLPixelFormatASTC_6x6_LDR:
+		case MTLPixelFormatASTC_8x5_LDR: case MTLPixelFormatASTC_8x6_LDR: case MTLPixelFormatASTC_8x8_LDR:
+		case MTLPixelFormatASTC_10x5_LDR: case MTLPixelFormatASTC_10x6_LDR: case MTLPixelFormatASTC_10x8_LDR:
+		case MTLPixelFormatASTC_10x10_LDR: case MTLPixelFormatASTC_12x10_LDR: case MTLPixelFormatASTC_12x12_LDR:
+		case MTLPixelFormatASTC_4x4_sRGB: case MTLPixelFormatASTC_5x4_sRGB: case MTLPixelFormatASTC_5x5_sRGB:
+		case MTLPixelFormatASTC_6x5_sRGB: case MTLPixelFormatASTC_6x6_sRGB:
+		case MTLPixelFormatASTC_8x5_sRGB: case MTLPixelFormatASTC_8x6_sRGB: case MTLPixelFormatASTC_8x8_sRGB:
+		case MTLPixelFormatASTC_10x5_sRGB: case MTLPixelFormatASTC_10x6_sRGB: case MTLPixelFormatASTC_10x8_sRGB:
+		case MTLPixelFormatASTC_10x10_sRGB: case MTLPixelFormatASTC_12x10_sRGB: case MTLPixelFormatASTC_12x12_sRGB:
+			return true;
+		default: return false;
+	}
+}
+
+static bool isSizedTextureInternalFormat(GLenum format) {
+	switch (format) {
+		case GL_R8: case GL_R8_SNORM: case GL_RG8: case GL_RG8_SNORM:
+		case GL_RGB5_A1: case GL_RGB8: case GL_RGB8_SNORM: case GL_RGBA8: case GL_RGBA8_SNORM:
+		case GL_SRGB8: case GL_SRGB8_ALPHA8:
+		case GL_R16: case GL_R16_SNORM: case GL_RG16: case GL_RG16_SNORM:
+		case GL_RGB16: case GL_RGBA16: case GL_RGB16_SNORM: case GL_RGBA16_SNORM:
+		case GL_R16F: case GL_RG16F: case GL_RGB16F: case GL_RGBA16F:
+		case GL_R32F: case GL_RG32F: case GL_RGB32F: case GL_RGBA32F:
+		case GL_RGB10_A2: case GL_R11F_G11F_B10F: case GL_RGB9_E5:
+		case GL_DEPTH_COMPONENT16: case GL_DEPTH_COMPONENT24: case GL_DEPTH_COMPONENT32:
+		case GL_DEPTH_COMPONENT32F: case GL_DEPTH24_STENCIL8: case GL_DEPTH32F_STENCIL8:
+		case GL_STENCIL_INDEX8:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static GLsizei fullMipLevelCount(GLsizei width, GLsizei height = 1, GLsizei depth = 1) {
+	GLsizei largest = std::max(width, std::max(height, depth));
+	GLsizei levels = 1;
+	while (largest > 1) { largest >>= 1; ++levels; }
+	return levels;
+}
+
 
 static bool usesMipmaps(GLenum filter) {
 	return filter == GL_NEAREST_MIPMAP_NEAREST || filter == GL_LINEAR_MIPMAP_NEAREST ||
@@ -150,12 +195,151 @@ static int cubeFace(GLenum target) {
 }
 
 static TextureObject *boundTexture(GLenum target) {
-	GLuint tex_id = ctx.bound_textures[ctx.active_texture_unit][target];
-	if (tex_id == 0) {
-		return nullptr;
+	if (ctx.active_texture_unit >= GL4METAL_MAX_TEXTURE_UNITS) return nullptr;
+	const auto binding = ctx.bound_textures[ctx.active_texture_unit].find(target);
+	if (binding == ctx.bound_textures[ctx.active_texture_unit].end() || binding->second == 0) return nullptr;
+	auto textureIt = ctx.texture_objects.find(binding->second);
+	return textureIt == ctx.texture_objects.end() ? nullptr : &textureIt->second;
+}
+
+void gl4metalInvalidateTextureSamplingViews(TextureObject &textureObject) {
+	textureObject.sampled_view = nil;
+	textureObject.sampled_view_source_identity = nullptr;
+	textureObject.feedback_sampled_view = nil;
+	textureObject.feedback_sampled_view_source_identity = nullptr;
+}
+
+void gl4metalSetTextureStorage(TextureObject &textureObject, id<MTLTexture> texture) {
+	gl4metalInvalidateTextureSamplingViews(textureObject);
+	textureObject.feedback_snapshot = nil;
+	textureObject.feedback_snapshot_pass_serial = UINT64_MAX;
+	textureObject.texture = texture;
+}
+
+static bool textureSwizzleTraceEnabled() {
+	static const bool enabled = [] {
+		const char *value = std::getenv("GL4METAL_TRACE_TEXTURE_SWIZZLE");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool mapGLTextureSwizzle(GLenum value, MTLTextureSwizzle &mapped) {
+	switch (value) {
+		case GL_RED: mapped = MTLTextureSwizzleRed; return true;
+		case GL_GREEN: mapped = MTLTextureSwizzleGreen; return true;
+		case GL_BLUE: mapped = MTLTextureSwizzleBlue; return true;
+		case GL_ALPHA: mapped = MTLTextureSwizzleAlpha; return true;
+		case GL_ZERO: mapped = MTLTextureSwizzleZero; return true;
+		case GL_ONE: mapped = MTLTextureSwizzleOne; return true;
+		default: return false;
 	}
-	auto it = ctx.texture_objects.find(tex_id);
-	return it == ctx.texture_objects.end() ? nullptr : &it->second;
+}
+
+// Keep this list aligned with the Metal texture-view type conversion table. In particular,
+// do not assume 1DArray or multisample texture types support the swizzle-view overload.
+static bool textureViewSliceRange(id<MTLTexture> sourceTexture, NSUInteger &sliceCount) {
+	if (!sourceTexture) return false;
+	switch (sourceTexture.textureType) {
+		case MTLTextureType1D:
+		case MTLTextureType2D:
+		case MTLTextureType3D:
+			sliceCount = 1;
+			return true;
+		case MTLTextureType2DArray:
+			sliceCount = sourceTexture.arrayLength;
+			return sliceCount != 0;
+		case MTLTextureTypeCube:
+			sliceCount = 6;
+			return true;
+		case MTLTextureTypeCubeArray:
+			if (sourceTexture.arrayLength == 0 || sourceTexture.arrayLength > std::numeric_limits<NSUInteger>::max() / 6) return false;
+			sliceCount = sourceTexture.arrayLength * 6;
+			return true;
+		default:
+			return false;
+	}
+}
+
+id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, id<MTLTexture> sourceTexture) {
+	if (!sourceTexture) return nil;
+	MTLTextureSwizzle mapped[4];
+	bool identitySwizzle = true;
+	for (size_t component = 0; component < 4; ++component) {
+		if (!mapGLTextureSwizzle(textureObject.swizzle[component], mapped[component])) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("texture sampling: invalid stored swizzle enum 0x%X", textureObject.swizzle[component]);
+			return nil;
+		}
+	}
+	identitySwizzle = textureObject.swizzle[0] == GL_RED && textureObject.swizzle[1] == GL_GREEN &&
+		textureObject.swizzle[2] == GL_BLUE && textureObject.swizzle[3] == GL_ALPHA;
+
+	const bool isPrimaryTexture = sourceTexture == textureObject.texture;
+	const bool isFeedbackSnapshot = sourceTexture == textureObject.feedback_snapshot;
+	if (identitySwizzle) {
+		if (isPrimaryTexture) {
+			textureObject.sampled_view = nil;
+			textureObject.sampled_view_source_identity = nullptr;
+		} else if (isFeedbackSnapshot) {
+			textureObject.feedback_sampled_view = nil;
+			textureObject.feedback_sampled_view_source_identity = nullptr;
+		}
+		return sourceTexture;
+	}
+
+	const bool cachePrimaryView = isPrimaryTexture;
+	const bool cacheFeedbackView = isFeedbackSnapshot;
+	void *sourceIdentity = (__bridge void *)sourceTexture;
+	if (cachePrimaryView && textureObject.sampled_view &&
+		textureObject.sampled_view_source_identity == sourceIdentity) return textureObject.sampled_view;
+	if (cacheFeedbackView && textureObject.feedback_sampled_view &&
+		textureObject.feedback_sampled_view_source_identity == sourceIdentity) return textureObject.feedback_sampled_view;
+	if (cachePrimaryView) {
+		textureObject.sampled_view = nil;
+		textureObject.sampled_view_source_identity = nullptr;
+	} else if (cacheFeedbackView) {
+		textureObject.feedback_sampled_view = nil;
+		textureObject.feedback_sampled_view_source_identity = nullptr;
+	}
+
+	NSUInteger sliceCount = 0;
+	if (!textureViewSliceRange(sourceTexture, sliceCount) || sourceTexture.mipmapLevelCount == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("texture sampling: Metal texture type %lu has no supported native swizzle-view mapping",
+			(unsigned long)sourceTexture.textureType);
+		return nil;
+	}
+
+	MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(
+		mapped[0], mapped[1], mapped[2], mapped[3]);
+	id<MTLTexture> view = [sourceTexture newTextureViewWithPixelFormat:sourceTexture.pixelFormat
+		textureType:sourceTexture.textureType
+		levels:NSMakeRange(0, sourceTexture.mipmapLevelCount)
+		slices:NSMakeRange(0, sliceCount)
+		swizzle:channels];
+	if (!view) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("texture sampling: failed to create swizzle view (type=%lu format=%lu mips=%lu slices=%lu)",
+			(unsigned long)sourceTexture.textureType, (unsigned long)sourceTexture.pixelFormat,
+			(unsigned long)sourceTexture.mipmapLevelCount, (unsigned long)sliceCount);
+		return nil;
+	}
+	view.label = [NSString stringWithFormat:@"GL4Metal swizzle view %@", sourceTexture.label ?: @"texture"];
+	if (textureSwizzleTraceEnabled()) {
+		GL4METAL_LOG("[TextureSwizzle] view created type=%lu format=%lu mips=%lu slices=%lu rgba=(0x%X,0x%X,0x%X,0x%X)",
+			(unsigned long)sourceTexture.textureType, (unsigned long)sourceTexture.pixelFormat,
+			(unsigned long)sourceTexture.mipmapLevelCount, (unsigned long)sliceCount,
+			textureObject.swizzle[0], textureObject.swizzle[1], textureObject.swizzle[2], textureObject.swizzle[3]);
+	}
+	if (cachePrimaryView) {
+		textureObject.sampled_view = view;
+		textureObject.sampled_view_source_identity = sourceIdentity;
+	} else if (cacheFeedbackView) {
+		textureObject.feedback_sampled_view = view;
+		textureObject.feedback_sampled_view_source_identity = sourceIdentity;
+	}
+	return view;
 }
 
 // Checked size arithmetic shared by the CPU pixel-transfer paths.
@@ -219,6 +403,7 @@ static const uint8_t *resolveUnpackPointer(const void *pixels, size_t byteOffset
 // bytes that the GPU may still be reading. The command buffer retains the arena.
 struct TextureUploadArena {
 	id<MTLCommandBuffer> commandBuffer = nil;
+	id<MTL4CommandBuffer> metal4CommandBuffer = nil;
 	id<MTLBuffer> buffer = nil;
 	NSUInteger used = 0;
 };
@@ -229,6 +414,15 @@ void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer) {
 	if (!commandBuffer) return;
 	if (textureUploadArena.commandBuffer == commandBuffer) {
 		textureUploadArena.commandBuffer = nil;
+		textureUploadArena.buffer = nil;
+		textureUploadArena.used = 0;
+	}
+}
+
+void resetTextureUploadArenaMetal4(id<MTL4CommandBuffer> command_buffer) {
+	if (!command_buffer) return;
+	if (textureUploadArena.metal4CommandBuffer == command_buffer) {
+		textureUploadArena.metal4CommandBuffer = nil;
 		textureUploadArena.buffer = nil;
 		textureUploadArena.used = 0;
 	}
@@ -249,19 +443,60 @@ static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger
 	}
 
 	// The upload must follow any render pass that has already sampled or rendered to
-	// this texture. Encoders in one command buffer execute in order on the same queue.
+	// this texture. Metal 4 records buffer-to-texture copies in its unified compute/blit
+	// encoder; later classic rendering is ordered by the shared-event bridge.
 	endRenderEncoder();
-	if (!ctx.currentCommandBuffer) {
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+
+	if (ctx.metal4Enabled && gl4metalBeginMetal4Compute()) {
+		id<MTL4CommandBuffer> targetMetal4CommandBuffer = ctx.currentMetal4CommandBuffer;
+		if (textureUploadArena.metal4CommandBuffer != targetMetal4CommandBuffer) {
+			textureUploadArena.commandBuffer = nil;
+			textureUploadArena.metal4CommandBuffer = targetMetal4CommandBuffer;
+			textureUploadArena.buffer = nil;
+			textureUploadArena.used = 0;
+		}
+		if ((NSUInteger)stagingBytes <= std::numeric_limits<NSUInteger>::max() - textureUploadArena.used) {
+			NSUInteger requiredEnd = textureUploadArena.used + (NSUInteger)stagingBytes;
+			if (!textureUploadArena.buffer || requiredEnd > textureUploadArena.buffer.length) {
+				NSUInteger capacity = std::max<NSUInteger>(256 * 1024, requiredEnd);
+				if (textureUploadArena.buffer && textureUploadArena.buffer.length <= ctx.device.maxBufferLength / 2)
+					capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
+				capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
+				if (capacity >= requiredEnd) {
+					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+					if (replacement) {
+						textureUploadArena.buffer = replacement;
+						textureUploadArena.used = 0;
+						requiredEnd = (NSUInteger)stagingBytes;
+					}
+				}
+			}
+			if (textureUploadArena.buffer && requiredEnd <= textureUploadArena.buffer.length) {
+				const NSUInteger stagingOffset = textureUploadArena.used;
+				uint8_t *destination = (uint8_t *)textureUploadArena.buffer.contents + stagingOffset;
+				for (GLsizei row = 0; row < height; ++row) {
+					memcpy(destination + (size_t)row * stagingRowBytes,
+						source + (size_t)row * sourceRowBytes, copyRowBytes);
+				}
+				if (gl4metalMetal4CopyBufferToTexture(textureUploadArena.buffer, stagingOffset,
+						(NSUInteger)stagingRowBytes, 0, MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+						texture, slice, (NSUInteger)level, MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0))) {
+					textureUploadArena.used = requiredEnd;
+					return true;
+				}
+			}
+		}
 	}
+
+	if (!gl4metalEnsureClassicCommandBuffer()) return false;
 	id<MTLCommandBuffer> targetCommandBuffer = ctx.currentCommandBuffer;
-	if (!targetCommandBuffer) return false;
 
 	id<MTLBuffer> staging = nil;
 	NSUInteger stagingOffset = 0;
 	{
 		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
 			textureUploadArena.commandBuffer = targetCommandBuffer;
+			textureUploadArena.metal4CommandBuffer = nil;
 			textureUploadArena.buffer = nil;
 			textureUploadArena.used = 0;
 		}
@@ -312,7 +547,9 @@ static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger
 static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 		GLint x, GLint y, GLint z, GLsizei width, GLsizei height, GLsizei depth,
 		const uint8_t *source, size_t sourceRowBytes, size_t sourceImageBytes, size_t copyRowBytes) {
-	if (!texture || texture.textureType != MTLTextureType3D || !source || !ctx.device ||
+	const bool isVolume = texture && texture.textureType == MTLTextureType3D;
+	const bool isArray = texture && texture.textureType == MTLTextureType2DArray;
+	if (!texture || (!isVolume && !isArray) || !source || !ctx.device ||
 		!ctx.commandQueue || width <= 0 || height <= 0 || depth <= 0) return false;
 	size_t stagingRowBytes = 0, stagingImageBytes = 0, stagingBytes = 0;
 	if (!checkedAlignSize(copyRowBytes, 256, stagingRowBytes) ||
@@ -321,15 +558,73 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 		stagingBytes == 0 || stagingBytes > ctx.device.maxBufferLength) return false;
 
 	endRenderEncoder();
-	if (!ctx.currentCommandBuffer) ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+
+	if (ctx.metal4Enabled && gl4metalBeginMetal4Compute()) {
+		id<MTL4CommandBuffer> targetMetal4CommandBuffer = ctx.currentMetal4CommandBuffer;
+		if (textureUploadArena.metal4CommandBuffer != targetMetal4CommandBuffer) {
+			textureUploadArena.commandBuffer = nil;
+			textureUploadArena.metal4CommandBuffer = targetMetal4CommandBuffer;
+			textureUploadArena.buffer = nil;
+			textureUploadArena.used = 0;
+		}
+		if ((NSUInteger)stagingBytes <= std::numeric_limits<NSUInteger>::max() - textureUploadArena.used) {
+			NSUInteger requiredEnd = textureUploadArena.used + (NSUInteger)stagingBytes;
+			if (!textureUploadArena.buffer || requiredEnd > textureUploadArena.buffer.length) {
+				NSUInteger capacity = std::max<NSUInteger>(256 * 1024, requiredEnd);
+				if (textureUploadArena.buffer && textureUploadArena.buffer.length <= ctx.device.maxBufferLength / 2)
+					capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
+				capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
+				if (capacity >= requiredEnd) {
+					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+					if (replacement) {
+						textureUploadArena.buffer = replacement;
+						textureUploadArena.used = 0;
+						requiredEnd = (NSUInteger)stagingBytes;
+					}
+				}
+			}
+			if (textureUploadArena.buffer && requiredEnd <= textureUploadArena.buffer.length) {
+				const NSUInteger stagingOffset = textureUploadArena.used;
+				uint8_t *destination = (uint8_t *)textureUploadArena.buffer.contents + stagingOffset;
+				for (GLsizei image = 0; image < depth; ++image) {
+					const uint8_t *sourceImage = source + (size_t)image * sourceImageBytes;
+					uint8_t *destinationImage = destination + (size_t)image * stagingImageBytes;
+					for (GLsizei row = 0; row < height; ++row) {
+						memcpy(destinationImage + (size_t)row * stagingRowBytes,
+							sourceImage + (size_t)row * sourceRowBytes, copyRowBytes);
+					}
+				}
+				bool copied = true;
+				if (isArray) {
+					for (GLsizei image = 0; image < depth; ++image) {
+						copied = gl4metalMetal4CopyBufferToTexture(textureUploadArena.buffer,
+							stagingOffset + (NSUInteger)image * (NSUInteger)stagingImageBytes,
+							(NSUInteger)stagingRowBytes, 0, MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+							texture, (NSUInteger)(z + image), (NSUInteger)level, MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)) && copied;
+					}
+				} else {
+					copied = gl4metalMetal4CopyBufferToTexture(textureUploadArena.buffer, stagingOffset,
+						(NSUInteger)stagingRowBytes, (NSUInteger)stagingImageBytes,
+						MTLSizeMake((NSUInteger)width, (NSUInteger)height, (NSUInteger)depth),
+						texture, 0, (NSUInteger)level, MTLOriginMake((NSUInteger)x, (NSUInteger)y, (NSUInteger)z));
+				}
+				if (copied) {
+					textureUploadArena.used = requiredEnd;
+					return true;
+				}
+			}
+		}
+	}
+
+	if (!gl4metalEnsureClassicCommandBuffer()) return false;
 	id<MTLCommandBuffer> targetCommandBuffer = ctx.currentCommandBuffer;
-	if (!targetCommandBuffer) return false;
 
 	id<MTLBuffer> staging = nil;
 	NSUInteger stagingOffset = 0;
 	{
 		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
 			textureUploadArena.commandBuffer = targetCommandBuffer;
+			textureUploadArena.metal4CommandBuffer = nil;
 			textureUploadArena.buffer = nil;
 			textureUploadArena.used = 0;
 		}
@@ -362,11 +657,24 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 
 	id<MTLBlitCommandEncoder> blit = [targetCommandBuffer blitCommandEncoder];
 	if (!blit) return false;
-	[blit copyFromBuffer:staging sourceOffset:stagingOffset
-		sourceBytesPerRow:(NSUInteger)stagingRowBytes sourceBytesPerImage:(NSUInteger)stagingImageBytes
-		sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, (NSUInteger)depth)
-		toTexture:texture destinationSlice:0 destinationLevel:(NSUInteger)level
-		destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, (NSUInteger)z)];
+	if (isArray) {
+		// A 2D-array texture is a sequence of independent 2D slices, not a 3D
+		// volume. Copy each layer explicitly; Metal's 3D destination-origin path
+		// would otherwise address the wrong resource type.
+		for (GLsizei image = 0; image < depth; ++image) {
+			[blit copyFromBuffer:staging sourceOffset:stagingOffset + (NSUInteger)image * (NSUInteger)stagingImageBytes
+				sourceBytesPerRow:(NSUInteger)stagingRowBytes sourceBytesPerImage:0
+				sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+				toTexture:texture destinationSlice:(NSUInteger)(z + image) destinationLevel:(NSUInteger)level
+				destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)];
+		}
+	} else {
+		[blit copyFromBuffer:staging sourceOffset:stagingOffset
+			sourceBytesPerRow:(NSUInteger)stagingRowBytes sourceBytesPerImage:(NSUInteger)stagingImageBytes
+			sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, (NSUInteger)depth)
+			toTexture:texture destinationSlice:0 destinationLevel:(NSUInteger)level
+			destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, (NSUInteger)z)];
+	}
 	[blit endEncoding];
 	return true;
 }
@@ -678,7 +986,9 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		GL4METAL_LOG("%s: upload staging size is too large", caller);
 		return;
 	}
-	MTLRegion region = MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h);
+	const bool is1D = t.texture.textureType == MTLTextureType1D;
+	MTLRegion region = is1D ? MTLRegionMake1D((NSUInteger)x, (NSUInteger)w)
+		: MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h);
 
 	// Metal stores GL_RGB formats in a four-component texture. Preserve GL's
 	// default alpha of +1 even when the upload source happens to be GL_RGBA.
@@ -697,7 +1007,15 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		return;
 	}
 	if ((identical || directNativeA1BGR5) && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1)) {
-		if (freshTextureStorage) {
+		if (is1D) {
+			if (!freshTextureStorage && !enqueueTextureUpload(t.texture, level, 0, x, 0, w, 1,
+					src, srcRowBytes, copyRowBytes)) {
+				flushCommandBuffer(true);
+				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:0];
+			} else if (freshTextureStorage) {
+				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:0];
+			}
+		} else if (freshTextureStorage) {
 			// A just-allocated texture has no earlier GPU readers, so avoid a staging blit
 			// for the common initial texture upload.
 			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
@@ -776,11 +1094,19 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		}
 	}
 	if (freshTextureStorage) {
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+		if (is1D) {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:0];
+		} else {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+		}
 	} else if (!enqueueTextureUpload(t.texture, level, slice, x, y, w, h, tmp.data(), tmpRowBytes, tmpRowBytes)) {
 		// Keep a correct synchronous fallback when the staging blit cannot be allocated.
 		flushCommandBuffer(true);
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+		if (is1D) {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:0];
+		} else {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+		}
 	}
 }
 
@@ -789,15 +1115,18 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLint z,
 		GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type, const void *pixels,
 		const char *caller, bool freshTextureStorage = false) {
-	if (!t.texture || t.texture.textureType != MTLTextureType3D || level < 0 ||
+	const bool isVolume = t.texture && t.texture.textureType == MTLTextureType3D;
+	const bool isArray = t.texture && t.texture.textureType == MTLTextureType2DArray;
+	if (!t.texture || (!isVolume && !isArray) || level < 0 ||
 		(NSUInteger)level >= t.texture.mipmapLevelCount) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("%s: invalid or unallocated 3D mip level %d", caller, level);
+		GL4METAL_LOG("%s: invalid or unallocated 3D/array mip level %d", caller, level);
 		return;
 	}
 	const GLsizei lw = std::max<GLsizei>(1, t.width >> level);
 	const GLsizei lh = std::max<GLsizei>(1, t.height >> level);
-	const GLsizei ld = std::max<GLsizei>(1, t.depth >> level);
+	// Array layer count is invariant across mip levels; volume depth shrinks.
+	const GLsizei ld = isArray ? t.depth : std::max<GLsizei>(1, t.depth >> level);
 	if (x < 0 || y < 0 || z < 0 || w < 0 || h < 0 || d < 0 ||
 		x > lw || y > lh || z > ld || w > lw - x || h > lh - y || d > ld - z) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -838,7 +1167,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 		(isRGBA5551PackedType(type) && !packedRGBA5551) ||
 		(type == GL_UNSIGNED_INT_8_8_8_8_REV && srcComps != 4)) {
 		gl4metalSetError(GL_INVALID_ENUM);
-		GL4METAL_LOG("%s: unsupported 3D upload, format 0x%X type 0x%X into MTLPixelFormat %d",
+		GL4METAL_LOG("%s: unsupported 3D/array upload, format 0x%X type 0x%X into MTLPixelFormat %d",
 			caller, format, type, (int)dstFormat);
 		return;
 	}
@@ -852,7 +1181,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 		!checkedAlignSize(rowRawBytes, align, srcRowBytes) ||
 		!checkedSizeMul(srcRowBytes, imageHeight, srcImageBytes) || srcRowBytes < (size_t)w * srcBpp) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("%s: invalid or overflowing 3D unpack row/image layout", caller);
+		GL4METAL_LOG("%s: invalid or overflowing 3D/array unpack row/image layout", caller);
 		return;
 	}
 	size_t skipImagesBytes = 0, skipRowsBytes = 0, skipPixelsBytes = 0;
@@ -870,7 +1199,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 		!checkedSizeAdd(accessedBytes, lastRowBytes, accessedBytes) ||
 		!checkedSizeAdd(accessedBytes, copyRowBytes, accessedBytes)) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("%s: 3D unpack skip/extent calculation overflows addressable memory", caller);
+		GL4METAL_LOG("%s: 3D/array unpack skip/extent calculation overflows addressable memory", caller);
 		return;
 	}
 	const uint8_t *src = resolveUnpackPointer(pixels, byteOffset, accessedBytes - byteOffset, caller);
@@ -882,7 +1211,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 		!checkedSizeMul(tmpRowBytes, (size_t)h, tmpImageBytes) ||
 		!checkedSizeMul(tmpImageBytes, (size_t)d, tmpBytes) || tmpBytes > ctx.device.maxBufferLength) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
-		GL4METAL_LOG("%s: 3D upload staging size is too large", caller);
+		GL4METAL_LOG("%s: 3D/array upload staging size is too large", caller);
 		return;
 	}
 	const MTLRegion region = MTLRegionMake3D((NSUInteger)x, (NSUInteger)y, (NSUInteger)z,
@@ -914,14 +1243,31 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 				GL4METAL_LOG("%s: could not stage %dx%dx%d private 3D texture upload", caller, w, h, d);
 			}
 		} else if (freshTextureStorage) {
-			// A new shared texture has no prior GPU readers; avoid a blit for its first upload.
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:src
-				bytesPerRow:srcRowBytes bytesPerImage:(d > 1 ? srcImageBytes : 0)];
+			// A new shared texture has no prior GPU readers. 3D storage accepts a
+			// single volume replace; array storage needs one replace per layer.
+			if (isArray) {
+				for (GLsizei image = 0; image < d; ++image) {
+					[t.texture replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h)
+						mipmapLevel:(NSUInteger)level slice:(NSUInteger)(z + image)
+						withBytes:src + (size_t)image * srcImageBytes bytesPerRow:srcRowBytes bytesPerImage:0];
+				}
+			} else {
+				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:src
+					bytesPerRow:srcRowBytes bytesPerImage:(d > 1 ? srcImageBytes : 0)];
+			}
 		} else if (!enqueueTextureUpload3D(t.texture, level, x, y, z, w, h, d,
 			src, srcRowBytes, srcImageBytes, copyRowBytes)) {
 			flushCommandBuffer(true);
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:src
-				bytesPerRow:srcRowBytes bytesPerImage:(d > 1 ? srcImageBytes : 0)];
+			if (isArray) {
+				for (GLsizei image = 0; image < d; ++image) {
+					[t.texture replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h)
+						mipmapLevel:(NSUInteger)level slice:(NSUInteger)(z + image)
+						withBytes:src + (size_t)image * srcImageBytes bytesPerRow:srcRowBytes bytesPerImage:0];
+				}
+			} else {
+				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:src
+					bytesPerRow:srcRowBytes bytesPerImage:(d > 1 ? srcImageBytes : 0)];
+			}
 		}
 		return;
 	}
@@ -930,7 +1276,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 	try { tmp.resize(tmpBytes); }
 	catch (const std::bad_alloc &) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
-		GL4METAL_LOG("%s: failed to allocate %lu-byte 3D CPU upload conversion buffer", caller, (unsigned long)tmpBytes);
+		GL4METAL_LOG("%s: failed to allocate %lu-byte 3D/array CPU upload conversion buffer", caller, (unsigned long)tmpBytes);
 		return;
 	}
 	const uint8_t one8 = type == GL_BYTE ? 0x7f : 0xff;
@@ -947,7 +1293,7 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 					uint16_t packed = 0;
 					if (!packA1BGR5Pixel(sp, type, idx, srcComps, ctx.unpack_swap_bytes != GL_FALSE, packed)) {
 						gl4metalSetError(GL_INVALID_ENUM);
-						GL4METAL_LOG("%s: unsupported source type 0x%X for 3D RGB5_A1 upload", caller, type);
+						GL4METAL_LOG("%s: unsupported source type 0x%X for 3D/array RGB5_A1 upload", caller, type);
 						return;
 					}
 					if (nativeA1BGR5) {
@@ -1001,13 +1347,29 @@ static void uploadPixels3D(TextureObject &t, GLint level, GLint x, GLint y, GLin
 			GL4METAL_LOG("%s: could not stage converted %dx%dx%d private 3D texture upload", caller, w, h, d);
 		}
 	} else if (freshTextureStorage) {
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:tmp.data()
-			bytesPerRow:tmpRowBytes bytesPerImage:(d > 1 ? tmpImageBytes : 0)];
+		if (isArray) {
+			for (GLsizei image = 0; image < d; ++image) {
+				[t.texture replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h)
+					mipmapLevel:(NSUInteger)level slice:(NSUInteger)(z + image)
+					withBytes:tmp.data() + (size_t)image * tmpImageBytes bytesPerRow:tmpRowBytes bytesPerImage:0];
+			}
+		} else {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:tmp.data()
+				bytesPerRow:tmpRowBytes bytesPerImage:(d > 1 ? tmpImageBytes : 0)];
+		}
 	} else if (!enqueueTextureUpload3D(t.texture, level, x, y, z, w, h, d,
 		tmp.data(), tmpRowBytes, tmpImageBytes, tmpRowBytes)) {
 		flushCommandBuffer(true);
-		[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:tmp.data()
-			bytesPerRow:tmpRowBytes bytesPerImage:(d > 1 ? tmpImageBytes : 0)];
+		if (isArray) {
+			for (GLsizei image = 0; image < d; ++image) {
+				[t.texture replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h)
+					mipmapLevel:(NSUInteger)level slice:(NSUInteger)(z + image)
+					withBytes:tmp.data() + (size_t)image * tmpImageBytes bytesPerRow:tmpRowBytes bytesPerImage:0];
+			}
+		} else {
+			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:0 withBytes:tmp.data()
+				bytesPerRow:tmpRowBytes bytesPerImage:(d > 1 ? tmpImageBytes : 0)];
+		}
 	}
 }
 
@@ -1080,6 +1442,9 @@ void glDeleteTextures(GLsizei n, const GLuint *textures) {
 		auto detach = [&](FBOAttachment &a) {
 			if (a.texture == tex_id) {
 				a.texture = 0;
+				a.layer = -1;
+				a.view = nil;
+				a.view_source = nil;
 				detached = true;
 			}
 		};
@@ -1321,7 +1686,7 @@ void refreshTextureBufferViews(GLuint bufferObject) {
 	if (maximumStorage != 0 && !ensureBufferTextureStorage(bufferObject, logicalSize, maximumStorage)) {
 		for (auto &entry : ctx.texture_objects) {
 			TextureObject &textureObject = entry.second;
-			if (textureObject.target == GL_TEXTURE_BUFFER && textureObject.buffer_object == bufferObject) textureObject.texture = nil;
+			if (textureObject.target == GL_TEXTURE_BUFFER && textureObject.buffer_object == bufferObject) gl4metalSetTextureStorage(textureObject, nil);
 		}
 		return;
 	}
@@ -1331,7 +1696,7 @@ void refreshTextureBufferViews(GLuint bufferObject) {
 		if (textureObject.target != GL_TEXTURE_BUFFER || textureObject.buffer_object != bufferObject) continue;
 		BufferTextureFormat viewFormat;
 		if (!bufferTextureFormat(textureObject.internalformat, viewFormat)) {
-			textureObject.texture = nil;
+			gl4metalSetTextureStorage(textureObject, nil);
 			textureObject.width = 0;
 			textureObject.height = 1;
 			textureObject.buffer_sampler_type = 0;
@@ -1342,7 +1707,7 @@ void refreshTextureBufferViews(GLuint bufferObject) {
 			logicalSize / viewFormat.bytesPerTexel, (NSUInteger)maxTextureBufferTexels());
 		textureObject.width = (GLsizei)std::min<NSUInteger>(visibleTexels, (NSUInteger)std::numeric_limits<GLsizei>::max());
 		textureObject.height = 1; // Buffer textures are logically one-dimensional.
-		textureObject.texture = makeBufferTextureView(bufferObject, textureObject.internalformat, logicalSize);
+		gl4metalSetTextureStorage(textureObject, makeBufferTextureView(bufferObject, textureObject.internalformat, logicalSize));
 	}
 }
 
@@ -1364,7 +1729,7 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 		return;
 	}
 	if (buffer == 0) {
-		textureObject->texture = nil;
+		gl4metalSetTextureStorage(*textureObject, nil);
 		textureObject->buffer_object = 0;
 		textureObject->width = textureObject->height = 0;
 		textureObject->buffer_sampler_type = viewFormat.samplerType;
@@ -1379,7 +1744,7 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 	}
 	// An existing buffer with no data store is a legal zero-sized buffer texture.
 	if (!bufferIt->second) {
-		textureObject->texture = nil;
+		gl4metalSetTextureStorage(*textureObject, nil);
 		textureObject->buffer_object = buffer;
 		textureObject->buffer_sampler_type = viewFormat.samplerType;
 		textureObject->internalformat = internalformat;
@@ -1391,7 +1756,7 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 	// format may require a larger padded backing store; creating only this view
 	// could otherwise orphan previously attached views onto the old MTLBuffer.
 	const TextureObject previous = *textureObject;
-	textureObject->texture = nil;
+	gl4metalSetTextureStorage(*textureObject, nil);
 	textureObject->buffer_object = buffer;
 	textureObject->buffer_sampler_type = viewFormat.samplerType;
 	textureObject->internalformat = internalformat;
@@ -1418,21 +1783,26 @@ void glGenerateMipmap(GLenum target) {
 		GL4METAL_LOG("glGenerateMipmap: no allocated texture bound to target 0x%X (GL_INVALID_OPERATION)", target);
 		return;
 	}
+	if (isCompressedMetalPixelFormat(tex->texture.pixelFormat)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGenerateMipmap: Metal cannot generate mipmaps for compressed texture storage; provide compressed mip levels explicitly");
+		return;
+	}
 	if (tex->texture.mipmapLevelCount < 2 || isDepthStencilFormat(tex->texture.pixelFormat)) {
 		return; // nothing to generate (levels are allocated from GL_TEXTURE_MAX_LEVEL / the min filter)
 	}
 	endRenderEncoder();
+
+	if (ctx.metal4Enabled && gl4metalMetal4GenerateMipmaps(tex->texture)) return;
+
 	if (!ctx.commandQueue) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glGenerateMipmap: Metal command queue is unavailable");
 		return;
 	}
-	if (!ctx.currentCommandBuffer) {
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-	}
-	if (!ctx.currentCommandBuffer) {
+	if (!gl4metalEnsureClassicCommandBuffer()) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
-		GL4METAL_LOG("glGenerateMipmap: failed to create Metal command buffer");
+		GL4METAL_LOG("glGenerateMipmap: failed to create ordered Metal command buffer");
 		return;
 	}
 	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
@@ -1506,9 +1876,88 @@ void glPixelStorei(GLenum pname, GLint param) {
 // MARK: - Texture images
 
 
-void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glTexImage1D: Unimplemented");
+void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border,
+		GLenum format, GLenum type, const void *pixels) {
+	if (target != GL_TEXTURE_1D && target != GL_PROXY_TEXTURE_1D) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	const MTLPixelFormat pixelFormat = metalPixelFormat((GLenum)internalformat);
+	const bool valid = level >= 0 && border == 0 && width >= 0 &&
+		width <= GL4METAL_MAX_TEXTURE_SIZE && pixelFormat != MTLPixelFormatInvalid;
+	if (target == GL_PROXY_TEXTURE_1D) {
+		ctx.proxy_texture_1d.w = valid ? width : 0;
+		ctx.proxy_texture_1d.internalformat = valid ? (GLenum)internalformat : 0;
+		return;
+	}
+	TextureObject *textureObject = boundTexture(GL_TEXTURE_1D);
+	if (!textureObject) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage1D: no GL_TEXTURE_1D object is bound");
+		return;
+	}
+	if (textureObject->immutable_storage) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage1D: immutable texture storage cannot be redefined");
+		return;
+	}
+	if (!valid) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glTexImage1D: invalid level=%d width=%d border=%d internalformat=0x%X",
+			level, width, border, internalformat);
+		return;
+	}
+	if (width == 0) {
+		if (level == 0) {
+			endRenderEncoder();
+			gl4metalSetTextureStorage(*textureObject, nil);
+			textureObject->width = 0;
+			textureObject->height = 1;
+			textureObject->depth = 1;
+			textureObject->internalformat = (GLenum)internalformat;
+		}
+		return;
+	}
+	bool freshTextureStorage = false;
+	if (level == 0) {
+		if (!textureObject->texture || textureObject->texture.textureType != MTLTextureType1D ||
+			textureObject->width != width || textureObject->texture.pixelFormat != pixelFormat) {
+			const NSUInteger levels = mipLevelCount(*textureObject, width, 1);
+			MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+			descriptor.textureType = MTLTextureType1D;
+			descriptor.pixelFormat = pixelFormat;
+			descriptor.width = (NSUInteger)width;
+			descriptor.height = 1;
+			descriptor.depth = 1;
+			descriptor.arrayLength = 1;
+			descriptor.mipmapLevelCount = levels;
+			descriptor.sampleCount = 1;
+			descriptor.usage = MTLTextureUsageShaderRead;
+			descriptor.storageMode = isDepthStencilFormat(pixelFormat) ? MTLStorageModePrivate : MTLStorageModeShared;
+			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+			if (!newTexture) {
+				gl4metalSetError(GL_OUT_OF_MEMORY);
+				GL4METAL_LOG("glTexImage1D: Metal allocation failed for width=%d format=0x%X", width, internalformat);
+				return;
+			}
+			endRenderEncoder();
+			gl4metalSetTextureStorage(*textureObject, newTexture);
+			textureObject->width = width;
+			textureObject->height = 1;
+			textureObject->depth = 1;
+			freshTextureStorage = true;
+		}
+		textureObject->internalformat = (GLenum)internalformat;
+	} else if (!textureObject->texture || textureObject->texture.textureType != MTLTextureType1D ||
+		(NSUInteger)level >= textureObject->texture.mipmapLevelCount ||
+		width != std::max(1, textureObject->width >> level)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glTexImage1D: mip level %d width=%d does not fit the allocated 1D mip chain", level, width);
+		return;
+	}
+	if (pixels || boundBuffer(GL_PIXEL_UNPACK_BUFFER)) {
+		uploadPixels(*textureObject, level, 0, 0, width, 1, format, type, pixels, "glTexImage1D", 0, freshTextureStorage);
+	}
 }
 
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
@@ -1536,6 +1985,11 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		GL4METAL_LOG("glTexImage2D: no texture bound to target 0x%X", face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D);
 		return;
 	}
+	if (t->immutable_storage) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage2D: immutable texture storage cannot be redefined");
+		return;
+	}
 	if (face >= 0 && width != height) {
 		GL4METAL_LOG("glTexImage2D: cube map faces must be square (%dx%d)", width, height);
 		return;
@@ -1554,7 +2008,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 		// treat the definition as a no-op because Metal's mip chain is fixed when the texture is allocated.
 		if (level == 0) {
 			endRenderEncoder();
-			t->texture = nil;
+			gl4metalSetTextureStorage(*t, nil);
 			t->width = width;
 			t->height = height;
 			t->internalformat = (GLenum)internalformat;
@@ -1595,7 +2049,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 			}
 			endRenderEncoder(); // close a pass targeting the old texture before replacing its GL storage
 			// In-flight command buffers retain the old MTLTexture until their work completes.
-			t->texture = newTexture;
+			gl4metalSetTextureStorage(*t, newTexture);
 			t->width = width;
 			t->height = height;
 			freshTextureStorage = true;
@@ -1616,35 +2070,52 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 
 void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
 		GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels) {
+	const bool isArray = target == GL_TEXTURE_2D_ARRAY;
+	const bool isVolume = target == GL_TEXTURE_3D;
+	const bool isArrayProxy = target == GL_PROXY_TEXTURE_2D_ARRAY;
+	const bool isVolumeProxy = target == GL_PROXY_TEXTURE_3D;
+	if (!isArray && !isVolume && !isArrayProxy && !isVolumeProxy) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glTexImage3D: unsupported target 0x%X", target);
+		return;
+	}
+
 	const MTLPixelFormat mtlFormat = metalPixelFormat((GLenum)internalformat);
-	// Metal depth/stencil pixel formats cannot be used with MTLTextureType3D.
-	// Reject them before creating a texture rather than leaving an unusable GL object.
+	// Metal 3D volume textures cannot be render targets or depth/stencil images.
+	// 2D-array textures can be render targets; depth-array allocation is allowed,
+	// although the CPU colour-conversion uploader below intentionally rejects a
+	// non-null initial pixel payload for depth formats.
 	const bool depthStencilFormat = isDepthStencilFormat(mtlFormat);
+	const GLsizei maxWidth = isArray ? GL4METAL_MAX_TEXTURE_SIZE : GL4METAL_MAX_3D_TEXTURE_SIZE;
+	const GLsizei maxHeight = isArray ? GL4METAL_MAX_TEXTURE_SIZE : GL4METAL_MAX_3D_TEXTURE_SIZE;
 	const bool valid = level >= 0 && border == 0 && mtlFormat != MTLPixelFormatInvalid &&
-		!depthStencilFormat && width >= 0 && height >= 0 && depth >= 0 &&
-		width <= GL4METAL_MAX_3D_TEXTURE_SIZE && height <= GL4METAL_MAX_3D_TEXTURE_SIZE &&
-		depth <= GL4METAL_MAX_3D_TEXTURE_SIZE;
-	if (target == GL_PROXY_TEXTURE_3D) {
+		width >= 0 && height >= 0 && depth >= 0 && width <= maxWidth && height <= maxHeight &&
+		depth <= (isArray ? GL4METAL_MAX_ARRAY_TEXTURE_LAYERS : GL4METAL_MAX_3D_TEXTURE_SIZE) &&
+		(!depthStencilFormat || isArray);
+	if (isArrayProxy) {
+		ctx.proxy_texture_2d_array.w = valid ? width : 0;
+		ctx.proxy_texture_2d_array.h = valid ? height : 0;
+		ctx.proxy_texture_2d_array.layers = valid ? depth : 0;
+		ctx.proxy_texture_2d_array.internalformat = valid ? (GLenum)internalformat : 0;
+		return;
+	}
+	if (isVolumeProxy) {
 		ctx.proxy_texture_3d.w = valid ? width : 0;
 		ctx.proxy_texture_3d.h = valid ? height : 0;
 		ctx.proxy_texture_3d.d = valid ? depth : 0;
 		ctx.proxy_texture_3d.internalformat = valid ? (GLenum)internalformat : 0;
 		return;
 	}
-	if (target != GL_TEXTURE_3D) {
-		gl4metalSetError(GL_INVALID_ENUM);
-		GL4METAL_LOG("glTexImage3D: unsupported target 0x%X", target);
+
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage3D: no texture bound to target 0x%X", target);
 		return;
 	}
-	TextureObject *t = boundTexture(GL_TEXTURE_3D);
-	if (!t) {
+	if (textureObject->immutable_storage) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glTexImage3D: no texture bound to GL_TEXTURE_3D");
-		return;
-	}
-	if (depthStencilFormat) {
-		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glTexImage3D: Metal does not support depth/stencil pixel formats for 3D textures");
+		GL4METAL_LOG("glTexImage3D: immutable texture storage cannot be redefined");
 		return;
 	}
 	if (!valid) {
@@ -1656,37 +2127,42 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 	if (width == 0 || height == 0 || depth == 0) {
 		if (level == 0) {
 			endRenderEncoder();
-			t->texture = nil;
-			t->width = width;
-			t->height = height;
-			t->depth = depth;
-			t->internalformat = (GLenum)internalformat;
+			gl4metalSetTextureStorage(*textureObject, nil);
+			textureObject->width = width;
+			textureObject->height = height;
+			textureObject->depth = depth;
+			textureObject->internalformat = (GLenum)internalformat;
 		}
 		return;
 	}
 
 	bool freshTextureStorage = false;
 	if (level == 0) {
-		if (!t->texture || t->width != width || t->height != height || t->depth != depth ||
-			t->texture.pixelFormat != mtlFormat || t->texture.textureType != MTLTextureType3D) {
-			const NSUInteger levels = mipLevelCount3D(*t, width, height, depth);
-			// Metal provides convenience descriptors for 2D and cube textures, but not 3D.
-			// Build the 3D descriptor through its documented writable properties instead.
+		const MTLTextureType expectedType = isArray ? MTLTextureType2DArray : MTLTextureType3D;
+		if (!textureObject->texture || textureObject->width != width || textureObject->height != height ||
+			textureObject->depth != depth || textureObject->texture.pixelFormat != mtlFormat ||
+			textureObject->texture.textureType != expectedType) {
+			const NSUInteger levels = isArray
+				? mipLevelCount(*textureObject, width, height)
+				: mipLevelCount3D(*textureObject, width, height, depth);
 			MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
-			descriptor.textureType = MTLTextureType3D;
+			descriptor.textureType = expectedType;
 			descriptor.pixelFormat = mtlFormat;
 			descriptor.width = (NSUInteger)width;
 			descriptor.height = (NSUInteger)height;
-			descriptor.depth = (NSUInteger)depth;
+			descriptor.depth = isArray ? 1 : (NSUInteger)depth;
+			descriptor.arrayLength = isArray ? (NSUInteger)depth : 1;
 			descriptor.mipmapLevelCount = levels;
 			descriptor.sampleCount = 1;
-			descriptor.arrayLength = 1;
 			descriptor.usage = MTLTextureUsageShaderRead;
-			const bool canShaderWrite = !isDepthStencilFormat(mtlFormat) && mtlFormat != MTLPixelFormatRGB9E5Float;
+			if (isArray && mtlFormat != MTLPixelFormatRGB9E5Float)
+				descriptor.usage = descriptor.usage | MTLTextureUsageRenderTarget;
+			const bool canShaderWrite = !depthStencilFormat && mtlFormat != MTLPixelFormatRGB9E5Float;
 			if (canShaderWrite) descriptor.usage = descriptor.usage | MTLTextureUsageShaderWrite;
-			// Volume textures are sampled by the GPU, not directly exposed to CPU reads.
-			// Keep their storage GPU-local; uploads use an async shared-buffer blit path.
-			descriptor.storageMode = MTLStorageModePrivate;
+			// Volume textures remain private and are uploaded through a staging blit.
+			// Array textures use shared storage: it supports fast initial slice upload
+			// and is also the conservative fallback if staging allocation is exhausted.
+			descriptor.storageMode = (isArray && !depthStencilFormat) ? MTLStorageModeShared : MTLStorageModePrivate;
 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
 			if (!newTexture && canShaderWrite) {
 				descriptor.usage = (MTLTextureUsage)(descriptor.usage & ~MTLTextureUsageShaderWrite);
@@ -1694,45 +2170,268 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 			}
 			if (!newTexture) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
-				GL4METAL_LOG("glTexImage3D: failed to allocate %dx%dx%d MTLPixelFormat %d; old storage preserved",
-					width, height, depth, (int)mtlFormat);
+				GL4METAL_LOG("glTexImage3D: failed to allocate %dx%dx%d texture type=%lu format=%d; previous storage preserved",
+					width, height, depth, (unsigned long)expectedType, (int)mtlFormat);
 				return;
 			}
 			endRenderEncoder();
-			t->texture = newTexture;
-			t->width = width;
-			t->height = height;
-			t->depth = depth;
+			gl4metalSetTextureStorage(*textureObject, newTexture);
+			textureObject->width = width;
+			textureObject->height = height;
+			textureObject->depth = depth;
 			freshTextureStorage = true;
 		}
-		t->internalformat = (GLenum)internalformat;
-	} else if (!t->texture || t->texture.textureType != MTLTextureType3D ||
-		(NSUInteger)level >= t->texture.mipmapLevelCount ||
-		width != std::max(1, t->width >> level) || height != std::max(1, t->height >> level) ||
-		depth != std::max(1, t->depth >> level)) {
+		textureObject->internalformat = (GLenum)internalformat;
+	} else {
+		const GLsizei expectedDepth = isArray ? textureObject->depth : std::max(1, textureObject->depth >> level);
+		if (!textureObject->texture || textureObject->texture.textureType != (isArray ? MTLTextureType2DArray : MTLTextureType3D) ||
+			(NSUInteger)level >= textureObject->texture.mipmapLevelCount ||
+			width != std::max(1, textureObject->width >> level) ||
+			height != std::max(1, textureObject->height >> level) || depth != expectedDepth) {
+			gl4metalSetError(GL_INVALID_VALUE);
+			GL4METAL_LOG("glTexImage3D: level %d (%dx%dx%d) does not fit the allocated %s texture",
+				level, width, height, depth, isArray ? "array" : "volume");
+			return;
+		}
+	}
+
+	const bool hasPixelInput = pixels != nullptr || boundBuffer(GL_PIXEL_UNPACK_BUFFER) != 0;
+	if (hasPixelInput && !depthStencilFormat) {
+		uploadPixels3D(*textureObject, level, 0, 0, 0, width, height, depth, format, type, pixels,
+			isArray ? "glTexImage3D(GL_TEXTURE_2D_ARRAY)" : "glTexImage3D", freshTextureStorage);
+	} else if (hasPixelInput && depthStencilFormat) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage3D: initial depth-array pixel upload is not supported; allocate the image without pixels and clear/render it afterward");
+	}
+}
+
+namespace {
+
+static bool validateImmutableStorageArguments(GLsizei levels, GLenum internalformat,
+		GLsizei width, GLsizei height, GLsizei depth, GLsizei maxWidth,
+		GLsizei maxHeight, GLsizei maxDepth, bool allowDepthStencil, bool arrayTexture = false) {
+	const MTLPixelFormat pixelFormat = metalPixelFormat(internalformat);
+	if (!isSizedTextureInternalFormat(internalformat) || pixelFormat == MTLPixelFormatInvalid) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return false;
+	}
+	if (levels < 1 || width <= 0 || height <= 0 || depth <= 0 ||
+		width > maxWidth || height > maxHeight || depth > maxDepth) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glTexImage3D: mip level %d (%dx%dx%d) does not fit allocated volume", level, width, height, depth);
+		return false;
+	}
+	if (!allowDepthStencil && isDepthStencilFormat(pixelFormat)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	if (levels > fullMipLevelCount(width, height, arrayTexture ? 1 : depth)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return false;
+	}
+	return true;
+}
+
+static bool allocateImmutableTexture(TextureObject &textureObject, MTLTextureType textureType,
+		GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth,
+		GLsizei levels, bool cube, bool arrayTexture) {
+	const MTLPixelFormat pixelFormat = metalPixelFormat(internalformat);
+	const bool depthStencil = isDepthStencilFormat(pixelFormat);
+	MTLTextureDescriptor *descriptor = nil;
+	if (cube) {
+		descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat
+			size:(NSUInteger)width mipmapped:levels > 1];
+	} else {
+		descriptor = [[MTLTextureDescriptor alloc] init];
+	}
+	descriptor.textureType = textureType;
+	descriptor.pixelFormat = pixelFormat;
+	descriptor.width = (NSUInteger)width;
+	descriptor.height = (NSUInteger)height;
+	descriptor.depth = textureType == MTLTextureType3D ? (NSUInteger)depth : 1;
+	descriptor.arrayLength = arrayTexture ? (NSUInteger)depth : 1;
+	descriptor.mipmapLevelCount = (NSUInteger)levels;
+	descriptor.sampleCount = 1;
+	descriptor.usage = MTLTextureUsageShaderRead;
+	if ((textureType == MTLTextureType2D || textureType == MTLTextureTypeCube || arrayTexture) &&
+		pixelFormat != MTLPixelFormatRGB9E5Float) {
+		descriptor.usage = descriptor.usage | MTLTextureUsageRenderTarget;
+	}
+	const bool canShaderWrite = !depthStencil && pixelFormat != MTLPixelFormatRGB9E5Float &&
+		textureType != MTLTextureTypeCube;
+	if (canShaderWrite) descriptor.usage = descriptor.usage | MTLTextureUsageShaderWrite;
+	descriptor.storageMode = (depthStencil || textureType == MTLTextureType3D)
+		? MTLStorageModePrivate : MTLStorageModeShared;
+
+	id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+	if (!newTexture && canShaderWrite) {
+		descriptor.usage = (MTLTextureUsage)(descriptor.usage & ~MTLTextureUsageShaderWrite);
+		newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+	}
+	if (!newTexture) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glTexStorage: Metal allocation failed type=%lu size=%dx%dx%d levels=%d format=0x%X",
+			(unsigned long)textureType, width, height, depth, levels, internalformat);
+		return false;
+	}
+	endRenderEncoder();
+	gl4metalSetTextureStorage(textureObject, newTexture);
+	textureObject.width = width;
+	textureObject.height = height;
+	textureObject.depth = depth;
+	textureObject.internalformat = internalformat;
+	textureObject.buffer_object = 0;
+	textureObject.immutable_storage = true;
+	return true;
+}
+
+} // namespace
+
+void glTexStorage1D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width) {
+	if (target != GL_TEXTURE_1D) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (textureObject->immutable_storage || textureObject->texture || textureObject->internalformat != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		return;
 	}
-	if (pixels || boundBuffer(GL_PIXEL_UNPACK_BUFFER)) {
-		uploadPixels3D(*t, level, 0, 0, 0, width, height, depth, format, type, pixels,
-			"glTexImage3D", freshTextureStorage);
+	if (!validateImmutableStorageArguments(levels, internalformat, width, 1, 1,
+		GL4METAL_MAX_TEXTURE_SIZE, 1, 1, false)) return;
+	if (!ctx.device) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	allocateImmutableTexture(*textureObject, MTLTextureType1D, internalformat,
+		width, 1, 1, levels, false, false);
+}
+
+void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
+	const bool cube = target == GL_TEXTURE_CUBE_MAP;
+	if (target != GL_TEXTURE_2D && !cube) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (textureObject->immutable_storage || textureObject->texture || textureObject->internalformat != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
 	}
+	if ((cube && width != height) || !validateImmutableStorageArguments(levels, internalformat,
+		width, height, 1, GL4METAL_MAX_TEXTURE_SIZE, GL4METAL_MAX_TEXTURE_SIZE, 1, true)) {
+		if (cube && width != height) gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (!ctx.device) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	allocateImmutableTexture(*textureObject, cube ? MTLTextureTypeCube : MTLTextureType2D,
+		internalformat, width, height, 1, levels, cube, false);
+}
+
+void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat,
+		GLsizei width, GLsizei height, GLsizei depth) {
+	const bool arrayTexture = target == GL_TEXTURE_2D_ARRAY;
+	if (target != GL_TEXTURE_3D && !arrayTexture) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (textureObject->immutable_storage || textureObject->texture || textureObject->internalformat != 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	if (!validateImmutableStorageArguments(levels, internalformat, width, height, depth,
+		arrayTexture ? GL4METAL_MAX_TEXTURE_SIZE : GL4METAL_MAX_3D_TEXTURE_SIZE,
+		arrayTexture ? GL4METAL_MAX_TEXTURE_SIZE : GL4METAL_MAX_3D_TEXTURE_SIZE,
+		arrayTexture ? GL4METAL_MAX_ARRAY_TEXTURE_LAYERS : GL4METAL_MAX_3D_TEXTURE_SIZE,
+		arrayTexture, arrayTexture)) return;
+	if (!ctx.device) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	allocateImmutableTexture(*textureObject, arrayTexture ? MTLTextureType2DArray : MTLTextureType3D,
+		internalformat, width, height, depth, levels, false, arrayTexture);
+}
+
+void glTexStorage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat,
+		GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
+	glTexImage2DMultisample(target, samples, internalformat, width, height, fixedsamplelocations);
+}
+
+void glTexStorage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat,
+		GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
+	glTexImage3DMultisample(target, samples, internalformat, width, height, depth, fixedsamplelocations);
 }
 
 void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glTexImage2DMultisample: Unimplemented");
+	if (target != GL_TEXTURE_2D_MULTISAMPLE) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glTexImage2DMultisample: target must be GL_TEXTURE_2D_MULTISAMPLE (0x%X)", target);
+		return;
+	}
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage2DMultisample: no multisample texture is bound");
+		return;
+	}
+	if (textureObject->immutable_storage) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexImage2DMultisample: immutable texture storage cannot be redefined");
+		return;
+	}
+	const MTLPixelFormat pixelFormat = metalPixelFormat(internalformat);
+	if (samples < 1 || width <= 0 || height <= 0 ||
+		width > GL4METAL_MAX_TEXTURE_SIZE || height > GL4METAL_MAX_TEXTURE_SIZE) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glTexImage2DMultisample: invalid samples=%d size=%dx%d", samples, width, height);
+		return;
+	}
+	if (pixelFormat == MTLPixelFormatInvalid) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		GL4METAL_LOG("glTexImage2DMultisample: unsupported internal format 0x%X", internalformat);
+		return;
+	}
+	if (![ctx.device supportsTextureSampleCount:(NSUInteger)samples]) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glTexImage2DMultisample: sample count %d is not supported by this iOS Metal device", samples);
+		return;
+	}
+	MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+	descriptor.textureType = MTLTextureType2DMultisample;
+	descriptor.pixelFormat = pixelFormat;
+	descriptor.width = (NSUInteger)width;
+	descriptor.height = (NSUInteger)height;
+	descriptor.depth = 1;
+	descriptor.arrayLength = 1;
+	descriptor.mipmapLevelCount = 1;
+	descriptor.sampleCount = (NSUInteger)samples;
+	descriptor.storageMode = MTLStorageModePrivate;
+	descriptor.usage = MTLTextureUsageRenderTarget;
+	if (pixelFormat != MTLPixelFormatStencil8)
+		descriptor.usage = descriptor.usage | MTLTextureUsageShaderRead;
+	id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+	if (!newTexture) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glTexImage2DMultisample: Metal allocation failed for %dx%d samples=%d format=0x%X",
+			width, height, samples, internalformat);
+		return;
+	}
+	// Metal uses fixed sample locations. OpenGL permits the implementation to use
+	// fixed locations even when the caller passes GL_FALSE, so both values map safely.
+	(void)fixedsamplelocations;
+	endRenderEncoder();
+	gl4metalSetTextureStorage(*textureObject, newTexture);
+	textureObject->width = width;
+	textureObject->height = height;
+	textureObject->depth = 1;
+	textureObject->internalformat = internalformat;
+	textureObject->immutable_storage = true;
 }
 
 void glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glTexImage3DMultisample: Unimplemented");
+	(void)samples; (void)internalformat; (void)width; (void)height; (void)depth; (void)fixedsamplelocations;
+	if (target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY) gl4metalSetError(GL_INVALID_ENUM);
+	else gl4metalSetError(GL_INVALID_OPERATION);
+	GL4METAL_LOG("glTexImage3DMultisample: 2D multisample-array textures are not exposed by the current iOS shader/FBO backend");
 }
 
 void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glTexSubImage1D: Unimplemented");
+	if (target != GL_TEXTURE_1D) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	TextureObject *textureObject = boundTexture(GL_TEXTURE_1D);
+	if (!textureObject || !textureObject->texture || textureObject->texture.textureType != MTLTextureType1D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glTexSubImage1D: no allocated 1D texture is bound");
+		return;
+	}
+	uploadPixels(*textureObject, level, xoffset, 0, width, 1, format, type, pixels, "glTexSubImage1D");
 }
 
 void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
@@ -1748,34 +2447,93 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, G
 
 void glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
 		GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels) {
-	if (target != GL_TEXTURE_3D) {
+	const bool isArray = target == GL_TEXTURE_2D_ARRAY;
+	const bool isVolume = target == GL_TEXTURE_3D;
+	if (!isVolume && !isArray) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glTexSubImage3D: unsupported target 0x%X", target);
 		return;
 	}
-	TextureObject *t = boundTexture(GL_TEXTURE_3D);
-	if (!t || !t->texture || t->texture.textureType != MTLTextureType3D) {
+	TextureObject *t = boundTexture(target);
+	const MTLTextureType expectedType = isArray ? MTLTextureType2DArray : MTLTextureType3D;
+	if (!t || !t->texture || t->texture.textureType != expectedType) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glTexSubImage3D: no allocated 3D texture bound");
+		GL4METAL_LOG("glTexSubImage3D: no allocated %s texture bound", isArray ? "2D-array" : "3D");
 		return;
 	}
 	uploadPixels3D(*t, level, xoffset, yoffset, zoffset, width, height, depth,
-		format, type, pixels, "glTexSubImage3D");
+		format, type, pixels, isArray ? "glTexSubImage3D(GL_TEXTURE_2D_ARRAY)" : "glTexSubImage3D");
 }
 
 void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCopyTexImage1D: Unimplemented");
+	if (target != GL_TEXTURE_1D) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (width < 0 || border != 0 || level < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	TextureObject *textureObject = boundTexture(GL_TEXTURE_1D);
+	if (textureObject && textureObject->immutable_storage) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	glTexImage1D(target, level, (GLint)internalformat, width, border, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+	if (width > 0) glCopyTexSubImage1D(target, level, 0, x, y, width);
 }
 
 void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border) {
+	const int face = cubeFace(target);
+	TextureObject *textureObject = (target == GL_TEXTURE_2D || face >= 0)
+		? boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D) : nullptr;
+	if (textureObject && textureObject->immutable_storage) { gl4metalSetError(GL_INVALID_OPERATION); return; }
 	glTexImage2D(target, level, (GLint)internalformat, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	glCopyTexSubImage2D(target, level, 0, 0, x, y, width, height);
 }
 
 void glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCopyTexSubImage1D: Unimplemented");
+	if (target != GL_TEXTURE_1D) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	TextureObject *destination = boundTexture(GL_TEXTURE_1D);
+	if (!destination || !destination->texture || destination->texture.textureType != MTLTextureType1D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glCopyTexSubImage1D: no allocated 1D destination texture is bound");
+		return;
+	}
+	if (level < 0 || (NSUInteger)level >= destination->texture.mipmapLevelCount || width < 0) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	if (width == 0) return;
+	GLint sourceLevel = 0;
+	const bool copyDepth = isDepthStencilFormat(destination->texture.pixelFormat);
+	id<MTLTexture> source = readAttachment(sourceLevel, copyDepth);
+	if (!source || source.textureType != MTLTextureType2D || source.sampleCount != 1) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glCopyTexSubImage1D: read framebuffer has no compatible single-sample 2D source");
+		return;
+	}
+	const NSUInteger sourceWidth = std::max<NSUInteger>(source.width >> sourceLevel, 1);
+	const NSUInteger sourceHeight = std::max<NSUInteger>(source.height >> sourceLevel, 1);
+	const GLsizei destinationWidth = std::max(1, destination->width >> level);
+	if (x < 0 || y < 0 || xoffset < 0 || x > (GLint)sourceWidth || y >= (GLint)sourceHeight ||
+		width > (GLint)sourceWidth - x || xoffset > destinationWidth || width > destinationWidth - xoffset) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	if (source.pixelFormat != destination->texture.pixelFormat || copyDepth != isDepthStencilFormat(source.pixelFormat)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glCopyTexSubImage1D: source/destination pixel formats differ (%lu -> %lu)",
+			(unsigned long)source.pixelFormat, (unsigned long)destination->texture.pixelFormat);
+		return;
+	}
+	if (source == destination->texture) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	endRenderEncoder();
+
+	if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(source, 0, (NSUInteger)sourceLevel,
+		MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0), MTLSizeMake((NSUInteger)width, 1, 1),
+		destination->texture, 0, (NSUInteger)level, MTLOriginMake((NSUInteger)xoffset, 0, 0))) return;
+
+	if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
+	if (!blit) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+	[blit copyFromTexture:source sourceSlice:0 sourceLevel:(NSUInteger)sourceLevel
+		sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+		sourceSize:MTLSizeMake((NSUInteger)width, 1, 1)
+		toTexture:destination->texture destinationSlice:0 destinationLevel:(NSUInteger)level
+		destinationOrigin:MTLOriginMake((NSUInteger)xoffset, 0, 0)];
+	[blit endEncoding];
 }
 
 void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
@@ -1825,15 +2583,20 @@ void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 		return;
 	}
 	endRenderEncoder();
+
+	if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(src, 0, (NSUInteger)srcLevel,
+		MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0), MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+		dst->texture, (face >= 0 ? (NSUInteger)face : 0), (NSUInteger)level,
+		MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0))) {
+		return;
+	}
+
 	if (!ctx.commandQueue) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glCopyTexSubImage2D: Metal command queue is unavailable");
 		return;
 	}
-	if (!ctx.currentCommandBuffer) {
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-	}
-	if (!ctx.currentCommandBuffer) {
+	if (!gl4metalEnsureClassicCommandBuffer()) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		return;
 	}
@@ -1852,15 +2615,18 @@ void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 
 void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
 		GLint x, GLint y, GLsizei width, GLsizei height) {
-	if (target != GL_TEXTURE_3D) {
+	const bool isArray = target == GL_TEXTURE_2D_ARRAY;
+	const bool isVolume = target == GL_TEXTURE_3D;
+	if (!isVolume && !isArray) {
 		gl4metalSetError(GL_INVALID_ENUM);
 		GL4METAL_LOG("glCopyTexSubImage3D: unsupported target 0x%X", target);
 		return;
 	}
-	TextureObject *dst = boundTexture(GL_TEXTURE_3D);
-	if (!dst || !dst->texture || dst->texture.textureType != MTLTextureType3D) {
+	TextureObject *dst = boundTexture(target);
+	const MTLTextureType expectedType = isArray ? MTLTextureType2DArray : MTLTextureType3D;
+	if (!dst || !dst->texture || dst->texture.textureType != expectedType) {
 		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("glCopyTexSubImage3D: destination 3D texture is not allocated");
+		GL4METAL_LOG("glCopyTexSubImage3D: destination %s texture is not allocated", isArray ? "2D-array" : "3D");
 		return;
 	}
 	if (level < 0 || (NSUInteger)level >= dst->texture.mipmapLevelCount || width < 0 || height < 0) {
@@ -1881,7 +2647,7 @@ void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 	const NSUInteger srcH = std::max<NSUInteger>(src.height >> srcLevel, 1);
 	const GLsizei dstW = std::max(1, dst->width >> level);
 	const GLsizei dstH = std::max(1, dst->height >> level);
-	const GLsizei dstD = std::max(1, dst->depth >> level);
+	const GLsizei dstD = isArray ? dst->depth : std::max(1, dst->depth >> level);
 	if (x < 0 || y < 0 || xoffset < 0 || yoffset < 0 || zoffset < 0 ||
 		(NSUInteger)x > srcW || (NSUInteger)y > srcH || (NSUInteger)width > srcW - (NSUInteger)x ||
 		(NSUInteger)height > srcH - (NSUInteger)y || xoffset > dstW || yoffset > dstH || zoffset >= dstD ||
@@ -1901,95 +2667,792 @@ void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 		return;
 	}
 	endRenderEncoder();
+
+	if (ctx.metal4Enabled && gl4metalMetal4CopyTextureRegion(src, 0, (NSUInteger)srcLevel,
+		MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0), MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+		dst->texture, isArray ? (NSUInteger)zoffset : 0, (NSUInteger)level,
+		MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, isArray ? 0 : (NSUInteger)zoffset))) {
+		return;
+	}
+
 	if (!ctx.commandQueue) { gl4metalSetError(GL_INVALID_OPERATION); return; }
-	if (!ctx.currentCommandBuffer) ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
-	if (!ctx.currentCommandBuffer) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+	if (!gl4metalEnsureClassicCommandBuffer()) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
 	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
 	if (!blit) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
-	[blit copyFromTexture:src sourceSlice:0 sourceLevel:(NSUInteger)srcLevel
-		sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
-		sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
-		toTexture:dst->texture destinationSlice:0 destinationLevel:(NSUInteger)level
-		destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, (NSUInteger)zoffset)];
+	if (isArray) {
+		[blit copyFromTexture:src sourceSlice:0 sourceLevel:(NSUInteger)srcLevel
+			sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+			sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+			toTexture:dst->texture destinationSlice:(NSUInteger)zoffset destinationLevel:(NSUInteger)level
+			destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0)];
+	} else {
+		[blit copyFromTexture:src sourceSlice:0 sourceLevel:(NSUInteger)srcLevel
+			sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+			sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+			toTexture:dst->texture destinationSlice:0 destinationLevel:(NSUInteger)level
+			destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, (NSUInteger)zoffset)];
+	}
 	[blit endEncoding];
 }
 
 // MARK: - Compressed texture images
 
+namespace {
+struct CompressedFormatInfo {
+	MTLPixelFormat pixelFormat = MTLPixelFormatInvalid;
+	NSUInteger blockWidth = 4;
+	NSUInteger blockHeight = 4;
+	NSUInteger bytesPerBlock = 0;
+};
+
+static bool compressedFormatInfo(GLenum format, CompressedFormatInfo &info) {
+	info = {};
+	switch (format) {
+		case GL_COMPRESSED_R11_EAC: info.pixelFormat = MTLPixelFormatEAC_R11Unorm; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_SIGNED_R11_EAC: info.pixelFormat = MTLPixelFormatEAC_R11Snorm; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_RG11_EAC: info.pixelFormat = MTLPixelFormatEAC_RG11Unorm; info.bytesPerBlock = 16; return true;
+		case GL_COMPRESSED_SIGNED_RG11_EAC: info.pixelFormat = MTLPixelFormatEAC_RG11Snorm; info.bytesPerBlock = 16; return true;
+		case GL_COMPRESSED_RGB8_ETC2: info.pixelFormat = MTLPixelFormatETC2_RGB8; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_SRGB8_ETC2: info.pixelFormat = MTLPixelFormatETC2_RGB8_sRGB; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2: info.pixelFormat = MTLPixelFormatETC2_RGB8A1; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2: info.pixelFormat = MTLPixelFormatETC2_RGB8A1_sRGB; info.bytesPerBlock = 8; return true;
+		case GL_COMPRESSED_RGBA8_ETC2_EAC: info.pixelFormat = MTLPixelFormatEAC_RGBA8; info.bytesPerBlock = 16; return true;
+		case GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC: info.pixelFormat = MTLPixelFormatEAC_RGBA8_sRGB; info.bytesPerBlock = 16; return true;
+#define GL4METAL_ASTC_FORMAT(glFormat, metalFormat, bw, bh) \
+		case glFormat: info.pixelFormat = metalFormat; info.blockWidth = bw; info.blockHeight = bh; info.bytesPerBlock = 16; return true
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_4x4_KHR, MTLPixelFormatASTC_4x4_LDR, 4, 4);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_5x4_KHR, MTLPixelFormatASTC_5x4_LDR, 5, 4);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_5x5_KHR, MTLPixelFormatASTC_5x5_LDR, 5, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_6x5_KHR, MTLPixelFormatASTC_6x5_LDR, 6, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_6x6_KHR, MTLPixelFormatASTC_6x6_LDR, 6, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_8x5_KHR, MTLPixelFormatASTC_8x5_LDR, 8, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_8x6_KHR, MTLPixelFormatASTC_8x6_LDR, 8, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_8x8_KHR, MTLPixelFormatASTC_8x8_LDR, 8, 8);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_10x5_KHR, MTLPixelFormatASTC_10x5_LDR, 10, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_10x6_KHR, MTLPixelFormatASTC_10x6_LDR, 10, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_10x8_KHR, MTLPixelFormatASTC_10x8_LDR, 10, 8);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_10x10_KHR, MTLPixelFormatASTC_10x10_LDR, 10, 10);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_12x10_KHR, MTLPixelFormatASTC_12x10_LDR, 12, 10);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_RGBA_ASTC_12x12_KHR, MTLPixelFormatASTC_12x12_LDR, 12, 12);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR, MTLPixelFormatASTC_4x4_sRGB, 4, 4);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR, MTLPixelFormatASTC_5x4_sRGB, 5, 4);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR, MTLPixelFormatASTC_5x5_sRGB, 5, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR, MTLPixelFormatASTC_6x5_sRGB, 6, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR, MTLPixelFormatASTC_6x6_sRGB, 6, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR, MTLPixelFormatASTC_8x5_sRGB, 8, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR, MTLPixelFormatASTC_8x6_sRGB, 8, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR, MTLPixelFormatASTC_8x8_sRGB, 8, 8);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR, MTLPixelFormatASTC_10x5_sRGB, 10, 5);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR, MTLPixelFormatASTC_10x6_sRGB, 10, 6);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR, MTLPixelFormatASTC_10x8_sRGB, 10, 8);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR, MTLPixelFormatASTC_10x10_sRGB, 10, 10);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR, MTLPixelFormatASTC_12x10_sRGB, 12, 10);
+		GL4METAL_ASTC_FORMAT(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR, MTLPixelFormatASTC_12x12_sRGB, 12, 12);
+#undef GL4METAL_ASTC_FORMAT
+		default: return false;
+	}
+}
+
+static bool compressedImageLayout(GLsizei width, GLsizei height, const CompressedFormatInfo &info,
+		NSUInteger &rowBytes, NSUInteger &rows, size_t &totalBytes) {
+	if (width <= 0 || height <= 0 || info.bytesPerBlock == 0 || info.blockWidth == 0 || info.blockHeight == 0)
+		return false;
+	const NSUInteger blocksWide = ((NSUInteger)width + info.blockWidth - 1) / info.blockWidth;
+	rows = ((NSUInteger)height + info.blockHeight - 1) / info.blockHeight;
+	if (blocksWide > SIZE_MAX / info.bytesPerBlock) return false;
+	rowBytes = blocksWide * info.bytesPerBlock;
+	if (rows > SIZE_MAX / rowBytes) return false;
+	totalBytes = rowBytes * rows;
+	return totalBytes != 0;
+}
+
+static bool compressedSubRegionValid(GLint x, GLint y, GLsizei width, GLsizei height,
+		GLsizei textureWidth, GLsizei textureHeight, const CompressedFormatInfo &info) {
+	if (x < 0 || y < 0 || width < 0 || height < 0 ||
+		x > textureWidth || y > textureHeight || width > textureWidth - x || height > textureHeight - y)
+		return false;
+	if (width == 0 || height == 0) return true;
+	const bool rightEdge = x + width == textureWidth;
+	const bool bottomEdge = y + height == textureHeight;
+	return ((NSUInteger)x % info.blockWidth) == 0 && ((NSUInteger)y % info.blockHeight) == 0 &&
+		(((NSUInteger)width % info.blockWidth) == 0 || rightEdge) &&
+		(((NSUInteger)height % info.blockHeight) == 0 || bottomEdge);
+}
+
+static bool uploadCompressedSlices(TextureObject &textureObject, GLint level, NSUInteger firstSlice,
+		NSUInteger sliceCount, GLint x, GLint y, GLsizei width, GLsizei height,
+		const CompressedFormatInfo &info, const uint8_t *bytes, NSUInteger rowBytes) {
+	id<MTLTexture> destinationTexture = textureObject.texture;
+	const NSUInteger availableSlices = destinationTexture && destinationTexture.textureType == MTLTextureTypeCube
+		? 6 : (destinationTexture ? destinationTexture.arrayLength : 0);
+	if (!destinationTexture || !bytes || !ctx.device || !ctx.commandQueue || sliceCount == 0 ||
+		width <= 0 || height <= 0 || rowBytes == 0 || info.blockHeight == 0 ||
+		level < 0 || (NSUInteger)level >= destinationTexture.mipmapLevelCount ||
+		firstSlice >= availableSlices || sliceCount > availableSlices - firstSlice) return false;
+
+	const NSUInteger blockRows = ((NSUInteger)height + info.blockHeight - 1) / info.blockHeight;
+	if (blockRows > SIZE_MAX / rowBytes) return false;
+	const size_t bytesPerImage = (size_t)rowBytes * (size_t)blockRows;
+	if (bytesPerImage == 0 || bytesPerImage > ctx.device.maxBufferLength ||
+		sliceCount > SIZE_MAX / bytesPerImage) return false;
+
+	// Keep compressed uploads asynchronous and ordered with surrounding GL work.
+	// Metal 4 routes block-linear copies through the unified compute/blit encoder;
+	// sourceBytesPerRow is the byte distance between compressed block rows.
+	endRenderEncoder();
+
+	if (ctx.metal4Enabled && gl4metalBeginMetal4Compute()) {
+		// Metal buffer/texture copies require an aligned row pitch. Compressed
+		// payloads arrive tightly packed by GL, so repack block rows into a
+		// 256-byte-aligned staging image before encoding the MTL4 copy.
+		if (rowBytes <= std::numeric_limits<NSUInteger>::max() - 255u) {
+			const NSUInteger stagingRowBytes = (rowBytes + 255u) & ~(NSUInteger)255u;
+			if (blockRows <= SIZE_MAX / stagingRowBytes) {
+				const NSUInteger stagingImageBytes = stagingRowBytes * blockRows;
+				if (stagingImageBytes > 0 && stagingImageBytes <= ctx.device.maxBufferLength) {
+					const NSUInteger maxMetal4Slices = std::max<NSUInteger>(1, ctx.device.maxBufferLength / stagingImageBytes);
+					NSUInteger uploadedSlices = 0;
+					bool allCopiesEncoded = true;
+					while (uploadedSlices < sliceCount && allCopiesEncoded) {
+						const NSUInteger batchSlices = std::min<NSUInteger>(sliceCount - uploadedSlices, maxMetal4Slices);
+						if (batchSlices > SIZE_MAX / stagingImageBytes) { allCopiesEncoded = false; break; }
+						const NSUInteger batchBytes = batchSlices * stagingImageBytes;
+						std::vector<uint8_t> paddedBytes;
+						try { paddedBytes.resize((size_t)batchBytes); }
+						catch (const std::bad_alloc &) { allCopiesEncoded = false; break; }
+						for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+							const uint8_t *sourceImage = bytes + (uploadedSlices + sliceIndex) * bytesPerImage;
+							uint8_t *destinationImage = paddedBytes.data() + sliceIndex * stagingImageBytes;
+							for (NSUInteger blockRow = 0; blockRow < blockRows; ++blockRow) {
+								memcpy(destinationImage + blockRow * stagingRowBytes,
+									sourceImage + blockRow * rowBytes, rowBytes);
+							}
+						}
+						id<MTLBuffer> stagingBuffer = nil;
+						NSUInteger stagingOffset = 0;
+						if (!gl4metalMetal4StageBytes(paddedBytes.data(), batchBytes, &stagingBuffer, &stagingOffset)) {
+							allCopiesEncoded = false;
+							break;
+						}
+						for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+							if (!gl4metalMetal4CopyBufferToTexture(stagingBuffer,
+									stagingOffset + sliceIndex * stagingImageBytes, stagingRowBytes, 0,
+									MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1), destinationTexture,
+									firstSlice + uploadedSlices + sliceIndex, (NSUInteger)level,
+									MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0))) {
+								allCopiesEncoded = false;
+								break;
+							}
+						}
+						if (allCopiesEncoded) uploadedSlices += batchSlices;
+					}
+					if (allCopiesEncoded && uploadedSlices == sliceCount) return true;
+				}
+			}
+		}
+		// If setup failed after a partial MTL4 batch, the classic helper below
+		// commits and waits on the shared-event bridge before replaying all slices.
+	}
+
+	if (!gl4metalEnsureClassicCommandBuffer()) return false;
+	id<MTLCommandBuffer> targetCommandBuffer = ctx.currentCommandBuffer;
+
+	NSUInteger uploadedSlices = 0;
+	const NSUInteger maxSlicesPerBatch = std::max<NSUInteger>(1, ctx.device.maxBufferLength / bytesPerImage);
+	while (uploadedSlices < sliceCount) {
+		const NSUInteger batchSlices = std::min<NSUInteger>(sliceCount - uploadedSlices, maxSlicesPerBatch);
+		if (batchSlices > SIZE_MAX / bytesPerImage) return false;
+		const size_t batchBytes = bytesPerImage * batchSlices;
+
+		if (textureUploadArena.commandBuffer != targetCommandBuffer) {
+			textureUploadArena.commandBuffer = targetCommandBuffer;
+			textureUploadArena.metal4CommandBuffer = nil;
+			textureUploadArena.buffer = nil;
+			textureUploadArena.used = 0;
+		}
+
+		size_t alignedOffset = 0;
+		if (!checkedAlignSize((size_t)textureUploadArena.used, (size_t)info.bytesPerBlock, alignedOffset) ||
+			alignedOffset > std::numeric_limits<NSUInteger>::max() ||
+			batchBytes > std::numeric_limits<NSUInteger>::max() - alignedOffset) return false;
+		NSUInteger stagingOffset = (NSUInteger)alignedOffset;
+		NSUInteger requiredEnd = stagingOffset + (NSUInteger)batchBytes;
+
+		if (!textureUploadArena.buffer || requiredEnd > textureUploadArena.buffer.length) {
+			NSUInteger capacity = std::max<NSUInteger>(256 * 1024, requiredEnd);
+			if (textureUploadArena.buffer && textureUploadArena.buffer.length <= ctx.device.maxBufferLength / 2) {
+				capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
+			}
+			capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
+			if (capacity < requiredEnd) return false;
+			id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+			if (!replacement) return false;
+			// The command buffer retains previously encoded staging buffers. Reset the
+			// offset only when switching to a newly allocated arena buffer.
+			textureUploadArena.buffer = replacement;
+			textureUploadArena.used = 0;
+			stagingOffset = 0;
+			requiredEnd = (NSUInteger)batchBytes;
+		}
+
+		id<MTLBuffer> stagingBuffer = textureUploadArena.buffer;
+		uint8_t *stagingBytes = (uint8_t *)stagingBuffer.contents + stagingOffset;
+		memcpy(stagingBytes, bytes + uploadedSlices * bytesPerImage, batchBytes);
+		textureUploadArena.used = requiredEnd;
+
+		id<MTLBlitCommandEncoder> blitEncoder = [targetCommandBuffer blitCommandEncoder];
+		if (!blitEncoder) return false;
+		for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+			[blitEncoder copyFromBuffer:stagingBuffer
+				sourceOffset:stagingOffset + sliceIndex * bytesPerImage
+				sourceBytesPerRow:rowBytes
+				sourceBytesPerImage:0
+				sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+				toTexture:destinationTexture
+				destinationSlice:firstSlice + uploadedSlices + sliceIndex
+				destinationLevel:(NSUInteger)level
+				destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)];
+		}
+		[blitEncoder endEncoding];
+		uploadedSlices += batchSlices;
+	}
+	return true;
+}
+
+static bool readbackCompressedSlices(id<MTLTexture> sourceTexture, GLint level, NSUInteger firstSlice,
+		NSUInteger sliceCount, GLsizei width, GLsizei height, const CompressedFormatInfo &info,
+		uint8_t *destination, NSUInteger rowBytes) {
+	const NSUInteger availableSlices = sourceTexture && sourceTexture.textureType == MTLTextureTypeCube
+		? 6 : (sourceTexture ? sourceTexture.arrayLength : 0);
+	if (!sourceTexture || !destination || !ctx.device || !ctx.commandQueue || sliceCount == 0 ||
+		width <= 0 || height <= 0 || rowBytes == 0 || level < 0 ||
+		(NSUInteger)level >= sourceTexture.mipmapLevelCount || firstSlice >= availableSlices ||
+		sliceCount > availableSlices - firstSlice || info.blockHeight == 0) return false;
+
+	const NSUInteger blockRows = ((NSUInteger)height + info.blockHeight - 1) / info.blockHeight;
+	if (blockRows > SIZE_MAX / rowBytes) return false;
+	const size_t bytesPerImage = (size_t)rowBytes * (size_t)blockRows;
+	if (bytesPerImage == 0 || bytesPerImage > ctx.device.maxBufferLength ||
+		sliceCount > SIZE_MAX / bytesPerImage) return false;
+	const NSUInteger maxSlicesPerBatch = std::max<NSUInteger>(1, ctx.device.maxBufferLength / bytesPerImage);
+
+	NSUInteger copiedSlices = 0;
+	while (copiedSlices < sliceCount) {
+		const NSUInteger batchSlices = std::min<NSUInteger>(sliceCount - copiedSlices, maxSlicesPerBatch);
+		if (batchSlices > SIZE_MAX / bytesPerImage) return false;
+		const NSUInteger stagingLength = (NSUInteger)(bytesPerImage * batchSlices);
+		if (stagingLength == 0 || stagingLength > ctx.device.maxBufferLength) return false;
+		endRenderEncoder();
+		if (rowBytes > std::numeric_limits<NSUInteger>::max() - 255u) return false;
+		const NSUInteger stagingRowBytes = (rowBytes + 255u) & ~(NSUInteger)255u;
+		if (blockRows > SIZE_MAX / stagingRowBytes) return false;
+		const NSUInteger stagingImageBytes = stagingRowBytes * blockRows;
+		if (stagingImageBytes == 0 || batchSlices > SIZE_MAX / stagingImageBytes) return false;
+		const NSUInteger paddedStagingLength = stagingImageBytes * batchSlices;
+		bool metal4ReadbackSucceeded = false;
+
+		id<MTLBuffer> metal4StagingBuffer = nil;
+		if (ctx.metal4Enabled && paddedStagingLength <= ctx.device.maxBufferLength) {
+			metal4StagingBuffer = [ctx.device newBufferWithLength:paddedStagingLength options:MTLResourceStorageModeShared];
+			if (metal4StagingBuffer) {
+				metal4ReadbackSucceeded = true;
+				for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+					if (!gl4metalMetal4CopyTextureToBuffer(sourceTexture, firstSlice + copiedSlices + sliceIndex,
+							(NSUInteger)level, MTLOriginMake(0, 0, 0), MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1),
+							metal4StagingBuffer, sliceIndex * stagingImageBytes, stagingRowBytes, 0, MTLBlitOptionNone)) {
+						metal4ReadbackSucceeded = false;
+						break;
+					}
+				}
+				if (metal4ReadbackSucceeded) {
+					flushCommandBuffer(true);
+					metal4ReadbackSucceeded = ctx.metal4InteropEvent &&
+						ctx.metal4InteropEvent.signaledValue >= ctx.metal4LastComputeEventValue &&
+						ctx.metal4LastComputeEventValue != 0;
+				}
+			}
+		}
+
+		if (metal4ReadbackSucceeded) {
+			const uint8_t *stagingBytes = (const uint8_t *)metal4StagingBuffer.contents;
+			for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+				for (NSUInteger blockRow = 0; blockRow < blockRows; ++blockRow) {
+					memcpy(destination + (copiedSlices + sliceIndex) * bytesPerImage + blockRow * rowBytes,
+						stagingBytes + sliceIndex * stagingImageBytes + blockRow * stagingRowBytes, rowBytes);
+				}
+			}
+		} else {
+			// A partial Metal 4 attempt must finish before the classic queue reads
+			// the same texture. Reuse its staging allocation when possible and keep
+			// the Metal-required padded row pitch for compressed blocks.
+			flushCommandBuffer(true);
+
+			if (!metal4StagingBuffer) metal4StagingBuffer = [ctx.device newBufferWithLength:paddedStagingLength options:MTLResourceStorageModeShared];
+			id<MTLBuffer> stagingBuffer = metal4StagingBuffer;
+			if (!stagingBuffer) {
+				stagingBuffer = [ctx.device newBufferWithLength:paddedStagingLength options:MTLResourceStorageModeShared];
+			}
+			// id<MTLBuffer> stagingBuffer = [ctx.device newBufferWithLength:paddedStagingLength options:MTLResourceStorageModeShared];
+			if (!stagingBuffer || !gl4metalEnsureClassicCommandBuffer()) return false;
+			id<MTLCommandBuffer> targetCommandBuffer = ctx.currentCommandBuffer;
+			id<MTLBlitCommandEncoder> blitEncoder = [targetCommandBuffer blitCommandEncoder];
+			if (!blitEncoder) return false;
+			for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+				[blitEncoder copyFromTexture:sourceTexture
+					sourceSlice:firstSlice + copiedSlices + sliceIndex
+					sourceLevel:(NSUInteger)level
+					sourceOrigin:MTLOriginMake(0, 0, 0)
+					sourceSize:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+					toBuffer:stagingBuffer
+					destinationOffset:sliceIndex * stagingImageBytes
+					destinationBytesPerRow:stagingRowBytes
+					destinationBytesPerImage:0];
+			}
+			[blitEncoder endEncoding];
+			flushCommandBuffer(true);
+			if (!ctx.last_committed_buffer || ctx.last_committed_buffer.status != MTLCommandBufferStatusCompleted) return false;
+			const uint8_t *stagingBytes = (const uint8_t *)stagingBuffer.contents;
+			for (NSUInteger sliceIndex = 0; sliceIndex < batchSlices; ++sliceIndex) {
+				for (NSUInteger blockRow = 0; blockRow < blockRows; ++blockRow) {
+					memcpy(destination + (copiedSlices + sliceIndex) * bytesPerImage + blockRow * rowBytes,
+						stagingBytes + sliceIndex * stagingImageBytes + blockRow * stagingRowBytes, rowBytes);
+				}
+			}
+		}
+		copiedSlices += batchSlices;
+	}
+	return true;
+}
+
+static bool defineCompressed2D(TextureObject &textureObject, GLenum textureTarget, GLint level,
+		GLenum internalformat, GLsizei width, GLsizei height, GLint border,
+		GLsizei imageSize, const void *data) {
+	CompressedFormatInfo info;
+	if (!compressedFormatInfo(internalformat, info)) { gl4metalSetError(GL_INVALID_ENUM); return false; }
+	if (level < 0 || width <= 0 || height <= 0 || border != 0 ||
+		width > GL4METAL_MAX_TEXTURE_SIZE || height > GL4METAL_MAX_TEXTURE_SIZE) {
+		gl4metalSetError(GL_INVALID_VALUE); return false;
+	}
+	NSUInteger rowBytes = 0, blockRows = 0;
+	size_t expectedBytes = 0;
+	if (!compressedImageLayout(width, height, info, rowBytes, blockRows, expectedBytes) ||
+		expectedBytes > (size_t)INT_MAX || imageSize < 0 || (size_t)imageSize != expectedBytes) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glCompressedTexImage2D: imageSize=%d does not match required compressed payload %lu", imageSize, (unsigned long)expectedBytes);
+		return false;
+	}
+	const bool cube = cubeFace(textureTarget) >= 0;
+	if (textureTarget != GL_TEXTURE_2D && !cube) { gl4metalSetError(GL_INVALID_ENUM); return false; }
+	if (cube && width != height) { gl4metalSetError(GL_INVALID_VALUE); return false; }
+	if (textureObject.immutable_storage) { gl4metalSetError(GL_INVALID_OPERATION); return false; }
+	if (textureObject.internalformat != 0 && textureObject.internalformat != internalformat) {
+		gl4metalSetError(GL_INVALID_OPERATION); return false;
+	}
+	if (level == 0) {
+		const MTLTextureType expectedType = cube ? MTLTextureTypeCube : MTLTextureType2D;
+		if (!textureObject.texture || textureObject.texture.textureType != expectedType ||
+			textureObject.width != width || textureObject.height != height ||
+			textureObject.texture.pixelFormat != info.pixelFormat) {
+			MTLTextureDescriptor *descriptor = cube
+				? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:info.pixelFormat size:(NSUInteger)width mipmapped:mipLevelCount(textureObject, width, height) > 1]
+				: [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:info.pixelFormat width:(NSUInteger)width height:(NSUInteger)height mipmapped:mipLevelCount(textureObject, width, height) > 1];
+			descriptor.textureType = expectedType;
+			descriptor.mipmapLevelCount = mipLevelCount(textureObject, width, height);
+			descriptor.storageMode = MTLStorageModePrivate;
+			descriptor.usage = MTLTextureUsageShaderRead;
+			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+			if (!newTexture) { gl4metalSetError(GL_OUT_OF_MEMORY); return false; }
+			endRenderEncoder();
+			gl4metalSetTextureStorage(textureObject, newTexture);
+			textureObject.width = width;
+			textureObject.height = height;
+			textureObject.depth = 1;
+			textureObject.internalformat = internalformat;
+		} else {
+			textureObject.internalformat = internalformat;
+		}
+	} else {
+		const MTLTextureType expectedType = cube ? MTLTextureTypeCube : MTLTextureType2D;
+		if (!textureObject.texture || textureObject.texture.textureType != expectedType || textureObject.texture.pixelFormat != info.pixelFormat ||
+			(NSUInteger)level >= textureObject.texture.mipmapLevelCount ||
+			width != std::max(1, textureObject.width >> level) ||
+			height != std::max(1, textureObject.height >> level)) {
+			gl4metalSetError(GL_INVALID_VALUE); return false;
+		}
+	}
+	if (data) {
+		const uint8_t *source = resolveUnpackPointer(data, 0, expectedBytes, "glCompressedTexImage2D");
+		if (!source) return false;
+		const NSUInteger slice = cube ? (NSUInteger)cubeFace(textureTarget) : 0;
+		if (!uploadCompressedSlices(textureObject, level, slice, 1, 0, 0, width, height, info, source, rowBytes)) {
+			gl4metalSetError(GL_INVALID_OPERATION); return false;
+		}
+	}
+	return true;
+}
+} // namespace
+
 void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexImage1D: Unimplemented");
+	(void)level; (void)internalformat; (void)width; (void)border; (void)imageSize; (void)data;
+	if (target != GL_TEXTURE_1D) gl4metalSetError(GL_INVALID_ENUM);
+	else gl4metalSetError(GL_INVALID_OPERATION);
+	GL4METAL_LOG("glCompressedTexImage1D: compressed 1D textures are not supported by Metal on iOS");
 }
 
 void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexImage2D: Unimplemented");
+	if (target != GL_TEXTURE_2D && cubeFace(target) < 0) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	const GLenum bindingTarget = cubeFace(target) >= 0 ? GL_TEXTURE_CUBE_MAP : target;
+	TextureObject *textureObject = boundTexture(bindingTarget);
+	if (!textureObject) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	defineCompressed2D(*textureObject, target, level, internalformat, width, height, border, imageSize, data);
 }
 
 void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexImage3D: Unimplemented");
+	if (target != GL_TEXTURE_2D_ARRAY) {
+		gl4metalSetError(target == GL_TEXTURE_3D ? GL_INVALID_OPERATION : GL_INVALID_ENUM);
+		GL4METAL_LOG("glCompressedTexImage3D: compressed Metal textures support 2D arrays, not compressed 3D volumes");
+		return;
+	}
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	CompressedFormatInfo info;
+	if (!compressedFormatInfo(internalformat, info)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (level < 0 || width <= 0 || height <= 0 || depth <= 0 || border != 0 ||
+		width > GL4METAL_MAX_TEXTURE_SIZE || height > GL4METAL_MAX_TEXTURE_SIZE || depth > GL4METAL_MAX_ARRAY_TEXTURE_LAYERS) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	NSUInteger rowBytes = 0, blockRows = 0;
+	size_t imageBytes = 0;
+	if (!compressedImageLayout(width, height, info, rowBytes, blockRows, imageBytes) ||
+		imageBytes > SIZE_MAX / (size_t)depth || (size_t)imageSize != imageBytes * (size_t)depth) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	if (textureObject->immutable_storage || (textureObject->internalformat && textureObject->internalformat != internalformat)) {
+		gl4metalSetError(GL_INVALID_OPERATION); return;
+	}
+	if (level != 0) {
+		if (!textureObject->texture || textureObject->texture.textureType != MTLTextureType2DArray ||
+			textureObject->texture.pixelFormat != info.pixelFormat || (NSUInteger)level >= textureObject->texture.mipmapLevelCount ||
+			width != std::max(1, textureObject->width >> level) || height != std::max(1, textureObject->height >> level) || depth != textureObject->depth) {
+			gl4metalSetError(GL_INVALID_VALUE); return;
+		}
+	} else if (!textureObject->texture || textureObject->texture.textureType != MTLTextureType2DArray ||
+		textureObject->width != width || textureObject->height != height || textureObject->depth != depth ||
+		textureObject->texture.pixelFormat != info.pixelFormat) {
+		MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+		descriptor.textureType = MTLTextureType2DArray;
+		descriptor.pixelFormat = info.pixelFormat;
+		descriptor.width = (NSUInteger)width;
+		descriptor.height = (NSUInteger)height;
+		descriptor.depth = 1;
+		descriptor.arrayLength = (NSUInteger)depth;
+		descriptor.mipmapLevelCount = mipLevelCount(*textureObject, width, height);
+		descriptor.sampleCount = 1;
+		descriptor.storageMode = MTLStorageModePrivate;
+		descriptor.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
+		if (!newTexture) { gl4metalSetError(GL_OUT_OF_MEMORY); return; }
+		endRenderEncoder();
+		gl4metalSetTextureStorage(*textureObject, newTexture);
+		textureObject->width = width; textureObject->height = height; textureObject->depth = depth;
+		textureObject->internalformat = internalformat;
+	}
+	if (data) {
+		const uint8_t *source = resolveUnpackPointer(data, 0, (size_t)imageSize, "glCompressedTexImage3D");
+		if (!source) return;
+		if (!uploadCompressedSlices(*textureObject, level, 0, (NSUInteger)depth,
+			0, 0, width, height, info, source, rowBytes)) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+	}
 }
 
 void glCompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexSubImage1D: Unimplemented");
+	(void)level; (void)xoffset; (void)width; (void)format; (void)imageSize; (void)data;
+	if (target != GL_TEXTURE_1D) gl4metalSetError(GL_INVALID_ENUM); else gl4metalSetError(GL_INVALID_OPERATION);
+	GL4METAL_LOG("glCompressedTexSubImage1D: compressed 1D textures are not supported by Metal on iOS");
 }
 
 void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexSubImage2D: Unimplemented");
+	if (target != GL_TEXTURE_2D && cubeFace(target) < 0) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	const bool cube = cubeFace(target) >= 0;
+	TextureObject *textureObject = boundTexture(cube ? GL_TEXTURE_CUBE_MAP : target);
+	if (!textureObject || !textureObject->texture) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	CompressedFormatInfo info;
+	if (!compressedFormatInfo(format, info)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (format != textureObject->internalformat || textureObject->texture.pixelFormat != info.pixelFormat) {
+		gl4metalSetError(GL_INVALID_OPERATION); return;
+	}
+	if (level < 0 || (NSUInteger)level >= textureObject->texture.mipmapLevelCount || width < 0 || height < 0) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	const GLsizei levelWidth = std::max(1, textureObject->width >> level);
+	const GLsizei levelHeight = std::max(1, textureObject->height >> level);
+	if (!compressedSubRegionValid(xoffset, yoffset, width, height, levelWidth, levelHeight, info)) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	if (width == 0 || height == 0) return;
+	NSUInteger rowBytes = 0, blockRows = 0;
+	size_t expectedBytes = 0;
+	if (!compressedImageLayout(width, height, info, rowBytes, blockRows, expectedBytes) || imageSize < 0 || (size_t)imageSize != expectedBytes) {
+		gl4metalSetError(GL_INVALID_VALUE); return;
+	}
+	const uint8_t *source = resolveUnpackPointer(data, 0, expectedBytes, "glCompressedTexSubImage2D");
+	if (!source) return;
+	const NSUInteger slice = cube ? (NSUInteger)cubeFace(target) : 0;
+	if (!uploadCompressedSlices(*textureObject, level, slice, 1, xoffset, yoffset,
+		width, height, info, source, rowBytes))
+		gl4metalSetError(GL_INVALID_OPERATION);
 }
 
 void glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glCompressedTexSubImage3D: Unimplemented");
+	if (target != GL_TEXTURE_2D_ARRAY) { gl4metalSetError(target == GL_TEXTURE_3D ? GL_INVALID_OPERATION : GL_INVALID_ENUM); return; }
+	TextureObject *textureObject = boundTexture(target);
+	if (!textureObject || !textureObject->texture || textureObject->texture.textureType != MTLTextureType2DArray) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	CompressedFormatInfo info;
+	if (!compressedFormatInfo(format, info)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (format != textureObject->internalformat || textureObject->texture.pixelFormat != info.pixelFormat) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (level < 0 || (NSUInteger)level >= textureObject->texture.mipmapLevelCount || depth < 0 ||
+		zoffset < 0 || zoffset > textureObject->depth || depth > textureObject->depth - zoffset) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	const GLsizei levelWidth = std::max(1, textureObject->width >> level);
+	const GLsizei levelHeight = std::max(1, textureObject->height >> level);
+	if (!compressedSubRegionValid(xoffset, yoffset, width, height, levelWidth, levelHeight, info)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (width == 0 || height == 0 || depth == 0) return;
+	NSUInteger rowBytes = 0, blockRows = 0;
+	size_t imageBytes = 0;
+	if (!compressedImageLayout(width, height, info, rowBytes, blockRows, imageBytes) || imageBytes > SIZE_MAX / (size_t)depth || (size_t)imageSize != imageBytes * (size_t)depth) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	const uint8_t *source = resolveUnpackPointer(data, 0, (size_t)imageSize, "glCompressedTexSubImage3D");
+	if (!source) return;
+	if (!uploadCompressedSlices(*textureObject, level, (NSUInteger)zoffset, (NSUInteger)depth,
+		xoffset, yoffset, width, height, info, source, rowBytes)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
 }
 
 // MARK: - Texture parameters
 
+static bool validTextureMinFilter(GLint value) {
+	return value == GL_NEAREST || value == GL_LINEAR || value == GL_NEAREST_MIPMAP_NEAREST ||
+		value == GL_LINEAR_MIPMAP_NEAREST || value == GL_NEAREST_MIPMAP_LINEAR || value == GL_LINEAR_MIPMAP_LINEAR;
+}
+
+static bool validTextureMagFilter(GLint value) {
+	return value == GL_NEAREST || value == GL_LINEAR;
+}
+
+static bool validTextureWrap(GLint value) {
+	return value == GL_REPEAT || value == GL_CLAMP_TO_EDGE || value == GL_MIRRORED_REPEAT || value == GL_CLAMP_TO_BORDER;
+}
+
+static bool validTextureCompareFunc(GLint value) {
+	switch (value) {
+		case GL_NEVER: case GL_LESS: case GL_EQUAL: case GL_LEQUAL:
+		case GL_GREATER: case GL_NOTEQUAL: case GL_GEQUAL: case GL_ALWAYS: return true;
+		default: return false;
+	}
+}
+
+static bool validTextureSwizzle(GLint value) {
+	switch (value) {
+		case GL_RED: case GL_GREEN: case GL_BLUE: case GL_ALPHA: case GL_ZERO: case GL_ONE:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static GLint textureSwizzleComponentIndex(GLenum pname) {
+	switch (pname) {
+		case GL_TEXTURE_SWIZZLE_R: return 0;
+		case GL_TEXTURE_SWIZZLE_G: return 1;
+		case GL_TEXTURE_SWIZZLE_B: return 2;
+		case GL_TEXTURE_SWIZZLE_A: return 3;
+		default: return -1;
+	}
+}
+
+static bool setTextureSwizzle(TextureObject &texture, const GLint values[4]) {
+	for (int component = 0; component < 4; ++component) {
+		if (!validTextureSwizzle(values[component])) {
+			gl4metalSetError(GL_INVALID_ENUM);
+			return false;
+		}
+	}
+	bool changed = false;
+	for (int component = 0; component < 4; ++component) {
+		const GLenum value = (GLenum)values[component];
+		if (texture.swizzle[component] != value) changed = true;
+	}
+	if (!changed) return true;
+	for (int component = 0; component < 4; ++component) texture.swizzle[component] = (GLenum)values[component];
+	gl4metalInvalidateTextureSamplingViews(texture);
+	return true;
+}
+
+static bool setTextureSwizzleComponent(TextureObject &texture, GLenum pname, GLint value) {
+	const GLint component = textureSwizzleComponentIndex(pname);
+	if (component < 0) return false;
+	if (!validTextureSwizzle(value)) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return true;
+	}
+	if (texture.swizzle[component] != (GLenum)value) {
+		texture.swizzle[component] = (GLenum)value;
+		gl4metalInvalidateTextureSamplingViews(texture);
+	}
+	return true;
+}
+
+static bool textureSwizzleFloatToInt(GLfloat value, GLint &converted) {
+	const double wideValue = (double)value;
+	if (!std::isfinite(value) || wideValue < (double)std::numeric_limits<GLint>::min() ||
+		wideValue > (double)std::numeric_limits<GLint>::max()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return false;
+	}
+	converted = (GLint)value;
+	return true;
+}
+
+static bool validTextureParameterTarget(GLenum target) {
+	switch (target) {
+		case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D:
+		case GL_TEXTURE_1D_ARRAY: case GL_TEXTURE_2D_ARRAY:
+		case GL_TEXTURE_RECTANGLE: case GL_TEXTURE_CUBE_MAP:
+		case GL_TEXTURE_BUFFER: case GL_TEXTURE_CUBE_MAP_ARRAY:
+		case GL_TEXTURE_2D_MULTISAMPLE: case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+			return true;
+		default: return false;
+	}
+}
+
+static GLint textureParameterFloatToInt(GLfloat value) {
+	if (std::isnan(value)) return 0;
+	if (value >= (GLfloat)std::numeric_limits<GLint>::max()) return std::numeric_limits<GLint>::max();
+	if (value <= (GLfloat)std::numeric_limits<GLint>::min()) return std::numeric_limits<GLint>::min();
+	return (GLint)value;
+}
+
+static GLint textureParameterQueryInt(GLfloat value) {
+	return textureParameterFloatToInt(value);
+}
+
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
-	TextureObject *t = boundTexture(target);
-	if (!t) {
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *texture = boundTexture(target);
+	if (!texture) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexParameterf: no texture bound to target 0x%X", target);
 		return;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_LOD:           t->min_lod = param; break;
-		case GL_TEXTURE_MAX_LOD:           t->max_lod = param; break;
-		case GL_TEXTURE_LOD_BIAS:          t->lod_bias = param; break;
-		case GL_TEXTURE_MAX_ANISOTROPY_EXT: t->max_anisotropy = std::max(param, 1.0f); break;
+		case GL_TEXTURE_MIN_LOD:
+		case GL_TEXTURE_MAX_LOD:
+		case GL_TEXTURE_LOD_BIAS:
+			if (!std::isfinite(param)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+			if (pname == GL_TEXTURE_MIN_LOD) texture->min_lod = param;
+			else if (pname == GL_TEXTURE_MAX_LOD) texture->max_lod = param;
+			else texture->lod_bias = param;
+			return;
+		case GL_TEXTURE_MAX_ANISOTROPY_EXT:
+			if (!std::isfinite(param)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+			texture->max_anisotropy = std::min(std::max(param, 1.0f), 16.0f);
+			return;
 		default:
-			glTexParameteri(target, pname, (GLint)param); // enum-valued parameters passed as float
-			break;
+			if (!std::isfinite(param) || (double)param > (double)std::numeric_limits<GLint>::max() ||
+				(double)param < (double)std::numeric_limits<GLint>::min()) {
+				gl4metalSetError(GL_INVALID_VALUE);
+				return;
+			}
+			glTexParameteri(target, pname, (GLint)param);
+			return;
 	}
 }
 
 void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *texture = boundTexture(target);
+	if (!texture) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
+		GLint converted[4];
+		for (int component = 0; component < 4; ++component) {
+			if (!textureSwizzleFloatToInt(params[component], converted[component])) return;
+		}
+		setTextureSwizzle(*texture, converted);
+		return;
+	}
 	if (pname == GL_TEXTURE_BORDER_COLOR) {
-		return; // clamp-to-border colours are not available, see addressMode in draw.mm
+		const bool transparentBlack = params[0] == 0.0f && params[1] == 0.0f && params[2] == 0.0f && params[3] == 0.0f;
+		const bool opaqueBlack = params[0] == 0.0f && params[1] == 0.0f && params[2] == 0.0f && params[3] == 1.0f;
+		const bool opaqueWhite = params[0] == 1.0f && params[1] == 1.0f && params[2] == 1.0f && params[3] == 1.0f;
+		if (!transparentBlack && !opaqueBlack && !opaqueWhite) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glTexParameterfv: Metal supports transparent-black, opaque-black and opaque-white border colours only");
+			return;
+		}
+		for (int component = 0; component < 4; ++component) texture->border_color[component] = params[component];
+		return;
 	}
 	glTexParameterf(target, pname, params[0]);
 }
 
 void glTexParameteri(GLenum target, GLenum pname, GLint param) {
-	TextureObject *t = boundTexture(target);
-	if (!t) {
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *texture = boundTexture(target);
+	if (!texture) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glTexParameteri: no texture bound to target 0x%X", target);
 		return;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_FILTER:   t->min_filter = (GLenum)param; break;
-		case GL_TEXTURE_MAG_FILTER:   t->mag_filter = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_S:       t->wrap_s = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_T:       t->wrap_t = (GLenum)param; break;
-		case GL_TEXTURE_WRAP_R:       t->wrap_r = (GLenum)param; break;
-		case GL_TEXTURE_BASE_LEVEL:   t->base_level = param; break;
-		case GL_TEXTURE_MAX_LEVEL:    t->max_level = param; break;
-		case GL_TEXTURE_COMPARE_MODE: t->compare_mode = (GLenum)param; break;
-		case GL_TEXTURE_COMPARE_FUNC: t->compare_func = (GLenum)param; break;
+		case GL_TEXTURE_SWIZZLE_R:
+		case GL_TEXTURE_SWIZZLE_G:
+		case GL_TEXTURE_SWIZZLE_B:
+		case GL_TEXTURE_SWIZZLE_A:
+			setTextureSwizzleComponent(*texture, pname, param);
+			return;
+		case GL_TEXTURE_MIN_FILTER:
+			if (!validTextureMinFilter(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->min_filter = (GLenum)param; break;
+		case GL_TEXTURE_MAG_FILTER:
+			if (!validTextureMagFilter(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->mag_filter = (GLenum)param; break;
+		case GL_TEXTURE_WRAP_S:
+			if (!validTextureWrap(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->wrap_s = (GLenum)param; break;
+		case GL_TEXTURE_WRAP_T:
+			if (!validTextureWrap(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->wrap_t = (GLenum)param; break;
+		case GL_TEXTURE_WRAP_R:
+			if (!validTextureWrap(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->wrap_r = (GLenum)param; break;
+		case GL_TEXTURE_BASE_LEVEL:
+			if (param < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+			texture->base_level = param; break;
+		case GL_TEXTURE_MAX_LEVEL:
+			if (param < 0) { gl4metalSetError(GL_INVALID_VALUE); return; }
+			texture->max_level = param; break;
+		case GL_TEXTURE_COMPARE_MODE:
+			if (param != GL_NONE && param != GL_COMPARE_REF_TO_TEXTURE) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->compare_mode = (GLenum)param; break;
+		case GL_TEXTURE_COMPARE_FUNC:
+			if (!validTextureCompareFunc(param)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			texture->compare_func = (GLenum)param; break;
 		case GL_TEXTURE_MIN_LOD:
 		case GL_TEXTURE_MAX_LOD:
 		case GL_TEXTURE_LOD_BIAS:
@@ -2004,8 +3467,30 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
 }
 
 void glTexParameteriv(GLenum target, GLenum pname, const GLint *params) {
-	if (pname == GL_TEXTURE_BORDER_COLOR || pname == GL_TEXTURE_SWIZZLE_RGBA) {
-		return; // border colours and swizzles are not supported yet
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *texture = boundTexture(target);
+	if (!texture) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (pname == GL_TEXTURE_BORDER_COLOR) {
+		const bool transparentBlack = params[0] == 0 && params[1] == 0 && params[2] == 0 && params[3] == 0;
+		const bool opaqueBlack = params[0] == 0 && params[1] == 0 && params[2] == 0 && params[3] == 1;
+		const bool opaqueWhite = params[0] == 1 && params[1] == 1 && params[2] == 1 && params[3] == 1;
+		if (!transparentBlack && !opaqueBlack && !opaqueWhite) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+		for (int component = 0; component < 4; ++component) texture->border_color[component] = (GLfloat)params[component];
+		return;
+	}
+	if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
+		setTextureSwizzle(*texture, params);
+		return;
+	}
+	if (pname == GL_TEXTURE_SWIZZLE_R || pname == GL_TEXTURE_SWIZZLE_G ||
+		pname == GL_TEXTURE_SWIZZLE_B || pname == GL_TEXTURE_SWIZZLE_A) {
+		setTextureSwizzleComponent(*texture, pname, params[0]);
+		return;
 	}
 	glTexParameteri(target, pname, params[0]);
 }
@@ -2015,7 +3500,39 @@ void glTexParameterIiv(GLenum target, GLenum pname, const GLint *params) {
 }
 
 void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint *params) {
-	glTexParameteriv(target, pname, (const GLint *)params);
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (!boundTexture(target)) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
+		GLint converted[4];
+		for (int component = 0; component < 4; ++component) {
+			if (params[component] > (GLuint)std::numeric_limits<GLint>::max()) { gl4metalSetError(GL_INVALID_ENUM); return; }
+			converted[component] = (GLint)params[component];
+		}
+		glTexParameteriv(target, pname, converted);
+		return;
+	}
+	if (pname == GL_TEXTURE_SWIZZLE_R || pname == GL_TEXTURE_SWIZZLE_G ||
+		pname == GL_TEXTURE_SWIZZLE_B || pname == GL_TEXTURE_SWIZZLE_A) {
+		if (params[0] > (GLuint)std::numeric_limits<GLint>::max()) { gl4metalSetError(GL_INVALID_ENUM); return; }
+		glTexParameteri(target, pname, (GLint)params[0]);
+		return;
+	}
+	if (pname == GL_TEXTURE_BORDER_COLOR) {
+		const bool transparentBlack = params[0] == 0u && params[1] == 0u && params[2] == 0u && params[3] == 0u;
+		const bool opaqueBlack = params[0] == 0u && params[1] == 0u && params[2] == 0u && params[3] == 1u;
+		const bool opaqueWhite = params[0] == 1u && params[1] == 1u && params[2] == 1u && params[3] == 1u;
+		if (!transparentBlack && !opaqueBlack && !opaqueWhite) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+		GLint converted[4] = {(GLint)params[0], (GLint)params[1], (GLint)params[2], (GLint)params[3]};
+		glTexParameteriv(target, pname, converted);
+		return;
+	}
+	if (params[0] > (GLuint)std::numeric_limits<GLint>::max()) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	glTexParameteri(target, pname, (GLint)params[0]);
 }
 
 // MARK: - Texture queries
@@ -2024,10 +3541,13 @@ namespace {
 
 static bool getTexImageBytesPerPixel(MTLPixelFormat format, NSUInteger &bytesPerPixel) {
 	switch (format) {
-		case MTLPixelFormatR8Unorm: bytesPerPixel = 1; return true;
-		case MTLPixelFormatRG8Unorm: bytesPerPixel = 2; return true;
+		case MTLPixelFormatR8Unorm:
+		case MTLPixelFormatR8Snorm: bytesPerPixel = 1; return true;
+		case MTLPixelFormatRG8Unorm:
+		case MTLPixelFormatRG8Snorm: bytesPerPixel = 2; return true;
 		case MTLPixelFormatRGBA8Unorm:
 		case MTLPixelFormatRGBA8Unorm_sRGB:
+		case MTLPixelFormatRGBA8Snorm:
 		case MTLPixelFormatBGRA8Unorm:
 		case MTLPixelFormatRGB10A2Unorm:
 		case MTLPixelFormatRG11B10Float:
@@ -2035,11 +3555,14 @@ static bool getTexImageBytesPerPixel(MTLPixelFormat format, NSUInteger &bytesPer
 		case MTLPixelFormatA1BGR5Unorm:
 			bytesPerPixel = 2; return true;
 		case MTLPixelFormatR16Unorm:
+		case MTLPixelFormatR16Snorm:
 		case MTLPixelFormatR16Float:
 		case MTLPixelFormatDepth16Unorm: bytesPerPixel = 2; return true;
 		case MTLPixelFormatRG16Unorm:
+		case MTLPixelFormatRG16Snorm:
 		case MTLPixelFormatRG16Float: bytesPerPixel = 4; return true;
 		case MTLPixelFormatRGBA16Unorm:
+		case MTLPixelFormatRGBA16Snorm:
 		case MTLPixelFormatRGBA16Float: bytesPerPixel = 8; return true;
 		case MTLPixelFormatR32Float:
 		case MTLPixelFormatDepth32Float: bytesPerPixel = 4; return true;
@@ -2054,6 +3577,8 @@ static bool readTextureLevel(id<MTLTexture> texture, GLint level, NSUInteger sli
 						 NSUInteger width, NSUInteger height, NSUInteger bytesPerPixel,
 						 MTLBlitOption blitOptions, std::vector<uint8_t> &out) {
 	if (!texture || width == 0 || height == 0 || bytesPerPixel == 0) return false;
+	const bool is1D = texture.textureType == MTLTextureType1D;
+	if (is1D && height != 1) return false;
 	if (width > SIZE_MAX / bytesPerPixel) return false;
 	const NSUInteger rowBytes = width * bytesPerPixel;
 	if (height > SIZE_MAX / rowBytes) return false;
@@ -2070,8 +3595,12 @@ static bool readTextureLevel(id<MTLTexture> texture, GLint level, NSUInteger sli
 	flushCommandBuffer(true);
 	// MTLStorageModeManaged does not available on iOS
 	if (texture.storageMode == MTLStorageModeShared) {
-		[texture getBytes:out.data() bytesPerRow:rowBytes bytesPerImage:0
-			fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:(NSUInteger)level slice:slice];
+		if (is1D) {
+			[texture getBytes:out.data() bytesPerRow:0 fromRegion:MTLRegionMake1D(0, width) mipmapLevel:(NSUInteger)level];
+		} else {
+			[texture getBytes:out.data() bytesPerRow:rowBytes bytesPerImage:0
+				fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:(NSUInteger)level slice:slice];
+		}
 		return true;
 	}
 
@@ -2085,23 +3614,40 @@ static bool readTextureLevel(id<MTLTexture> texture, GLint level, NSUInteger sli
 		GL4METAL_LOG("glGetTexImage: private texture readback exceeds maxBufferLength (%lu bytes)", (unsigned long)stagingBytes);
 		return false;
 	}
-	id<MTLBuffer> staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
-	if (!staging) return false;
-	id<MTLCommandQueue> queue = ctx.commandQueue;
-	id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-	if (!commandBuffer || !blit) return false;
-	[blit copyFromTexture:texture sourceSlice:slice sourceLevel:(NSUInteger)level
-		sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
-		toBuffer:staging destinationOffset:0 destinationBytesPerRow:stagingRowBytes
-		destinationBytesPerImage:0 options:blitOptions];
-	[blit endEncoding];
-	[commandBuffer commit];
-	[commandBuffer waitUntilCompleted];
-	if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
-		GL4METAL_LOG("glGetTexImage: private texture blit readback failed: %s",
-			commandBuffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
-		return false;
+	id<MTLBuffer> staging = nil;
+	bool readbackCompleted = false;
+
+	if (ctx.metal4Enabled) {
+		staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		if (staging && gl4metalMetal4CopyTextureToBuffer(texture, slice, (NSUInteger)level,
+				MTLOriginMake(0, 0, 0), MTLSizeMake(width, height, 1), staging, 0, stagingRowBytes, 0, blitOptions)) {
+			flushCommandBuffer(true);
+			readbackCompleted = ctx.metal4LastComputeEventValue == 0 ||
+				(ctx.metal4InteropEvent && ctx.metal4InteropEvent.signaledValue >= ctx.metal4LastComputeEventValue);
+		}
+	}
+
+	if (!readbackCompleted) {
+		// Reuse an MTL4 staging allocation if its command was only partially encoded.
+		flushCommandBuffer(true);
+		if (!staging) staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		if (!staging) return false;
+		id<MTLCommandQueue> queue = ctx.commandQueue;
+		id<MTLCommandBuffer> commandBuffer = queue ? [queue commandBuffer] : nil;
+		id<MTLBlitCommandEncoder> blit = commandBuffer ? [commandBuffer blitCommandEncoder] : nil;
+		if (!commandBuffer || !blit) return false;
+		[blit copyFromTexture:texture sourceSlice:slice sourceLevel:(NSUInteger)level
+			sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+			toBuffer:staging destinationOffset:0 destinationBytesPerRow:stagingRowBytes
+			destinationBytesPerImage:0 options:blitOptions];
+		[blit endEncoding];
+		[commandBuffer commit];
+		[commandBuffer waitUntilCompleted];
+		if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+			GL4METAL_LOG("glGetTexImage: private texture blit readback failed: %s",
+				commandBuffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
+			return false;
+		}
 	}
 	const uint8_t *src = (const uint8_t *)staging.contents;
 	for (NSUInteger y = 0; y < height; ++y) {
@@ -2150,29 +3696,139 @@ static bool readTextureLevel3D(id<MTLTexture> texture, GLint level,
 		GL4METAL_LOG("glGetTexImage: private 3D readback exceeds maxBufferLength (%lu bytes)", (unsigned long)stagingBytes);
 		return false;
 	}
-	id<MTLBuffer> staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
-	if (!staging) return false;
-	id<MTLCommandQueue> queue = ctx.commandQueue;
-	id<MTLCommandBuffer> commandBuffer = queue ? [queue commandBuffer] : nil;
-	id<MTLBlitCommandEncoder> blit = commandBuffer ? [commandBuffer blitCommandEncoder] : nil;
-	if (!commandBuffer || !blit) return false;
-	[blit copyFromTexture:texture sourceSlice:0 sourceLevel:(NSUInteger)level
-		sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, depth)
-		toBuffer:staging destinationOffset:0 destinationBytesPerRow:stagingRowBytes
-		destinationBytesPerImage:stagingImageBytes options:blitOptions];
-	[blit endEncoding];
-	[commandBuffer commit];
-	[commandBuffer waitUntilCompleted];
-	if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
-		GL4METAL_LOG("glGetTexImage: private 3D blit readback failed: %s",
-			commandBuffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
-		return false;
+	id<MTLBuffer> staging = nil;
+	bool readbackCompleted = false;
+
+	if (ctx.metal4Enabled) {
+		staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		if (staging && gl4metalMetal4CopyTextureToBuffer(texture, 0, (NSUInteger)level,
+				MTLOriginMake(0, 0, 0), MTLSizeMake(width, height, depth), staging, 0,
+				stagingRowBytes, stagingImageBytes, blitOptions)) {
+			flushCommandBuffer(true);
+			readbackCompleted = ctx.metal4LastComputeEventValue == 0 ||
+				(ctx.metal4InteropEvent && ctx.metal4InteropEvent.signaledValue >= ctx.metal4LastComputeEventValue);
+		}
+	}
+
+	if (!readbackCompleted) {
+		flushCommandBuffer(true);
+		if (!staging) staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		if (!staging) return false;
+		id<MTLCommandQueue> queue = ctx.commandQueue;
+		id<MTLCommandBuffer> commandBuffer = queue ? [queue commandBuffer] : nil;
+		id<MTLBlitCommandEncoder> blit = commandBuffer ? [commandBuffer blitCommandEncoder] : nil;
+		if (!commandBuffer || !blit) return false;
+		[blit copyFromTexture:texture sourceSlice:0 sourceLevel:(NSUInteger)level
+			sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, depth)
+			toBuffer:staging destinationOffset:0 destinationBytesPerRow:stagingRowBytes
+			destinationBytesPerImage:stagingImageBytes options:blitOptions];
+		[blit endEncoding];
+		[commandBuffer commit];
+		[commandBuffer waitUntilCompleted];
+		if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+			GL4METAL_LOG("glGetTexImage: private 3D blit readback failed: %s",
+				commandBuffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
+			return false;
+		}
 	}
 	const uint8_t *source = (const uint8_t *)staging.contents;
 	for (NSUInteger image = 0; image < depth; ++image) {
 		for (NSUInteger row = 0; row < height; ++row) {
 			memcpy(out.data() + image * imageBytes + row * rowBytes,
 				source + image * stagingImageBytes + row * stagingRowBytes, rowBytes);
+		}
+	}
+	return true;
+}
+
+// Read a 2D-array mip as a tightly packed sequence of images.  Unlike a 3D
+// texture, each array layer is an independent 2D slice, so the Metal blit API
+// must be issued once per slice.  The shared-buffer path still uses one
+// allocation and one command buffer for the entire array.
+static bool readTextureLevelArray(id<MTLTexture> texture, GLint level,
+							  NSUInteger width, NSUInteger height, NSUInteger layers,
+							  NSUInteger bytesPerPixel, MTLBlitOption blitOptions,
+							  std::vector<uint8_t> &out) {
+	if (!texture || texture.textureType != MTLTextureType2DArray || width == 0 || height == 0 ||
+		layers == 0 || bytesPerPixel == 0 || width > SIZE_MAX / bytesPerPixel) return false;
+	const NSUInteger rowBytes = width * bytesPerPixel;
+	if (height > SIZE_MAX / rowBytes) return false;
+	const NSUInteger imageBytes = rowBytes * height;
+	if (layers > SIZE_MAX / imageBytes) return false;
+	const NSUInteger totalBytes = imageBytes * layers;
+	try { out.resize((size_t)totalBytes); }
+	catch (const std::bad_alloc &) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("glGetTexImage: array CPU readback allocation failed (%lu bytes)", (unsigned long)totalBytes);
+		return false;
+	}
+
+	flushCommandBuffer(true);
+	if (texture.storageMode == MTLStorageModeShared) {
+		for (NSUInteger layer = 0; layer < layers; ++layer) {
+			[texture getBytes:out.data() + layer * imageBytes bytesPerRow:rowBytes bytesPerImage:0
+				fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:(NSUInteger)level slice:layer];
+		}
+		return true;
+	}
+
+	const NSUInteger alignment = 256;
+	if (rowBytes > SIZE_MAX - (alignment - 1)) return false;
+	const NSUInteger stagingRowBytes = (rowBytes + alignment - 1) & ~(alignment - 1);
+	if (height > SIZE_MAX / stagingRowBytes) return false;
+	const NSUInteger stagingImageBytes = stagingRowBytes * height;
+	if (layers > SIZE_MAX / stagingImageBytes) return false;
+	const NSUInteger stagingBytes = stagingImageBytes * layers;
+	if (stagingBytes == 0 || stagingBytes > texture.device.maxBufferLength) return false;
+	id<MTLBuffer> staging = nil;
+	bool metal4ReadbackSucceeded = false;
+
+	if (ctx.metal4Enabled) {
+		staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		metal4ReadbackSucceeded = staging != nil;
+		for (NSUInteger layer = 0; metal4ReadbackSucceeded && layer < layers; ++layer) {
+			if (!gl4metalMetal4CopyTextureToBuffer(texture, layer, (NSUInteger)level,
+					MTLOriginMake(0, 0, 0), MTLSizeMake(width, height, 1), staging,
+					layer * stagingImageBytes, stagingRowBytes, 0, blitOptions)) {
+				metal4ReadbackSucceeded = false;
+			}
+		}
+		if (metal4ReadbackSucceeded) {
+			flushCommandBuffer(true);
+			metal4ReadbackSucceeded = ctx.metal4LastComputeEventValue == 0 ||
+				(ctx.metal4InteropEvent && ctx.metal4InteropEvent.signaledValue >= ctx.metal4LastComputeEventValue);
+		}
+	}
+
+	if (!metal4ReadbackSucceeded) {
+		// Complete any partially encoded MTL4 copies before submitting classic work.
+		flushCommandBuffer(true);
+		if (!staging) staging = [texture.device newBufferWithLength:stagingBytes options:MTLResourceStorageModeShared];
+		if (!staging) return false;
+		id<MTLCommandQueue> queue = ctx.commandQueue;
+		id<MTLCommandBuffer> commandBuffer = queue ? [queue commandBuffer] : nil;
+		id<MTLBlitCommandEncoder> blit = commandBuffer ? [commandBuffer blitCommandEncoder] : nil;
+		if (!commandBuffer || !blit) return false;
+		for (NSUInteger layer = 0; layer < layers; ++layer) {
+			[blit copyFromTexture:texture sourceSlice:layer sourceLevel:(NSUInteger)level
+				sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+				toBuffer:staging destinationOffset:layer * stagingImageBytes
+				destinationBytesPerRow:stagingRowBytes destinationBytesPerImage:0 options:blitOptions];
+		}
+		[blit endEncoding];
+		[commandBuffer commit];
+		[commandBuffer waitUntilCompleted];
+		if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+			GL4METAL_LOG("glGetTexImage: private array blit readback failed: %s",
+				commandBuffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
+			return false;
+		}
+	}
+	const uint8_t *source = (const uint8_t *)staging.contents;
+	for (NSUInteger layer = 0; layer < layers; ++layer) {
+		for (NSUInteger row = 0; row < height; ++row) {
+			memcpy(out.data() + layer * imageBytes + row * rowBytes,
+				source + layer * stagingImageBytes + row * stagingRowBytes, rowBytes);
 		}
 	}
 	return true;
@@ -2243,10 +3899,22 @@ static bool decodeTexturePixel(MTLPixelFormat format, const uint8_t *src, float 
 			return true;
 		}
 		case MTLPixelFormatRG8Unorm: rgba[0] = unorm8(src[0]); rgba[1] = unorm8(src[1]); return true;
+		case MTLPixelFormatR8Snorm: rgba[0] = std::max(-1.0f, (float)*(const int8_t *)src / 127.0f); return true;
+		case MTLPixelFormatRG8Snorm: {
+			const int8_t *values = (const int8_t *)src;
+			rgba[0] = std::max(-1.0f, (float)values[0] / 127.0f);
+			rgba[1] = std::max(-1.0f, (float)values[1] / 127.0f);
+			return true;
+		}
 		case MTLPixelFormatRGBA8Unorm:
 		case MTLPixelFormatRGBA8Unorm_sRGB:
 			for (int i = 0; i < 4; ++i) rgba[i] = unorm8(src[i]);
 			return true;
+		case MTLPixelFormatRGBA8Snorm: {
+			const int8_t *values = (const int8_t *)src;
+			for (int i = 0; i < 4; ++i) rgba[i] = std::max(-1.0f, (float)values[i] / 127.0f);
+			return true;
+		}
 		case MTLPixelFormatBGRA8Unorm:
 			rgba[0] = unorm8(src[2]); rgba[1] = unorm8(src[1]); rgba[2] = unorm8(src[0]); rgba[3] = unorm8(src[3]);
 			return true;
@@ -2254,11 +3922,25 @@ static bool decodeTexturePixel(MTLPixelFormat format, const uint8_t *src, float 
 		case MTLPixelFormatDepth16Unorm: {
 			uint16_t v; memcpy(&v, src, sizeof(v)); rgba[0] = unorm16(v); return true;
 		}
+		case MTLPixelFormatR16Snorm: {
+			int16_t v; memcpy(&v, src, sizeof(v)); rgba[0] = std::max(-1.0f, (float)v / 32767.0f); return true;
+		}
 		case MTLPixelFormatRG16Unorm: {
 			uint16_t v[2]; memcpy(v, src, sizeof(v)); rgba[0] = unorm16(v[0]); rgba[1] = unorm16(v[1]); return true;
 		}
+		case MTLPixelFormatRG16Snorm: {
+			int16_t v[2]; memcpy(v, src, sizeof(v));
+			rgba[0] = std::max(-1.0f, (float)v[0] / 32767.0f);
+			rgba[1] = std::max(-1.0f, (float)v[1] / 32767.0f);
+			return true;
+		}
 		case MTLPixelFormatRGBA16Unorm: {
 			uint16_t v[4]; memcpy(v, src, sizeof(v)); for (int i = 0; i < 4; ++i) rgba[i] = unorm16(v[i]); return true;
+		}
+		case MTLPixelFormatRGBA16Snorm: {
+			int16_t v[4]; memcpy(v, src, sizeof(v));
+			for (int i = 0; i < 4; ++i) rgba[i] = std::max(-1.0f, (float)v[i] / 32767.0f);
+			return true;
 		}
 		case MTLPixelFormatR16Float: {
 			uint16_t v; memcpy(&v, src, sizeof(v)); rgba[0] = halfToFloat(v); return true;
@@ -2760,13 +4442,17 @@ static bool clearTextureRegion(TextureObject &textureObject, GLint level,
 		return false;
 	}
 	const GLint levelWidth = (GLint)std::max<NSUInteger>(1, texture.width >> level);
-	const GLint levelHeight = (GLint)std::max<NSUInteger>(1, texture.height >> level);
+	GLint levelHeight = (GLint)std::max<NSUInteger>(1, texture.height >> level);
 	GLint levelDepth = 1;
+	const bool is1D = texture.textureType == MTLTextureType1D;
 	const bool is3D = texture.textureType == MTLTextureType3D;
+	const bool isArray = texture.textureType == MTLTextureType2DArray;
 	const bool isCube = texture.textureType == MTLTextureTypeCube;
+	if (is1D) levelHeight = 1;
 	if (is3D) levelDepth = (GLint)std::max<NSUInteger>(1, texture.depth >> level);
+	else if (isArray) levelDepth = (GLint)texture.arrayLength;
 	else if (isCube) levelDepth = 6;
-	else if (texture.textureType != MTLTextureType2D) {
+	else if (!is1D && texture.textureType != MTLTextureType2D) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: texture type %lu is not supported by the clear path", caller, (unsigned long)texture.textureType);
 		return false;
@@ -2829,7 +4515,7 @@ static bool clearTextureRegion(TextureObject &textureObject, GLint level,
 	for (GLsizei column = 0; column < width; ++column)
 		memcpy(row.data() + (size_t)column * bytesPerPixel, clearPixel, bytesPerPixel);
 
-	if (is3D) {
+	if (is3D || isArray) {
 		// Chunk by z so even a maximum-size volume doesn't require one staging buffer
 		// larger than Metal's per-buffer limit. Each chunk remains ordered on the GL queue.
 		size_t alignedRow = 0, imageBytes = 0;
@@ -2844,7 +4530,8 @@ static bool clearTextureRegion(TextureObject &textureObject, GLint level,
 			if (!enqueueTextureUpload3D(texture, level, x, y, z + done, width, height, chunkDepth,
 				row.data(), 0, 0, rowBytes)) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
-				GL4METAL_LOG("%s: failed to stage 3D clear at z=%d depth=%d", caller, z + done, chunkDepth);
+				GL4METAL_LOG("%s: failed to stage %s clear at slice/depth=%d count=%d",
+					caller, isArray ? "array" : "3D", z + done, chunkDepth);
 				return false;
 			}
 			done += chunkDepth;
@@ -2886,10 +4573,12 @@ void gl4metalClearTexImageImpl(GLuint texture, GLint level, GLenum format, GLenu
 		return;
 	}
 	const bool is3D = object.texture.textureType == MTLTextureType3D;
+	const bool isArray = object.texture.textureType == MTLTextureType2DArray;
 	const bool isCube = object.texture.textureType == MTLTextureTypeCube;
 	const GLsizei width = (GLsizei)std::max<NSUInteger>(1, object.texture.width >> level);
 	const GLsizei height = (GLsizei)std::max<NSUInteger>(1, object.texture.height >> level);
-	const GLsizei depth = is3D ? (GLsizei)std::max<NSUInteger>(1, object.texture.depth >> level) : (isCube ? 6 : 1);
+	const GLsizei depth = is3D ? (GLsizei)std::max<NSUInteger>(1, object.texture.depth >> level)
+		: (isArray ? (GLsizei)object.texture.arrayLength : (isCube ? 6 : 1));
 	clearTextureRegion(object, level, 0, 0, 0, width, height, depth, format, type, data, "glClearTexImage");
 }
 
@@ -2912,14 +4601,16 @@ void gl4metalClearTexSubImageImpl(GLuint texture, GLint level, GLint xoffset, GL
 
 void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void *pixels) {
 	const int face = cubeFace(target);
+	const bool is1D = target == GL_TEXTURE_1D;
 	const bool is2D = target == GL_TEXTURE_2D;
 	const bool is3D = target == GL_TEXTURE_3D;
-	if (!is2D && !is3D && face < 0) {
+	const bool isArray = target == GL_TEXTURE_2D_ARRAY;
+	if (!is1D && !is2D && !is3D && !isArray && face < 0) {
 		gl4metalSetError(GL_INVALID_ENUM);
-		GL4METAL_LOG("glGetTexImage: unsupported target 0x%X (use GL_TEXTURE_2D, GL_TEXTURE_3D or a cube-map face)", target);
+		GL4METAL_LOG("glGetTexImage: unsupported target 0x%X", target);
 		return;
 	}
-	TextureObject *tex = boundTexture(is2D || is3D ? target : GL_TEXTURE_CUBE_MAP);
+	TextureObject *tex = boundTexture(is1D || is2D || is3D || isArray ? target : GL_TEXTURE_CUBE_MAP);
 	if (!tex) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glGetTexImage: no texture bound for target 0x%X", target);
@@ -2934,14 +4625,25 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 		GL4METAL_LOG("glGetTexImage: texture image at level %d is not allocated", level);
 		return;
 	}
+	if (is1D && tex->texture.textureType != MTLTextureType1D) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetTexImage: GL_TEXTURE_1D is not backed by a 1D Metal texture");
+		return;
+	}
 	if (is3D && tex->texture.textureType != MTLTextureType3D) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glGetTexImage: GL_TEXTURE_3D is not backed by a 3D Metal texture");
 		return;
 	}
+	if (isArray && tex->texture.textureType != MTLTextureType2DArray) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetTexImage: GL_TEXTURE_2D_ARRAY is not backed by a 2D-array Metal texture");
+		return;
+	}
 	const NSUInteger width = std::max<NSUInteger>(1, (NSUInteger)tex->width >> level);
-	const NSUInteger height = std::max<NSUInteger>(1, (NSUInteger)tex->height >> level);
-	const NSUInteger depth = is3D ? std::max<NSUInteger>(1, (NSUInteger)tex->depth >> level) : 1;
+	const NSUInteger height = is1D ? 1 : std::max<NSUInteger>(1, (NSUInteger)tex->height >> level);
+	const NSUInteger depth = is3D ? std::max<NSUInteger>(1, (NSUInteger)tex->depth >> level)
+		: (isArray ? tex->texture.arrayLength : 1);
 	const MTLPixelFormat mtlFormat = tex->texture.pixelFormat;
 	const bool depthFormat = isDepthStencilFormat(mtlFormat);
 
@@ -3018,13 +4720,13 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 	}
 
 	size_t rowStride = 0, imageStride = 0, startOffset = 0, requiredBytes = 0;
-	if (is3D) {
+	if (is3D || isArray) {
 		if (!checkedImageSize3D((size_t)width, (size_t)height, (size_t)depth, outputPixelBytes,
 			(size_t)ctx.pack_row_length, (size_t)ctx.pack_image_height, ctx.pack_alignment,
 			ctx.pack_skip_pixels, ctx.pack_skip_rows, ctx.pack_skip_images,
 			rowStride, imageStride, startOffset, requiredBytes)) {
 			gl4metalSetError(GL_INVALID_VALUE);
-			GL4METAL_LOG("glGetTexImage: 3D pixel-pack layout overflows addressable memory");
+		GL4METAL_LOG("glGetTexImage: 3D/array pixel-pack layout overflows addressable memory");
 			return;
 		}
 	} else {
@@ -3057,8 +4759,10 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 		? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;
 	const bool readSucceeded = is3D
 		? readTextureLevel3D(tex->texture, level, width, height, depth, sourceBytesPerPixel, readbackOptions, source)
-		: readTextureLevel(tex->texture, level, face >= 0 ? (NSUInteger)face : 0,
-			width, height, sourceBytesPerPixel, readbackOptions, source);
+		: (isArray
+			? readTextureLevelArray(tex->texture, level, width, height, depth, sourceBytesPerPixel, readbackOptions, source)
+			: readTextureLevel(tex->texture, level, face >= 0 ? (NSUInteger)face : 0,
+				width, height, sourceBytesPerPixel, readbackOptions, source));
 	if (!readSucceeded) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glGetTexImage: failed to read MTLPixelFormat %d at level %d", (int)mtlFormat, level);
@@ -3100,21 +4804,115 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void 
 }
 
 void glGetCompressedTexImage(GLenum target, GLint level, void *img) {
-	gl4metalSetError(GL_INVALID_OPERATION);
-	GL4METAL_LOG("glGetCompressedTexImage: Unimplemented");
+	const int face = cubeFace(target);
+	const bool isArray = target == GL_TEXTURE_2D_ARRAY;
+	if (target != GL_TEXTURE_2D && !isArray && face < 0) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	TextureObject *textureObject = boundTexture(face >= 0 ? GL_TEXTURE_CUBE_MAP : target);
+	if (!textureObject || !textureObject->texture) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	CompressedFormatInfo info;
+	if (!compressedFormatInfo(textureObject->internalformat, info) || textureObject->texture.pixelFormat != info.pixelFormat) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetCompressedTexImage: bound texture does not contain a supported compressed image");
+		return;
+	}
+	if (level < 0 || (NSUInteger)level >= textureObject->texture.mipmapLevelCount) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
+	const NSUInteger width = std::max<NSUInteger>(1, (NSUInteger)textureObject->width >> level);
+	const NSUInteger height = std::max<NSUInteger>(1, (NSUInteger)textureObject->height >> level);
+	NSUInteger rowBytes = 0, blockRows = 0;
+	size_t imageBytes = 0;
+	if (!compressedImageLayout((GLsizei)width, (GLsizei)height, info, rowBytes, blockRows, imageBytes)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	const NSUInteger layerCount = isArray ? textureObject->texture.arrayLength : 1;
+	if (imageBytes > SIZE_MAX / layerCount) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	const size_t totalBytes = imageBytes * layerCount;
+	const GLuint packBuffer = boundBuffer(GL_PIXEL_PACK_BUFFER);
+	uint8_t *destination = (uint8_t *)img;
+	NSUInteger bufferOffset = 0;
+	id<MTLBuffer> packBufferObject = nil;
+	if (packBuffer != 0) {
+		auto bufferIt = ctx.buffer_objects.find(packBuffer);
+		if (bufferIt == ctx.buffer_objects.end() || !bufferIt->second || !bufferIt->second.contents) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			return;
+		}
+		packBufferObject = bufferIt->second;
+		bufferOffset = (NSUInteger)(uintptr_t)img;
+		const NSUInteger logicalLength = glBufferLogicalSize(packBuffer);
+		if (bufferOffset > logicalLength || totalBytes > logicalLength - bufferOffset) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("glGetCompressedTexImage: pixel-pack buffer range exceeds buffer storage");
+			return;
+		}
+		destination = (uint8_t *)packBufferObject.contents + bufferOffset;
+	} else if (!destination) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		return;
+	}
+	const NSUInteger firstSlice = face >= 0 ? (NSUInteger)face : 0;
+	if (!readbackCompressedSlices(textureObject->texture, level, firstSlice, layerCount,
+		(GLsizei)width, (GLsizei)height, info, destination, rowBytes)) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glGetCompressedTexImage: Metal blit readback failed");
+		return;
+	}
 }
 
 void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) { gl4metalSetError(GL_INVALID_ENUM); return; }
 	TextureObject *tex = boundTexture(target);
-	if (tex && pname == GL_TEXTURE_MIN_LOD)  { *params = tex->min_lod; return; }
-	if (tex && pname == GL_TEXTURE_MAX_LOD)  { *params = tex->max_lod; return; }
-	if (tex && pname == GL_TEXTURE_LOD_BIAS) { *params = tex->lod_bias; return; }
+	if (!tex) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+	if (pname == GL_TEXTURE_MIN_LOD)  { *params = tex->min_lod; return; }
+	if (pname == GL_TEXTURE_MAX_LOD)  { *params = tex->max_lod; return; }
+	if (pname == GL_TEXTURE_LOD_BIAS) { *params = tex->lod_bias; return; }
+	if (tex && pname == GL_TEXTURE_MAX_ANISOTROPY_EXT) { *params = tex->max_anisotropy; return; }
+	if (pname == GL_TEXTURE_BORDER_COLOR) { for (int component = 0; component < 4; ++component) params[component] = tex->border_color[component]; return; }
+	GLint swizzleValues[4] = {0, 0, 0, 0};
+	if (pname == GL_TEXTURE_SWIZZLE_RGBA || textureSwizzleComponentIndex(pname) >= 0) {
+		glGetTexParameteriv(target, pname, swizzleValues);
+		if (pname == GL_TEXTURE_SWIZZLE_RGBA) { for (int component = 0; component < 4; ++component) params[component] = (GLfloat)swizzleValues[component]; }
+		else params[0] = (GLfloat)swizzleValues[0];
+		return;
+	}
 	GLint value = 0;
 	glGetTexParameteriv(target, pname, &value);
 	*params = (GLfloat)value;
 }
 
 void glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); *params = 0; return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+		TextureObject *multisampleTexture = boundTexture(target);
+		if (!multisampleTexture) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			*params = 0;
+			return;
+		}
+		if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
+			*params = multisampleTexture && multisampleTexture->immutable_storage ? GL_TRUE : GL_FALSE;
+			return;
+		}
+		if (pname == GL_TEXTURE_IMMUTABLE_LEVELS) {
+			*params = multisampleTexture && multisampleTexture->immutable_storage ? 1 : 0;
+			return;
+		}
+		gl4metalSetError(GL_INVALID_ENUM);
+		*params = 0;
+		return;
+	}
 	TextureObject *tex = boundTexture(target);
 	if (!tex) {
 		gl4metalSetError(GL_INVALID_OPERATION);
@@ -3132,9 +4930,22 @@ void glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) {
 		case GL_TEXTURE_MAX_LEVEL:    *params = tex->max_level; break;
 		case GL_TEXTURE_COMPARE_MODE: *params = (GLint)tex->compare_mode; break;
 		case GL_TEXTURE_COMPARE_FUNC: *params = (GLint)tex->compare_func; break;
-		case GL_TEXTURE_MIN_LOD:      *params = (GLint)tex->min_lod; break;
-		case GL_TEXTURE_MAX_LOD:      *params = (GLint)tex->max_lod; break;
-		case GL_TEXTURE_LOD_BIAS:     *params = (GLint)tex->lod_bias; break;
+		case GL_TEXTURE_IMMUTABLE_FORMAT: *params = tex->immutable_storage ? GL_TRUE : GL_FALSE; break;
+		case GL_TEXTURE_IMMUTABLE_LEVELS: *params = tex->immutable_storage && tex->texture ? (GLint)tex->texture.mipmapLevelCount : 0; break;
+		case GL_TEXTURE_MIN_LOD:      *params = textureParameterQueryInt(tex->min_lod); break;
+		case GL_TEXTURE_MAX_LOD:      *params = textureParameterQueryInt(tex->max_lod); break;
+		case GL_TEXTURE_LOD_BIAS:     *params = textureParameterQueryInt(tex->lod_bias); break;
+		case GL_TEXTURE_MAX_ANISOTROPY_EXT: *params = textureParameterQueryInt(tex->max_anisotropy); break;
+		case GL_TEXTURE_BORDER_COLOR:
+			for (int component = 0; component < 4; ++component) params[component] = (GLint)tex->border_color[component];
+			break;
+		case GL_TEXTURE_SWIZZLE_RGBA:
+			for (int component = 0; component < 4; ++component) params[component] = (GLint)tex->swizzle[component];
+			break;
+		case GL_TEXTURE_SWIZZLE_R: *params = (GLint)tex->swizzle[0]; break;
+		case GL_TEXTURE_SWIZZLE_G: *params = (GLint)tex->swizzle[1]; break;
+		case GL_TEXTURE_SWIZZLE_B: *params = (GLint)tex->swizzle[2]; break;
+		case GL_TEXTURE_SWIZZLE_A: *params = (GLint)tex->swizzle[3]; break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetTexParameteriv: unhandled pname 0x%X", pname);
@@ -3148,10 +4959,28 @@ void glGetTexParameterIiv(GLenum target, GLenum pname, GLint *params) {
 }
 
 void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint *params) {
-	glGetTexParameteriv(target, pname, (GLint *)params);
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!validTextureParameterTarget(target)) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) { gl4metalSetError(GL_INVALID_ENUM); return; }
+	if (pname == GL_TEXTURE_BORDER_COLOR) {
+		TextureObject *texture = boundTexture(target);
+		if (!texture) { gl4metalSetError(GL_INVALID_OPERATION); return; }
+		for (int component = 0; component < 4; ++component) params[component] = (GLuint)std::max(texture->border_color[component], 0.0f);
+		return;
+	}
+	if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
+		GLint values[4] = {0, 0, 0, 0};
+		glGetTexParameteriv(target, pname, values);
+		for (int component = 0; component < 4; ++component) params[component] = (GLuint)values[component];
+		return;
+	}
+	GLint value = 0;
+	glGetTexParameteriv(target, pname, &value);
+	params[0] = (GLuint)value;
 }
 
 void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	GLint value = 0;
 	glGetTexLevelParameteriv(target, level, pname, &value);
 	*params = (GLfloat)value;
@@ -3168,11 +4997,23 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 	GLuint bufferObject = 0;
 
 	GLsizei d = 0;
-	if (target == GL_PROXY_TEXTURE_2D) {
+	GLint samples = 0;
+	GLboolean fixedSampleLocations = GL_FALSE;
+	if (target == GL_PROXY_TEXTURE_1D) {
+		w = ctx.proxy_texture_1d.w;
+		h = w > 0 ? 1 : 0;
+		d = w > 0 ? 1 : 0;
+		internalformat = ctx.proxy_texture_1d.internalformat;
+	} else if (target == GL_PROXY_TEXTURE_2D) {
 		w = ctx.proxy_texture_2d.w;
 		h = ctx.proxy_texture_2d.h;
 		d = 1;
 		internalformat = ctx.proxy_texture_2d.internalformat;
+	} else if (target == GL_PROXY_TEXTURE_2D_ARRAY) {
+		w = ctx.proxy_texture_2d_array.w;
+		h = ctx.proxy_texture_2d_array.h;
+		d = ctx.proxy_texture_2d_array.layers;
+		internalformat = ctx.proxy_texture_2d_array.internalformat;
 	} else if (target == GL_PROXY_TEXTURE_3D) {
 		w = ctx.proxy_texture_3d.w;
 		h = ctx.proxy_texture_3d.h;
@@ -3189,7 +5030,16 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 		} else if (t && t->texture && level >= 0 && (NSUInteger)level < t->texture.mipmapLevelCount) {
 			w = std::max(1, t->width >> level);
 			h = std::max(1, t->height >> level);
-			d = t->texture.textureType == MTLTextureType3D ? std::max(1, t->depth >> level) : 1;
+			if (t->texture.textureType == MTLTextureType3D)
+				d = std::max(1, t->depth >> level);
+			else if (t->texture.textureType == MTLTextureType2DArray)
+				d = t->texture.arrayLength;
+			else
+				d = 1;
+			if (t->texture.textureType == MTLTextureType2DMultisample) {
+				samples = (GLint)t->texture.sampleCount;
+				fixedSampleLocations = GL_TRUE;
+			}
 			internalformat = t->internalformat;
 		}
 	}
@@ -3199,6 +5049,43 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *p
 		case GL_TEXTURE_HEIGHT:          *params = h; break;
 		case GL_TEXTURE_DEPTH:           *params = d; break;
 		case GL_TEXTURE_INTERNAL_FORMAT: *params = (GLint)internalformat; break;
+		case GL_TEXTURE_SAMPLES: *params = samples; break;
+		case GL_TEXTURE_FIXED_SAMPLE_LOCATIONS: *params = (GLint)fixedSampleLocations; break;
+		case GL_TEXTURE_COMPRESSED: {
+			CompressedFormatInfo info;
+			*params = compressedFormatInfo(internalformat, info) ? GL_TRUE : GL_FALSE;
+			break;
+		}
+		case GL_TEXTURE_COMPRESSED_IMAGE_SIZE: {
+			CompressedFormatInfo info;
+			if (!compressedFormatInfo(internalformat, info) || w <= 0 || h <= 0 || d <= 0) { *params = 0; break; }
+			NSUInteger compressedRowBytes = 0, compressedRows = 0;
+			size_t compressedImageBytes = 0;
+			if (!compressedImageLayout(w, h, info, compressedRowBytes, compressedRows, compressedImageBytes) ||
+				compressedImageBytes > SIZE_MAX / (size_t)d || compressedImageBytes * (size_t)d > (size_t)INT_MAX) {
+				gl4metalSetError(GL_INVALID_OPERATION); *params = 0; break;
+			}
+			*params = (GLint)(compressedImageBytes * (size_t)d);
+			break;
+		}
+		case GL_TEXTURE_COMPRESSED_BLOCK_WIDTH: {
+			CompressedFormatInfo info;
+			if (!compressedFormatInfo(internalformat, info)) { gl4metalSetError(GL_INVALID_OPERATION); *params = 0; }
+			else *params = (GLint)info.blockWidth;
+			break;
+		}
+		case GL_TEXTURE_COMPRESSED_BLOCK_HEIGHT: {
+			CompressedFormatInfo info;
+			if (!compressedFormatInfo(internalformat, info)) { gl4metalSetError(GL_INVALID_OPERATION); *params = 0; }
+			else *params = (GLint)info.blockHeight;
+			break;
+		}
+		case GL_TEXTURE_COMPRESSED_BLOCK_SIZE: {
+			CompressedFormatInfo info;
+			if (!compressedFormatInfo(internalformat, info)) { gl4metalSetError(GL_INVALID_OPERATION); *params = 0; }
+			else *params = (GLint)info.bytesPerBlock;
+			break;
+		}
 		case GL_TEXTURE_BUFFER_DATA_STORE_BINDING:
 			if (target != GL_TEXTURE_BUFFER) { gl4metalSetError(GL_INVALID_ENUM); *params = 0; break; }
 			*params = (GLint)bufferObject;

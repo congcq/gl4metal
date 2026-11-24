@@ -8,10 +8,15 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
+struct TextureObject;
+
 MTLPixelFormat metalPixelFormat(GLenum internalformat);
 void resetTextureUploadArena(id<MTLCommandBuffer> commandBuffer);
 void refreshTextureBufferViews(GLuint bufferObject);
 GLint maxTextureBufferTexels(void);
+void gl4metalInvalidateTextureSamplingViews(TextureObject &textureObject);
+void gl4metalSetTextureStorage(TextureObject &textureObject, id<MTLTexture> texture);
+id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, id<MTLTexture> sourceTexture);
 
 // Internal implementation hooks used by GL_ARB_clear_texture entry points.
 void gl4metalClearTexImageImpl(GLuint texture, GLint level, GLenum format, GLenum type, const void *data);

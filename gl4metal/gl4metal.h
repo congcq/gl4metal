@@ -1,7 +1,7 @@
 #pragma once
 
 #import <Metal/Metal.h>
-// #import <MetalKit/MetalKit.h>
+#import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 
 #import "framebuffer.h"
@@ -15,6 +15,8 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <memory>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +40,7 @@
 // iOS limits (Apple GPU family 3+ / A9 and newer)
 #define GL4METAL_MAX_TEXTURE_SIZE 16384
 #define GL4METAL_MAX_3D_TEXTURE_SIZE 2048
+#define GL4METAL_MAX_ARRAY_TEXTURE_LAYERS 2048
 #define GL4METAL_MAX_COLOR_ATTACHMENTS GL4METAL_MAX_FRAGMENT_OUTPUTS
 #define GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS 36
 // Metal buffer slots: vertex attributes 0...15, fragment gl_FragCoord 15,
@@ -54,6 +57,7 @@ struct TextureObject {
 	GLsizei width = 0, height = 0, depth = 1; // level 0 size; depth > 1 for GL_TEXTURE_3D
 	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
 	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
+	bool immutable_storage = false; // glTexStorage* / multisample texture storage cannot be redefined
 
 	// sampler parameters (consumed when the texture is bound to a shader)
 	GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR;
@@ -63,6 +67,16 @@ struct TextureObject {
 	GLint base_level = 0, max_level = 1000;
 	GLfloat max_anisotropy = 1.0f;
 	GLenum compare_mode = GL_NONE, compare_func = GL_LEQUAL;
+	GLfloat border_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	GLenum swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+
+	// Sampling views share the original allocation. Keep separate entries for
+	// the regular texture and the feedback snapshot so swizzle never changes
+	// framebuffer attachment or image-load/store semantics.
+	mutable __strong id<MTLTexture> sampled_view = nil;
+	mutable void *sampled_view_source_identity = nullptr;
+	mutable __strong id<MTLTexture> feedback_sampled_view = nil;
+	mutable void *feedback_sampled_view_source_identity = nullptr;
 
 	// Lazily allocated read-only copy used when a shader samples this same image
 	// while it is selected as an active framebuffer attachment. Tied to the GL
@@ -77,6 +91,9 @@ struct FBOAttachment {
 	GLuint texture = 0;       // GL_TEXTURE object, 0 when not a texture attachment
 	GLuint renderbuffer = 0;  // GL_RENDERBUFFER object, 0 when not a renderbuffer attachment
 	GLint level = 0;
+	GLint layer = -1;         // selected 2D-array slice; -1 for ordinary 2D attachments
+	mutable __strong id<MTLTexture> view = nil;        // cached single-slice 2D view
+	mutable __strong id<MTLTexture> view_source = nil; // storage identity used to build view
 };
 
 struct RenderbufferObject {
@@ -130,10 +147,13 @@ struct VertexArray {
 
 // MARK: - Shaders
 
+struct CompiledShaderStage; // opaque glslang stage retained between glCompileShader and glLinkProgram
+
 struct ShaderObject {
 	GLenum type = 0;
 	std::string source;
 	std::string info_log;
+	std::shared_ptr<CompiledShaderStage> compiled_stage;
 	GLboolean compiled = GL_FALSE;
 	GLboolean deleted = GL_FALSE; // glDeleteShader on a shader that is still attached to a program
 };
@@ -146,6 +166,7 @@ struct SamplerObject {
 	GLfloat min_lod = -1000.0f, max_lod = 1000.0f, lod_bias = 0.0f;
 	GLfloat max_anisotropy = 1.0f;
 	GLenum compare_mode = GL_NONE, compare_func = GL_LEQUAL;
+	GLfloat border_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // glBindBufferBase / glBindBufferRange on GL_UNIFORM_BUFFER
@@ -205,6 +226,7 @@ struct ActiveUniformInfo {
 struct ProgramObject {
 	std::vector<GLuint> shaders; // attached
 	GLboolean linked = GL_FALSE, validated = GL_FALSE, deleted = GL_FALSE;
+	bool has_executable = false; // may remain true while a failed relinked program is still current
 	std::string info_log;
 	std::unordered_map<std::string, GLuint> attrib_bindings; // glBindAttribLocation, applied at link time
 	std::unordered_map<std::string, uint32_t> frag_data_bindings; // glBindFragDataLocation, applied at link time
@@ -215,6 +237,9 @@ struct ProgramObject {
 	id<MTLFunction> vertex_function_flipped = nil; // vertex_function with gl_Position.y negated (texture targets)
 	std::vector<ProgramAttrib> attribs;
 	std::vector<ProgramUniform> uniforms; // default-block uniforms, samplers, and opaque image uniforms with locations
+	// Stable indices into uniforms for the draw-time feedback-loop check; avoid
+	// rescanning unrelated scalar/vector uniforms on every chunk draw.
+	std::vector<uint32_t> sampler_uniform_indices;
 	std::vector<ActiveUniformInfo> active_uniforms; // GL_ACTIVE_UNIFORMS includes named-block members too
 	std::vector<std::pair<GLint, GLint>> locations; // GL uniform location -> (index in uniforms, array element)
 	std::vector<uint8_t> uniform_data[3];           // CPU copy of default uniforms: [0] vertex, [1] fragment, [2] compute
@@ -265,6 +290,26 @@ struct ImageUnitBinding {
 struct RenderPipelineCacheEntry {
 	__strong id<MTLRenderPipelineState> pipeline = nil;
 	uint64_t last_used = 0;
+};
+
+struct GLQueryObject {
+	GLenum target = 0;
+	GLuint64 result = 0;
+	bool active = false;
+	bool available = false;
+	bool delete_pending = false;
+};
+
+// Retain everything referenced through an MTL4 argument table until the GPU has
+// completed the command buffer that snapshots those bindings. A residency set
+// makes allocations resident but does not replace application lifetime tracking.
+struct Metal4InFlightSubmission {
+	uint64_t event_value = 0;
+	__strong id<MTL4CommandBuffer> command_buffer = nil;
+	__strong id<MTLResidencySet> residency_set = nil;
+	std::vector<id<MTLResource>> resources;
+	std::vector<id<MTLSamplerState>> samplers;
+	std::vector<id<MTLComputePipelineState>> compute_pipelines;
 };
 
 struct MTLContext {
@@ -439,6 +484,58 @@ struct MTLContext {
 	uint64_t frame_render_pass_alias_candidates = 0;
 	uint64_t frame_render_pass_alias_reuses = 0;
 	uint64_t frame_render_pass_alias_misses = 0;
+	// 2D-array proxy state is appended to preserve established MTLContext offsets.
+	struct { GLsizei w = 0, h = 0, layers = 0; GLenum internalformat = 0; } proxy_texture_2d_array;
+	struct { GLsizei w = 0; GLenum internalformat = 0; } proxy_texture_1d;
+
+	// GL query objects are context state. Keep them appended so existing ObjC++
+	// translation units retain all established MTLContext member offsets.
+	GLuint next_query_name = 0;
+	std::unordered_set<GLuint> query_names;
+	std::unordered_map<GLuint, GLQueryObject> query_objects;
+	std::unordered_map<GLenum, GLuint> active_queries;
+	bool conditional_render_active = false;
+	bool conditional_render_should_draw = true;
+	GLuint conditional_render_query = 0;
+
+	// Metal 4 is adopted incrementally: compute/transfer dispatches use a dedicated
+	// MTL4 queue while rasterization and CAMetalLayer presentation remain classic.
+	// Classic and Metal 4 queues are serialized with this monotonic shared-event timeline.
+	bool metal4Enabled = false;
+	__strong id<MTL4Compiler> metal4Compiler = nil;
+	__strong id<MTL4CommandQueue> metal4CommandQueue = nil;
+	__strong id<MTLSharedEvent> metal4InteropEvent = nil;
+	__strong id<MTL4ArgumentTable> metal4ComputeArgumentTable = nil;
+	__strong id<MTL4CommandBuffer> currentMetal4CommandBuffer = nil;
+	__strong id<MTL4ComputeCommandEncoder> currentMetal4ComputeEncoder = nil;
+	__strong id<MTLResidencySet> currentMetal4ResidencySet = nil;
+	__strong id<MTL4CommandAllocator> metal4CommandAllocators[3] = { nil, nil, nil };
+	__strong id<MTL4CommandBuffer> metal4CommandBuffers[3] = { nil, nil, nil };
+	__strong id<MTLResidencySet> metal4ResidencySets[3] = { nil, nil, nil };
+	__strong id<MTLBuffer> metal4TransientBuffers[3] = { nil, nil, nil };
+	NSUInteger metal4TransientBufferOffsets[3] = { 0, 0, 0 };
+	uint64_t metal4AllocatorEventValues[3] = { 0, 0, 0 };
+	uint32_t metal4AllocatorCursor = 0;
+	uint32_t metal4CurrentAllocatorIndex = 0;
+	uint64_t metal4NextEventValue = 0;
+	uint64_t metal4CurrentEventValue = 0;
+	uint64_t metal4LastClassicEventValue = 0;
+	uint64_t metal4LastComputeEventValue = 0;
+	uint64_t classicWaitEventValue = 0;
+	// MTL4ComputeCommandEncoder also records blit operations. Track the last stage
+	// so dispatch<->blit hazards get an explicit intra-encoder visibility barrier.
+	uint8_t metal4LastWorkStage = 0; // 0=none, 1=dispatch, 2=blit
+	std::vector<id<MTLResource>> metal4CurrentResources;
+	std::vector<id<MTLSamplerState>> metal4CurrentSamplers;
+	std::vector<id<MTLComputePipelineState>> metal4CurrentComputePipelines;
+	std::unordered_set<const void *> metal4CurrentResourceKeys;
+	std::deque<Metal4InFlightSubmission> metal4InFlightSubmissions;
+	std::unordered_map<GLuint, uint64_t> buffer_last_use_event_value;
+	// Metal 4 resources are untracked. Keep stage masks for explicit hazards
+	// between successive encoders on the same MTL4CommandQueue. These are
+	// appended to preserve the established MTLContext member layout.
+	uint32_t metal4CurrentEncoderStages = 0;
+	uint32_t metal4PendingQueueBarrierStages = 0;
 };
 
 extern thread_local MTLContext ctx;
@@ -514,6 +611,42 @@ void updateDepthStencilState();
 #endif
 
 // MARK: - Internal helpers (C++ linkage, not part of the GL API)
+
+bool gl4metalEnsureClassicCommandBuffer(void); // also orders classic work after Metal 4 compute
+void gl4metalCommitClassicCommandBuffer(void);
+void gl4metalCommitMetal4Compute(void);
+// draw.mm owns the transient vertex/uniform upload arena; command-buffer submit
+// notifies it here so the arena can be recycled only after GPU completion.
+void resetDrawTransientUploadArena(id<MTLCommandBuffer> commandBuffer);
+void resetTextureUploadArenaMetal4(id<MTL4CommandBuffer> command_buffer);
+void gl4metalReapMetal4Submissions(void);
+bool gl4metalWaitForMetal4Event(uint64_t target_value, uint64_t timeout_milliseconds);
+bool gl4metalBeginMetal4Compute(void);
+bool gl4metalMetal4PrepareDispatch(void);
+bool gl4metalMetal4StageBytes(const void *bytes, NSUInteger length, id<MTLBuffer> __strong *out_buffer, NSUInteger *out_offset);
+bool gl4metalMetal4CopyBuffer(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	id<MTLBuffer> destination_buffer, NSUInteger destination_offset, NSUInteger size);
+bool gl4metalMetal4CopyBufferToTexture(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	NSUInteger source_bytes_per_row, NSUInteger source_bytes_per_image, MTLSize source_size,
+	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin);
+bool gl4metalMetal4CopyBufferToTextureOptions(id<MTLBuffer> source_buffer, NSUInteger source_offset,
+	NSUInteger source_bytes_per_row, NSUInteger source_bytes_per_image, MTLSize source_size,
+	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level,
+	MTLOrigin destination_origin, MTLBlitOption options);
+bool gl4metalMetal4CopyTextureRegion(id<MTLTexture> source_texture, NSUInteger source_slice, NSUInteger source_level,
+	MTLOrigin source_origin, MTLSize source_size, id<MTLTexture> destination_texture,
+	NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin);
+bool gl4metalMetal4GenerateMipmaps(id<MTLTexture> texture);
+bool gl4metalMetal4CopyTextureToBuffer(id<MTLTexture> source_texture, NSUInteger source_slice, NSUInteger source_level,
+	MTLOrigin source_origin, MTLSize source_size, id<MTLBuffer> destination_buffer,
+	NSUInteger destination_offset, NSUInteger destination_bytes_per_row, NSUInteger destination_bytes_per_image, MTLBlitOption options);
+bool gl4metalMetal4BindBuffer(id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot);
+bool gl4metalMetal4BindTexture(id<MTLTexture> texture, NSUInteger slot);
+bool gl4metalMetal4UseBuffer(id<MTLBuffer> buffer);
+bool gl4metalMetal4BindSampler(id<MTLSamplerState> sampler, NSUInteger slot);
+bool gl4metalMetal4BindBytes(const void *bytes, NSUInteger length, NSUInteger slot);
+void gl4metalMetal4UseComputePipeline(id<MTLComputePipelineState> pipeline);
+void gl4metalMarkMetal4BufferUsed(GLuint buffer_id);
 
 MTLCompareFunction getMetalCompareFunc(GLenum func);                // gl4metal.mm
 void gl4metalSetErrorImpl(GLenum error, const char *function, const char *file, int line); // getter.mm

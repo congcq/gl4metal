@@ -1,11 +1,14 @@
 #import "state.h"
 
 #include <cmath>
+#include <mutex>
 
 // Fixed-function state Metal has no equivalent for (or that is not wired up yet): accepted, reported once, ignored.
 static void notSupported(const char *name) {
 	gl4metalSetError(GL_INVALID_OPERATION);
+	static std::mutex reportMutex;
 	static std::unordered_set<std::string> reported;
+	std::lock_guard<std::mutex> lock(reportMutex);
 	if (reported.insert(name).second) {
 		GL4METAL_LOG("%s: not supported by the Metal layer, ignored (reported once)", name);
 	}
@@ -132,14 +135,25 @@ void glBlendEquationSeparatei(GLuint bufferIndex, GLenum modeRGB, GLenum modeAlp
 }
 
 void glBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
-	ctx.blend_color[0] = red;
-	ctx.blend_color[1] = green;
-	ctx.blend_color[2] = blue;
-	ctx.blend_color[3] = alpha;
+	const GLfloat values[4] = { red, green, blue, alpha };
+	for (int component = 0; component < 4; ++component) {
+		if (!std::isfinite(values[component])) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	}
+	for (int component = 0; component < 4; ++component)
+		ctx.blend_color[component] = std::min(std::max(values[component], 0.0f), 1.0f);
 }
 
 void glLogicOp(GLenum opcode) {
-	notSupported("glLogicOp");
+	switch (opcode) {
+		case GL_CLEAR: case GL_AND: case GL_AND_REVERSE: case GL_COPY: case GL_AND_INVERTED:
+		case GL_NOOP: case GL_XOR: case GL_OR: case GL_NOR: case GL_EQUIV: case GL_INVERT:
+		case GL_OR_REVERSE: case GL_COPY_INVERTED: case GL_OR_INVERTED: case GL_NAND: case GL_SET:
+			notSupported("glLogicOp");
+			return;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			return;
+	}
 }
 
 // MARK: - Depth
@@ -163,6 +177,7 @@ void glDepthMask(GLboolean flag) {
 }
 
 void glDepthRange(GLdouble n, GLdouble f) {
+	if (!std::isfinite(n) || !std::isfinite(f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	ctx.depth_range_near = (GLfloat)std::min(std::max(n, 0.0), 1.0);
 	ctx.depth_range_far = (GLfloat)std::min(std::max(f, 0.0), 1.0);
 	applyViewportAndScissor(); // the depth range lives in the viewport
@@ -290,13 +305,17 @@ void glFrontFace(GLenum mode) {
 }
 
 void glPolygonMode(GLenum face, GLenum mode) {
-	if (face != GL_FRONT_AND_BACK) {
+	if (face != GL_FRONT && face != GL_BACK && face != GL_FRONT_AND_BACK) {
 		gl4metalSetError(GL_INVALID_ENUM);
-		GL4METAL_LOG("glPolygonMode: only GL_FRONT_AND_BACK is supported");
 		return;
 	}
 	if (mode != GL_LINE && mode != GL_FILL && mode != GL_POINT) {
 		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
+	if (face != GL_FRONT_AND_BACK) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glPolygonMode: Metal pipeline state is shared by front and back faces");
 		return;
 	}
 	if (mode == GL_POINT) {
@@ -308,18 +327,19 @@ void glPolygonMode(GLenum face, GLenum mode) {
 }
 
 void glPolygonOffset(GLfloat factor, GLfloat units) {
+	if (!std::isfinite(factor) || !std::isfinite(units)) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	ctx.polygon_offset_factor = factor;
 	ctx.polygon_offset_units = units;
 }
 
 void glLineWidth(GLfloat width) {
-	if (!(width > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!std::isfinite(width) || !(width > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	// Metal exposes line primitives with a fixed 1-pixel width on iOS. Its GL range is [1, 1].
 	if (width != 1.0f) GL4METAL_LOG("glLineWidth: iOS Metal supports width 1 only; requested width is clamped");
 }
 
 void glPointSize(GLfloat size) {
-	if (!(size > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	if (!std::isfinite(size) || !(size > 0.0f)) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	// This backend currently maps GL_POINTS to Metal point primitives at fixed size 1.
 	if (size != 1.0f) GL4METAL_LOG("glPointSize: point-size output is not available in the current MSL vertex interface");
 }
@@ -341,6 +361,10 @@ void glPointParameteriv(GLenum pname, const GLint *params) {
 }
 
 void glProvokingVertex(GLenum mode) {
+	if (mode != GL_FIRST_VERTEX_CONVENTION && mode != GL_LAST_VERTEX_CONVENTION) {
+		gl4metalSetError(GL_INVALID_ENUM);
+		return;
+	}
 	notSupported("glProvokingVertex");
 }
 

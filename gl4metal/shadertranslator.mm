@@ -1,3 +1,5 @@
+#import "gl4metal.h"
+
 #include "shadertranslator.h"
 
 #include <glslang/Public/ShaderLang.h>
@@ -13,6 +15,8 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include <regex>
@@ -28,12 +32,18 @@ namespace {
 
 enum Stage { VS = 0, FS = 1 };
 
-void initGlslang() {
-	glslang::InitializeProcess();
+std::mutex &glslangMutex() {
+	static std::mutex mutex;
+	return mutex;
 }
 
-void finalizeGlslang() {
-	glslang::FinalizeProcess();
+bool initGlslang() {
+	static std::once_flag initializeFlag;
+	static bool initialized = false;
+	std::call_once(initializeFlag, [] {
+		initialized = glslang::InitializeProcess();
+	});
+	return initialized;
 }
 
 // glslang's generic defaults are intentionally conservative (notably only eight
@@ -88,8 +98,8 @@ std::string renameSamplerIdentifier(const std::string &source) {
 std::string maskShaderComments(const std::string &source);
 
 // Convert pre-4.10 desktop GLSL to desktop GLSL 4.10 before glslang parses it.
-// This includes Iris-generated #version 400 core shaders: the varying-alignment pass below inserts
-// layout(location) on stage inputs/outputs, which is core syntax starting with GLSL 4.10.
+// Linked stage interfaces receive locations through glslang TProgram::mapIO(); a post-SPIR-V
+// compatibility pass aligns simple varying names for generated shader interfaces where needed.
 // Keep the original profile suffix (for example, "core") and do not rewrite GLSL ES versions.
 // GLSL 4.20 introduced brace-style aggregate/array initializers. For older desktop source that uses
 // `T value = { ... }`, enable only the parser extension that defines that syntax instead of raising
@@ -1496,7 +1506,24 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 
 		spirv_cross::CompilerMSL::Options options;
 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
-		options.set_msl_version(2, 4);
+		int major = 0, minor = 0;
+		if ([ctx.device supportsFamily:MTLGPUFamilyMetal4]) {
+			major = 4;
+			// if (@available(iOS 27.0, *)) {
+				// minor = 1;
+			// }
+		} else if ([ctx.device supportsFamily:MTLGPUFamilyMetal3]) {
+			major = 3;
+			if (@available(iOS 17.0, *)) {
+				minor = 1;
+			} else if (@available(iOS 18.0, *)) {
+				minor = 2;
+			}
+		} else {
+			major = 2;
+			minor = 4;
+		}
+		options.set_msl_version(major, minor);
 		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
 		msl.set_msl_options(options);
 
@@ -1835,7 +1862,13 @@ bool compileStage(std::vector<unsigned int> spirv, spv::ExecutionModel model, in
 			TranslatedUniform &u = findOrAdd(out, r.name, lookup);
 			u.kind = TranslatedUniform::Sampler;
 			const spirv_cross::SPIRType &samplerType = msl.get_type(r.type_id);
-			if (samplerType.image.dim == spv::DimCube) {
+			if (samplerType.image.ms) {
+				out.log += "multisample sampler '" + r.name + "' is not supported by the current iOS Metal sampler binding path\n";
+				return false;
+			}
+			if (samplerType.image.dim == spv::Dim1D) {
+				u.dim = TranslatedUniform::Dim1D;
+			} else if (samplerType.image.dim == spv::DimCube) {
 				u.dim = TranslatedUniform::DimCube;
 			} else if (samplerType.image.dim == spv::Dim3D) {
 				u.dim = TranslatedUniform::Dim3D;
@@ -2027,7 +2060,24 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 		spirv_cross::CompilerMSL msl(std::move(spirv));
 		spirv_cross::CompilerMSL::Options options;
 		options.platform = spirv_cross::CompilerMSL::Options::iOS;
-		options.set_msl_version(2, 2);
+		int major = 0, minor = 0;
+		if ([ctx.device supportsFamily:MTLGPUFamilyMetal4]) {
+			major = 4;
+			// if (@available(iOS 27.0, *)) {
+				// minor = 1;
+			// }
+		} else if ([ctx.device supportsFamily:MTLGPUFamilyMetal3]) {
+			major = 3;
+			if (@available(iOS 17.0, *)) {
+				minor = 1;
+			} else if (@available(iOS 18.0, *)) {
+				minor = 2;
+			}
+		} else {
+			major = 2;
+			minor = 4;
+		}
+		options.set_msl_version(major, minor);
 		options.buffer_size_buffer_index = GL4METAL_BUFFER_SIZE_BUFFER_INDEX;
 		msl.set_msl_options(options);
 
@@ -2263,7 +2313,12 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 			TranslatedUniform &uniform = findOrAdd(out, resource.name, lookup);
 			uniform.kind = TranslatedUniform::Sampler;
 			const spirv_cross::SPIRType &samplerType = msl.get_type(resource.type_id);
+			if (samplerType.image.ms) {
+				out.log += "compute multisample sampler '" + resource.name + "' is not supported by the current iOS Metal sampler binding path\n";
+				return false;
+			}
 			if (samplerType.image.dim == spv::DimBuffer) uniform.dim = TranslatedUniform::DimBuffer;
+			else if (samplerType.image.dim == spv::Dim1D) uniform.dim = TranslatedUniform::Dim1D;
 			else if (samplerType.image.dim == spv::DimCube) uniform.dim = TranslatedUniform::DimCube;
 			else if (samplerType.image.dim == spv::Dim3D) uniform.dim = TranslatedUniform::Dim3D;
 			else if (samplerType.image.arrayed) uniform.dim = TranslatedUniform::Dim2DArray;
@@ -2282,15 +2337,15 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 		for (const spirv_cross::Resource &resource : resources.storage_images) {
 			const spirv_cross::SPIRType &imageType = msl.get_type(resource.type_id);
-			// Metal can expose a GL image3D as texture3d with read/write access. The
-			// GL_TEXTURE_3D allocation path is already private + ShaderRead/ShaderWrite.
-			// 2D-array/cube storage images remain explicitly unsupported until their GL
-			// texture allocation and view-binding paths are implemented as well.
+			// Metal texture2d_array supports read/write storage access. The matching
+			// GL_TEXTURE_2D_ARRAY allocation path requests ShaderRead + ShaderWrite,
+			// and glBindImageTexture enforces layered binding for image2DArray.
 			const bool is2D = imageType.image.dim == spv::Dim2D && !imageType.image.arrayed;
+			const bool isArray = imageType.image.dim == spv::Dim2D && imageType.image.arrayed;
 			const bool is3D = imageType.image.dim == spv::Dim3D && !imageType.image.arrayed;
-			if ((!is2D && !is3D) || imageType.image.ms) {
+			if ((!is2D && !isArray && !is3D) || imageType.image.ms) {
 				out.log += "compute storage image '" + resource.name +
-				"' has unsupported dimension (supported: image2D and image3D; no arrayed or multisample images)\n";
+				"' has unsupported dimension (supported: image2D, image2DArray and image3D; no cube or multisample images)\n";
 				return false;
 			}
 			const uint32_t resourceCount = (uint32_t)arraySizeOf(imageType);
@@ -2324,6 +2379,7 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 				image.slot = nextTextureSlot + element;
 				image.format = glImageFormatForSpirv(imageType.image.format);
 				image.is_3d = is3D;
+				image.is_array = isArray;
 				image.read_only = msl.has_decoration(resource.id, spv::DecorationNonWritable);
 				image.write_only = msl.has_decoration(resource.id, spv::DecorationNonReadable);
 				out.storage_images.push_back(std::move(image));
@@ -2351,6 +2407,150 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 } // namespace
 
+// This type intentionally stays opaque in shadertranslator.h. TShader retains its
+// parsed intermediate so glCompileShader performs the real GLSL stage compile and
+// the first glLinkProgram performs cross-stage linking and SPIR-V/MSL generation.
+// Source strings outlive TShader because glslang stores the pointers passed to setStrings().
+struct CompiledShaderStage {
+	uint32_t gl_type = 0;
+	std::string original_source;
+	std::string translated_source;
+	std::unique_ptr<glslang::TShader> shader;
+	bool consumed_by_link = false;
+};
+
+static bool shaderLanguageForGLType(uint32_t shaderType, EShLanguage &language, int &defaultVersion) {
+	switch (shaderType) {
+		case GL_VERTEX_SHADER: language = EShLangVertex; defaultVersion = 410; return true;
+		case GL_FRAGMENT_SHADER: language = EShLangFragment; defaultVersion = 410; return true;
+		case GL_COMPUTE_SHADER: language = EShLangCompute; defaultVersion = 430; return true;
+		default: return false;
+	}
+}
+
+static std::string shaderDiagnosticText(glslang::TShader &shader) {
+	std::string result;
+	const char *info = shader.getInfoLog();
+	const char *debug = shader.getInfoDebugLog();
+	if (info && info[0]) result += info;
+	if (debug && debug[0]) {
+		if (!result.empty() && result.back() != '\n') result += '\n';
+		result += debug;
+	}
+	return result;
+}
+
+static bool parseGlslangStage(EShLanguage language, int defaultVersion, const std::string &translatedSource,
+	std::unique_ptr<glslang::TShader> &shaderOut, std::string &diagnostics) {
+	shaderOut = std::make_unique<glslang::TShader>(language);
+	const char *sourcePointer = translatedSource.c_str();
+	setupShader(*shaderOut, language, &sourcePointer);
+	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
+	const TBuiltInResource resources = makeGL4MetalShaderResources();
+	const bool parsed = shaderOut->parse(&resources, defaultVersion, false, messages);
+	diagnostics = shaderDiagnosticText(*shaderOut);
+	if (!parsed && diagnostics.empty()) diagnostics = "glslang rejected the shader source without a diagnostic\n";
+	return parsed;
+}
+
+struct LinkShaderStage {
+	std::string sourceStorage;
+	std::unique_ptr<glslang::TShader> temporaryShader;
+	glslang::TShader *shader = nullptr;
+};
+
+// glslang documents that one TShader instance cannot be linked into multiple
+// TProgram objects. Reuse the parsed stage for its first link; on a later link
+// (including relinking the same GL program) build a fresh stage from validated source.
+static bool acquireShaderForLink(CompiledShaderStage &compiledStage, LinkShaderStage &linkStage,
+	std::string &diagnostics) {
+	if (!compiledStage.shader) {
+		diagnostics = "compiled GLSL stage has no glslang intermediate\n";
+		return false;
+	}
+	if (!compiledStage.consumed_by_link) {
+		compiledStage.consumed_by_link = true;
+		linkStage.shader = compiledStage.shader.get();
+		return true;
+	}
+	EShLanguage language = EShLangVertex;
+	int defaultVersion = 410;
+	if (!shaderLanguageForGLType(compiledStage.gl_type, language, defaultVersion)) {
+		diagnostics = "compiled GLSL stage has an invalid GL shader type\n";
+		return false;
+	}
+	linkStage.sourceStorage = compiledStage.translated_source;
+	if (!parseGlslangStage(language, defaultVersion, linkStage.sourceStorage,
+		linkStage.temporaryShader, diagnostics)) return false;
+	linkStage.shader = linkStage.temporaryShader.get();
+	return linkStage.shader != nullptr;
+}
+
+void collectCompiledStageExplicitVertexAttributeLocations(
+	const std::shared_ptr<CompiledShaderStage> &stage,
+	const std::vector<TranslatedAttrib> &attributes, std::vector<bool> &explicitLocations) {
+	explicitLocations.assign(attributes.size(), false);
+	if (!stage || stage->gl_type != GL_VERTEX_SHADER || attributes.empty()) return;
+	const std::string maskedSource = maskShaderComments(stage->translated_source);
+	// The numeric value can be a macro or constant expression. SPIRV-Cross already
+	// reports its resolved Location, so only detect whether the declaration supplied
+	// a location qualifier and match that declaration to its reflected input name.
+	static const std::regex declarationPattern(
+		R"(layout\s*\(([^;]*)\)\s*((?:(?:centroid|sample|patch|invariant|precise|flat|smooth|noperspective|highp|mediump|lowp)\s+)*in\s+[^;{}]*;))",
+		std::regex::ECMAScript);
+	static const std::regex locationPattern(R"(\blocation\s*=)", std::regex::ECMAScript);
+	for (std::sregex_iterator declarationIt(maskedSource.begin(), maskedSource.end(), declarationPattern), end;
+		 declarationIt != end; ++declarationIt) {
+		const std::string layoutQualifiers = (*declarationIt)[1].str();
+		if (!std::regex_search(layoutQualifiers, locationPattern)) continue;
+		const std::string declaration = (*declarationIt)[2].str();
+		for (size_t attribIndex = 0; attribIndex < attributes.size(); ++attribIndex) {
+			if (!explicitLocations[attribIndex] &&
+				containsIdentifierToken(declaration, attributes[attribIndex].name)) {
+				explicitLocations[attribIndex] = true;
+			}
+		}
+	}
+}
+
+std::shared_ptr<CompiledShaderStage> compileShaderStage(uint32_t shaderType,
+	const std::string &source, std::string &infoLog) {
+	std::lock_guard<std::mutex> lock(glslangMutex());
+	infoLog.clear();
+	try {
+		EShLanguage language = EShLangVertex;
+		int defaultVersion = 410;
+		if (!shaderLanguageForGLType(shaderType, language, defaultVersion)) {
+			infoLog = "unsupported shader stage type\n";
+			return nullptr;
+		}
+		if (!initGlslang()) {
+			infoLog = "glslang initialization failed\n";
+			return nullptr;
+		}
+		if (source.empty()) {
+			infoLog = "shader source is empty\n";
+			return nullptr;
+		}
+
+		auto compiledStage = std::make_shared<CompiledShaderStage>();
+		compiledStage->gl_type = shaderType;
+		compiledStage->original_source = source;
+		compiledStage->translated_source = patchVersion(source, defaultVersion);
+		if (!parseGlslangStage(language, defaultVersion, compiledStage->translated_source,
+			compiledStage->shader, infoLog)) {
+			compiledStage->shader.reset();
+			return nullptr;
+		}
+		return compiledStage;
+	} catch (const std::exception &exception) {
+		infoLog = std::string("shader compilation raised an exception: ") + exception.what() + "\n";
+		return nullptr;
+	} catch (...) {
+		infoLog = "shader compilation raised an unknown exception\n";
+		return nullptr;
+	}
+}
 
 bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t maxThreadgroupBytes, std::string &notes, bool force) {
 	if (maxThreadgroupBytes == 0 || mslSource.empty()) return false;
@@ -2489,45 +2689,54 @@ bool compactMetalThreadgroupFloat3Arrays(std::string &mslSource, std::size_t max
 	return true;
 }
 
-bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+bool translateProgram(const std::shared_ptr<CompiledShaderStage> &vertexStage,
+	const std::shared_ptr<CompiledShaderStage> &fragmentStage, TranslatedProgram &out,
 	const std::unordered_map<std::string, uint32_t> &fragDataBindings) {
+	std::lock_guard<std::mutex> compilerLock(glslangMutex());
 	out = TranslatedProgram();
-	initGlslang();
+	if (!initGlslang()) {
+		out.log = "glslang initialization failed\n";
+		return false;
+	}
+	if (!vertexStage || !fragmentStage || vertexStage->gl_type != GL_VERTEX_SHADER ||
+		fragmentStage->gl_type != GL_FRAGMENT_SHADER) {
+		out.log = "graphics program requires one compiled vertex stage and one compiled fragment stage\n";
+		return false;
+	}
+	if (!vertexStage->shader || !fragmentStage->shader) {
+		out.log = "an attached shader has no successful glCompileShader result\n";
+		return false;
+	}
 
-	std::string vsText = patchVersion(vertexGLSL);
-	std::string fsText = patchVersion(fragmentGLSL);
+	const std::string &vertexGLSL = vertexStage->original_source;
+	const std::string &fragmentGLSL = fragmentStage->original_source;
+	const std::string &vsText = vertexStage->translated_source;
+	const std::string &fsText = fragmentStage->translated_source;
 	const std::vector<std::pair<std::string, uint32_t>> explicitFragmentOutputLayouts =
 		collectExplicitFragmentOutputLayouts(fsText);
 	const bool fragmentUsesFragCoord = usesFragmentFragCoord(fsText);
 	const bool fragmentUsesUpperLeftOrigin = declaresFragCoordOriginUpperLeft(fsText);
 	const bool fixFragmentFragCoordY = fragmentUsesFragCoord && !fragmentUsesUpperLeftOrigin;
 	out.uses_gl_frag_coord = false;
-	alignUnqualifiedVaryingLocations(vsText, fsText);
-	const char *vsSource = vsText.c_str();
-	const char *fsSource = fsText.c_str();
 
-	glslang::TShader vs(EShLangVertex);
-	glslang::TShader fs(EShLangFragment);
-	setupShader(vs, EShLangVertex, &vsSource);
-	setupShader(fs, EShLangFragment, &fsSource);
+	// The GLSL parse is performed by glCompileShader. TProgram now does only
+	// cross-stage validation/location mapping; no normal first-link GLSL parse is repeated.
+	LinkShaderStage vertexLinkStage;
+	LinkShaderStage fragmentLinkStage;
+	std::string stageDiagnostics;
+	if (!acquireShaderForLink(*vertexStage, vertexLinkStage, stageDiagnostics)) {
+		out.log += "vertex shader relink preparation failed:\n" + stageDiagnostics;
+		return false;
+	}
+	if (!acquireShaderForLink(*fragmentStage, fragmentLinkStage, stageDiagnostics)) {
+		out.log += "fragment shader relink preparation failed:\n" + stageDiagnostics;
+		return false;
+	}
 
 	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
-	const TBuiltInResource resources = makeGL4MetalShaderResources();
-
-	if (!vs.parse(&resources, 410, false, messages)) {
-		out.log += std::string("vertex shader:\n") + vs.getInfoLog() + vs.getInfoDebugLog();
-		return false;
-	}
-	if (!fs.parse(&resources, 410, false, messages)) {
-		out.log += std::string("fragment shader:\n") + fs.getInfoLog() + fs.getInfoDebugLog();
-		return false;
-	}
-
-	// Both stages in one TProgram: mapIO() numbers varyings by name across the stages, which is what makes
-	// vertex outputs and fragment inputs line up (translating each shader on its own can't guarantee that).
 	glslang::TProgram program;
-	program.addShader(&vs);
-	program.addShader(&fs);
+	program.addShader(vertexLinkStage.shader);
+	program.addShader(fragmentLinkStage.shader);
 	if (!program.link(messages)) {
 		out.log += std::string("link:\n") + program.getInfoLog() + program.getInfoDebugLog();
 		return false;
@@ -2608,26 +2817,31 @@ bool translateProgram(const std::string &vertexGLSL, const std::string &fragment
 	// Preserve their original desktop-GL type for glGetActiveUniform / GL_UNIFORM_TYPE.
 	// Likewise keep the exact samplerBuffer variant for integer/unsigned buffer samplers.
 	applySourceUniformTypes(out, vertexGLSL, fragmentGLSL);
-	finalizeGlslang();
 	return true;
 }
 
 
-bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out) {
-	initGlslang();
+bool translateComputeProgram(const std::shared_ptr<CompiledShaderStage> &computeStage, TranslatedProgram &out) {
+	std::lock_guard<std::mutex> compilerLock(glslangMutex());
 	out = TranslatedProgram();
-	std::string computeText = patchVersion(computeGLSL, 430);
-	const char *computeSource = computeText.c_str();
-	glslang::TShader shader(EShLangCompute);
-	setupShader(shader, EShLangCompute, &computeSource);
-	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
-	const TBuiltInResource resources = makeGL4MetalShaderResources();
-	if (!shader.parse(&resources, 430, false, messages)) {
-		out.log += std::string("compute shader:\n") + shader.getInfoLog() + shader.getInfoDebugLog();
+	if (!initGlslang()) {
+		out.log = "glslang initialization failed\n";
 		return false;
 	}
+	if (!computeStage || computeStage->gl_type != GL_COMPUTE_SHADER || !computeStage->shader) {
+		out.log = "compute program requires one successfully compiled compute shader\n";
+		return false;
+	}
+	const std::string &computeGLSL = computeStage->original_source;
+	LinkShaderStage computeLinkStage;
+	std::string stageDiagnostics;
+	if (!acquireShaderForLink(*computeStage, computeLinkStage, stageDiagnostics)) {
+		out.log = "compute shader relink preparation failed:\n" + stageDiagnostics;
+		return false;
+	}
+	const EShMessages messages = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules);
 	glslang::TProgram program;
-	program.addShader(&shader);
+	program.addShader(computeLinkStage.shader);
 	if (!program.link(messages)) {
 		out.log += std::string("compute link:\n") + program.getInfoLog() + program.getInfoDebugLog();
 		return false;
@@ -2651,6 +2865,5 @@ bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &
 	const ComputeSourceBindings sourceBindings = collectComputeSourceBindings(computeGLSL);
 	if (!compileComputeStage(std::move(spirv), out, lookup, sourceBindings)) return false;
 	applySourceUniformTypes(out, computeGLSL, std::string());
-	finalizeGlslang();
 	return true;
 }

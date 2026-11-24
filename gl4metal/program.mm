@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <sstream>
+#include <exception>
 
 // MARK: - Helpers
 
@@ -31,6 +32,66 @@ static ProgramObject *findProgram(GLuint program) {
 	auto it = ctx.program_objects.find(program);
 	return it == ctx.program_objects.end() ? nullptr : &it->second;
 }
+
+static void clearProgramExecutable(ProgramObject &program) {
+	program.has_executable = false;
+	program.vertex_function = nil;
+	program.fragment_function = nil;
+	program.vertex_function_flipped = nil;
+	program.vertex_stage_cache_id = 0;
+	program.fragment_stage_cache_id = 0;
+	program.compute_pipeline = nil;
+	program.compute_workgroup_size[0] = program.compute_workgroup_size[1] = program.compute_workgroup_size[2] = 1;
+	program.is_compute = false;
+	for (int stage = 0; stage < 3; ++stage) program.needs_buffer_size_buffer[stage] = false;
+	program.storage_buffers.clear();
+	program.storage_images.clear();
+	program.image_units.clear();
+	program.attribs.clear();
+	program.uniforms.clear();
+	program.sampler_uniform_indices.clear();
+	program.active_uniforms.clear();
+	program.locations.clear();
+	for (int stage = 0; stage < 3; ++stage) {
+		program.uniform_data[stage].clear();
+		program.uniform_gpu_buffer[stage] = nil;
+		program.uniform_gpu_revision[stage] = 0;
+		program.uniform_gpu_device_identity[stage] = 0;
+		program.uniform_gpu_arena_generation[stage] = 0;
+		program.uniform_gpu_offset[stage] = 0;
+		program.uniform_gpu_is_transient[stage] = false;
+	}
+	program.frag_outputs.clear();
+	program.blocks.clear();
+	program.uses_gl_frag_coord = false;
+}
+
+// If a currently-used program is relinked unsuccessfully, OpenGL keeps its old
+// executable active until a later glUseProgram removes it. Keep a snapshot only
+// for that case; non-current programs can discard their previous executable.
+struct ProgramRelinkGuard {
+	ProgramObject &target;
+	std::unique_ptr<ProgramObject> previous_executable;
+	bool committed = false;
+
+	ProgramRelinkGuard(ProgramObject &program, bool preserveCurrentExecutable) : target(program) {
+		if (preserveCurrentExecutable && program.has_executable) {
+			previous_executable = std::make_unique<ProgramObject>(program);
+		}
+	}
+
+	void commit() { committed = true; }
+
+	~ProgramRelinkGuard() {
+		if (!previous_executable || committed) return;
+		std::string failedLinkLog = std::move(target.info_log);
+		target = std::move(*previous_executable);
+		target.linked = GL_FALSE;
+		target.validated = GL_FALSE;
+		target.has_executable = true;
+		target.info_log = std::move(failedLinkLog);
+	}
+};
 
 static void destroyProgram(GLuint program) {
 	auto it = ctx.program_objects.find(program);
@@ -72,6 +133,7 @@ static std::string threadgroupDeclarationsForLog(const std::string &mslSource) {
 // lifetime so late JVM/Metal teardown cannot lock a destroyed static mutex.
 struct ComputePipelineCacheEntry {
 	__strong id<MTLDevice> device = nil;
+	__strong id<MTLLibrary> library = nil;
 	__strong id<MTLComputePipelineState> pipeline = nil;
 	std::string error;
 	uint64_t last_used = 0;
@@ -116,18 +178,58 @@ static id<MTLComputePipelineState> computePipelineForMSL(const std::string &mslS
 	MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
 	options.languageVersion = MTLLanguageVersion2_2;
 	NSError *libraryError = nil;
+	NSError *metal4LibraryError = nil;
 	NSString *source = [NSString stringWithUTF8String:mslSource.c_str()];
-	id<MTLLibrary> library = source ? [compileDevice newLibraryWithSource:source options:options error:&libraryError] : nil;
+	id<MTLLibrary> library = nil;
+
+	if (ctx.metal4Enabled && ctx.metal4Compiler && source) {
+		MTL4LibraryDescriptor *libraryDescriptor = [[MTL4LibraryDescriptor alloc] init];
+		libraryDescriptor.source = source;
+		libraryDescriptor.options = options;
+		library = [ctx.metal4Compiler newLibraryWithDescriptor:libraryDescriptor error:&metal4LibraryError];
+		if (!library) {
+			GL4METAL_LOG("Metal 4 compute library compile failed; retrying classic compiler: %s",
+				metal4LibraryError.localizedDescription.UTF8String ?: "unknown Metal 4 library error");
+		}
+	}
+
+	if (!library && source) library = [compileDevice newLibraryWithSource:source options:options error:&libraryError];
+	compiled.library = library;
 	id<MTLFunction> computeFunction = [library newFunctionWithName:@"main0"];
 	if (!computeFunction) {
-		compiled.error = libraryError ? (libraryError.localizedDescription.UTF8String ?: "Metal library compilation failed") :
-			(source ? "no main0 compute entry point" : "compute MSL is not valid UTF-8");
+		const char *classicErrorText = libraryError ? libraryError.localizedDescription.UTF8String : nullptr;
+		const char *metal4ErrorText = metal4LibraryError ? metal4LibraryError.localizedDescription.UTF8String : nullptr;
+		compiled.error = std::string("Metal compute library compilation failed: classic=") +
+			(classicErrorText ? classicErrorText : "not attempted/unknown") + "; Metal4=" +
+			(metal4ErrorText ? metal4ErrorText : "not attempted/unknown");
 	} else {
 		NSError *pipelineError = nil;
-		compiled.pipeline = [compileDevice newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
+		NSError *metal4PipelineError = nil;
+
+		if (ctx.metal4Enabled && ctx.metal4Compiler && library) {
+			MTL4LibraryFunctionDescriptor *functionDescriptor = [[MTL4LibraryFunctionDescriptor alloc] init];
+			functionDescriptor.library = library;
+			functionDescriptor.name = @"main0";
+			MTL4ComputePipelineDescriptor *pipelineDescriptor = [[MTL4ComputePipelineDescriptor alloc] init];
+			pipelineDescriptor.computeFunctionDescriptor = functionDescriptor;
+			MTL4CompilerTaskOptions *taskOptions = [[MTL4CompilerTaskOptions alloc] init];
+			compiled.pipeline = [ctx.metal4Compiler newComputePipelineStateWithDescriptor:pipelineDescriptor
+				compilerTaskOptions:taskOptions error:&metal4PipelineError];
+			if (!compiled.pipeline) {
+				GL4METAL_LOG("Metal 4 compute PSO failed; retrying classic compiler: %s",
+					metal4PipelineError.localizedDescription.UTF8String ?: "unknown Metal 4 PSO error");
+			}
+		}
+
 		if (!compiled.pipeline) {
-			compiled.error = pipelineError ? (pipelineError.localizedDescription.UTF8String ?: "Metal compute pipeline creation failed") :
-				"unknown Metal compute pipeline error";
+			compiled.pipeline = [compileDevice newComputePipelineStateWithFunction:computeFunction error:&pipelineError];
+		}
+		if (!compiled.pipeline) {
+			const char *classicErrorText = pipelineError ? pipelineError.localizedDescription.UTF8String : nullptr;
+			const char *metal4ErrorText = metal4PipelineError ? metal4PipelineError.localizedDescription.UTF8String : nullptr;
+			compiled.error = std::string("Metal compute pipeline creation failed: classic=") +
+				(classicErrorText ? classicErrorText : "unknown error") + "; Metal4=" +
+				(metal4ErrorText ? metal4ErrorText : "not attempted/unknown");
 		}
 	}
 
@@ -515,9 +617,18 @@ static std::string activeUniformName(const TranslatedUniform &u) {
 
 static bool linkComputeProgram(GLuint programName, ProgramObject &program, const ShaderObject &computeShader) {
 	TranslatedProgram translated;
-	if (!translateComputeProgram(computeShader.source, translated)) {
-		program.info_log = translated.log;
-		GL4METAL_LOG("glLinkProgram(%u): compute translation failed:\n%s", programName, translated.log.c_str());
+	try {
+		if (!translateComputeProgram(computeShader.compiled_stage, translated)) {
+			program.info_log = translated.log;
+			GL4METAL_LOG("glLinkProgram(%u): compute translation failed:\n%s", programName, translated.log.c_str());
+			return false;
+		}
+	} catch (const std::exception &exception) {
+		program.info_log = std::string("compute shader translation raised an exception: ") + exception.what() + "\n";
+		GL4METAL_LOG("glLinkProgram(%u): %s", programName, program.info_log.c_str());
+		return false;
+	} catch (...) {
+		program.info_log = "compute shader translation raised an unknown exception\n";
 		return false;
 	}
 	std::string pipelineError;
@@ -637,7 +748,8 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 		imageUniform.info.array_size = (int)arrayCount;
 		imageUniform.base_location = nextLocation;
 		imageUniform.is_image = true;
-		imageUniform.opaque_gl_type = firstImage.is_3d ? 0x904Eu : 0x904Du; // GL_IMAGE_3D / GL_IMAGE_2D
+		imageUniform.opaque_gl_type = firstImage.is_3d ? GL_IMAGE_3D :
+			(firstImage.is_array ? GL_IMAGE_2D_ARRAY : GL_IMAGE_2D);
 		imageUniform.image_index = (uint32_t)imageIndex;
 		for (uint32_t element = 0; element < arrayCount; ++element) {
 			program.locations.emplace_back((GLint)program.uniforms.size(), (GLint)element);
@@ -687,6 +799,7 @@ static bool linkComputeProgram(GLuint programName, ProgramObject &program, const
 		}
 	}
 	program.is_compute = true;
+	program.has_executable = true;
 	program.linked = GL_TRUE;
 	return true;
 }
@@ -778,7 +891,7 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 		return;
 	}
 	ProgramObject *program = findProgram(ctx.current_program);
-	if (!program || !program->linked || !program->is_compute || !program->compute_pipeline) {
+	if (!program || !program->has_executable || !program->is_compute || !program->compute_pipeline) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glDispatchCompute: current program is not a linked compute program");
 		return;
@@ -790,6 +903,13 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 			return;
 		}
 		if (num_groups_x == 0 || num_groups_y == 0 || num_groups_z == 0) return;
+	}
+	if (indirect && ((indirectOffset & 3u) != 0 || indirectOffset > indirectBuffer.length ||
+		indirectBuffer.length - indirectOffset < sizeof(uint32_t) * 3u || indirectBuffer.gpuAddress == 0 ||
+		UINT64_MAX - indirectBuffer.gpuAddress < (MTLGPUAddress)indirectOffset)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		GL4METAL_LOG("glDispatchComputeIndirect: invalid indirect argument range, GPU address, or alignment");
+		return;
 	}
 
 	const uint64_t localThreadCount = (uint64_t)program->compute_workgroup_size[0] *
@@ -927,7 +1047,8 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 					}
 					if (object.texture && object.texture.textureType == expectedType &&
 						(object.texture.usage & MTLTextureUsageShaderRead) != 0) {
-						texture = object.texture;
+						texture = gl4metalTextureForSampling(object, object.texture);
+						if (!texture) return;
 						if (isBufferSampler) addUniqueBufferName(usedBufferNames, object.buffer_object);
 						else sampler = gl4metalSamplerForTexture(object, (GLuint)textureUnit);
 					}
@@ -966,9 +1087,11 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 		}
 		const ImageUnitBinding &binding = ctx.image_unit_bindings[(GLuint)imageUnit];
 		auto textureObject = ctx.texture_objects.find(binding.texture);
-		const GLenum expectedTarget = imageInfo.is_3d ? GL_TEXTURE_3D : GL_TEXTURE_2D;
-		const MTLTextureType expectedType = imageInfo.is_3d ? MTLTextureType3D : MTLTextureType2D;
-		const bool invalidLayerMode = imageInfo.is_3d
+		const GLenum expectedTarget = imageInfo.is_3d ? GL_TEXTURE_3D :
+			(imageInfo.is_array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D);
+		const MTLTextureType expectedType = imageInfo.is_3d ? MTLTextureType3D :
+			(imageInfo.is_array ? MTLTextureType2DArray : MTLTextureType2D);
+		const bool invalidLayerMode = (imageInfo.is_3d || imageInfo.is_array)
 			? binding.layered != GL_TRUE
 			: binding.layer != 0;
 		// GL ignores the layered flag for a plain GL_TEXTURE_2D image binding;
@@ -991,7 +1114,8 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 					(void *)&ctx, imageInfo.name.c_str(), (GLuint)imageUnit, binding.texture, actualTarget,
 					(unsigned)actualType, binding.level, (unsigned)binding.layered,
 					binding.layer, binding.access, binding.format, actualFormat,
-					imageInfo.is_3d ? "layered GL_TEXTURE_3D" : "GL_TEXTURE_2D",
+					imageInfo.is_3d ? "layered GL_TEXTURE_3D" :
+					(imageInfo.is_array ? "layered GL_TEXTURE_2D_ARRAY" : "GL_TEXTURE_2D"),
 					(unsigned long long)(failureNumber + 1));
 			}
 			return;
@@ -1015,12 +1139,80 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 		imageTextureBindings.push_back(resolved);
 	}
 
-	// Close a render pass before compute work. If the previous GL command was
-	// another compute dispatch, keep its encoder open: Metal permits changing the
-	// pipeline and rebinding resources between dispatches in the same encoder.
+	// Prefer the Metal 4 compute path on MTLGPUFamilyMetal4 devices. Graphics rendering
+	// remains on the classic queue for this migration phase; queue transitions are
+	// ordered through MTLSharedEvent by gl4metalBeginMetal4Compute/gl4metalEnsureClassicCommandBuffer.
+	if (ctx.metal4Enabled && gl4metalBeginMetal4Compute()) {
+		id<MTL4ComputeCommandEncoder> metal4Encoder = ctx.currentMetal4ComputeEncoder;
+		bool bindingsValid = metal4Encoder != nil;
+		if (bindingsValid) {
+			gl4metalMetal4UseComputePipeline(program->compute_pipeline);
+			[metal4Encoder setComputePipelineState:program->compute_pipeline];
+		}
+		for (const ComputeBufferBinding &binding : storageBufferBindings) {
+			bindingsValid = gl4metalMetal4BindBuffer(binding.buffer, binding.offset, binding.slot) && bindingsValid;
+		}
+		for (const ComputeBufferBinding &binding : uniformBufferBindings) {
+			bindingsValid = gl4metalMetal4BindBuffer(binding.buffer, binding.offset, binding.slot) && bindingsValid;
+		}
+		if (program->needs_buffer_size_buffer[2]) {
+			bindingsValid = gl4metalMetal4BindBytes(computeBufferSizes.data(), sizeof(computeBufferSizes),
+				GL4METAL_BUFFER_SIZE_BUFFER_INDEX) && bindingsValid;
+		}
+		if (!program->uniform_data[2].empty()) {
+			const std::vector<uint8_t> &uniformBytes = program->uniform_data[2];
+			if (uniformBytes.size() <= 4096) {
+				bindingsValid = gl4metalMetal4BindBytes(uniformBytes.data(), uniformBytes.size(),
+					GL4METAL_UNIFORM_BUFFER_INDEX) && bindingsValid;
+			} else {
+				__strong id<MTLBuffer> uniformBuffer = nil;
+				NSUInteger uniformOffset = 0;
+				if (!programUniformBufferForStage(*program, 2, uniformBuffer, uniformOffset)) {
+					bindingsValid = false;
+				} else {
+					bindingsValid = gl4metalMetal4BindBuffer(uniformBuffer, uniformOffset,
+						GL4METAL_UNIFORM_BUFFER_INDEX) && bindingsValid;
+				}
+			}
+		}
+		for (const ComputeTextureBinding &binding : sampledTextureBindings) {
+			bindingsValid = gl4metalMetal4BindTexture(binding.texture, binding.slot) && bindingsValid;
+			if (binding.usesSampler) {
+				bindingsValid = gl4metalMetal4BindSampler(binding.sampler, binding.slot) && bindingsValid;
+			}
+		}
+		for (const ComputeTextureBinding &binding : imageTextureBindings) {
+			bindingsValid = gl4metalMetal4BindTexture(binding.texture, binding.slot) && bindingsValid;
+		}
+		if (indirect) {
+			bindingsValid = gl4metalMetal4UseBuffer(indirectBuffer) && bindingsValid;
+		}
+		if (bindingsValid && gl4metalMetal4PrepareDispatch()) {
+			[metal4Encoder setArgumentTable:ctx.metal4ComputeArgumentTable];
+			for (GLuint buffer_id : usedBufferNames) gl4metalMarkMetal4BufferUsed(buffer_id);
+			const MTLSize threadsPerGroup = MTLSizeMake(program->compute_workgroup_size[0],
+				program->compute_workgroup_size[1], program->compute_workgroup_size[2]);
+			if (indirect) {
+				[metal4Encoder dispatchThreadgroupsWithIndirectBuffer:
+					indirectBuffer.gpuAddress + (MTLGPUAddress)indirectOffset threadsPerThreadgroup:threadsPerGroup];
+			} else {
+				[metal4Encoder dispatchThreadgroups:MTLSizeMake(num_groups_x, num_groups_y, num_groups_z)
+					threadsPerThreadgroup:threadsPerGroup];
+			}
+			return;
+		}
+		// No dispatch has been encoded yet. Commit any earlier MTL4 work in this batch,
+		// then execute this dispatch through the classic path rather than dropping it.
+		GL4METAL_LOG("glDispatchCompute: Metal 4 binding/encoder setup failed; falling back to classic compute");
+		gl4metalCommitMetal4Compute();
+	}
+
+	// Classic fallback: close a render pass before compute work. If the previous GL
+	// command was another compute dispatch, keep its encoder open and reuse its state cache.
 	if (ctx.currentEncoder) endRenderEncoder();
-	if (!ctx.currentCommandBuffer && ctx.commandQueue) {
-		ctx.currentCommandBuffer = [ctx.commandQueue commandBuffer];
+	if (!gl4metalEnsureClassicCommandBuffer()) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return;
 	}
 	if (!ctx.currentCommandBuffer) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
@@ -1119,6 +1311,7 @@ void glAttachShader(GLuint program, GLuint shader) {
 		return;
 	}
 	if (std::find(p->shaders.begin(), p->shaders.end(), shader) != p->shaders.end()) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glAttachShader: shader %u is already attached to program %u", shader, program);
 		return;
 	}
@@ -1134,6 +1327,7 @@ void glDetachShader(GLuint program, GLuint shader) {
 	}
 	auto it = std::find(p->shaders.begin(), p->shaders.end(), shader);
 	if (it == p->shaders.end()) {
+		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("glDetachShader: shader %u is not attached to program %u", shader, program);
 		return;
 	}
@@ -1142,19 +1336,22 @@ void glDetachShader(GLuint program, GLuint shader) {
 }
 
 void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei *count, GLuint *shaders) {
-	ProgramObject *p = findProgram(program);
-	GLsizei n = 0;
-	if (p) {
-		for (GLuint shader : p->shaders) {
-			if (n >= maxCount) {
-				break;
-			}
-			shaders[n++] = shader;
-		}
+	if (!count || maxCount < 0 || (maxCount > 0 && !shaders)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
 	}
-	if (count) {
-		*count = n;
+	ProgramObject *programObject = findProgram(program);
+	if (!programObject) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		*count = 0;
+		return;
 	}
+	GLsizei copiedCount = 0;
+	for (GLuint shaderName : programObject->shaders) {
+		if (copiedCount >= maxCount) break;
+		shaders[copiedCount++] = shaderName;
+	}
+	*count = copiedCount;
 }
 
 void glLinkProgram(GLuint program) {
@@ -1165,9 +1362,13 @@ void glLinkProgram(GLuint program) {
 		return;
 	}
 	ProgramObject &p = *pp;
+	ProgramRelinkGuard relinkGuard(p, ctx.current_program == program);
 
-	// A failed link must not keep anything from an earlier successful one.
+	// Link status is reset immediately. If this is the current program and the
+	// relink fails, relinkGuard preserves its old executable until glUseProgram
+	// removes it from current state, matching GL's active-program rule.
 	p.linked = GL_FALSE;
+	p.has_executable = false;
 	p.info_log.clear();
 	p.vertex_function = nil;
 	p.fragment_function = nil;
@@ -1177,11 +1378,14 @@ void glLinkProgram(GLuint program) {
 	p.compute_pipeline = nil;
 	p.compute_workgroup_size[0] = p.compute_workgroup_size[1] = p.compute_workgroup_size[2] = 1;
 	p.is_compute = false;
+	for (int stage = 0; stage < 3; ++stage) p.needs_buffer_size_buffer[stage] = false;
+	p.validated = GL_FALSE;
 	p.storage_buffers.clear();
 	p.storage_images.clear();
 	p.image_units.clear();
 	p.attribs.clear();
 	p.uniforms.clear();
+	p.sampler_uniform_indices.clear();
 	p.active_uniforms.clear();
 	p.locations.clear();
 	p.uniform_data[0].clear();
@@ -1204,47 +1408,65 @@ void glLinkProgram(GLuint program) {
 	const ShaderObject *vs = nullptr;
 	const ShaderObject *fs = nullptr;
 	const ShaderObject *cs = nullptr;
+	unsigned vertexShaderCount = 0;
+	unsigned fragmentShaderCount = 0;
 	unsigned computeShaderCount = 0;
-	for (GLuint shader : p.shaders) {
-		auto it = ctx.shader_objects.find(shader);
-		if (it == ctx.shader_objects.end()) {
-			continue;
+	for (GLuint shaderName : p.shaders) {
+		auto shaderIt = ctx.shader_objects.find(shaderName);
+		if (shaderIt == ctx.shader_objects.end()) {
+			p.info_log = "an attached shader object no longer exists\n";
+			return;
 		}
-		if (it->second.type == GL_VERTEX_SHADER) {
-			vs = &it->second;
-		} else if (it->second.type == GL_FRAGMENT_SHADER) {
-			fs = &it->second;
-		} else if (it->second.type == GL_COMPUTE_SHADER) {
-			cs = &it->second;
-			++computeShaderCount;
+		const ShaderObject &attachedShader = shaderIt->second;
+		if (!attachedShader.compiled || !attachedShader.compiled_stage) {
+			p.info_log = "an attached shader is not compiled\n";
+			return;
+		}
+		switch (attachedShader.type) {
+			case GL_VERTEX_SHADER:
+				vs = &attachedShader;
+				++vertexShaderCount;
+				break;
+			case GL_FRAGMENT_SHADER:
+				fs = &attachedShader;
+				++fragmentShaderCount;
+				break;
+			case GL_COMPUTE_SHADER:
+				cs = &attachedShader;
+				++computeShaderCount;
+				break;
+			default:
+				p.info_log = "an attached shader has an unsupported stage type\n";
+				return;
 		}
 	}
-	if (cs) {
-		if (vs || fs || computeShaderCount != 1) {
+	if (computeShaderCount != 0) {
+		if (computeShaderCount != 1 || vertexShaderCount != 0 || fragmentShaderCount != 0) {
 			p.info_log = "a compute program must contain exactly one compute shader and no graphics stages\n";
 			return;
 		}
-		if (!cs->compiled) {
-			p.info_log = "the attached compute shader is not compiled\n";
-			return;
-		}
-		linkComputeProgram(program, p, *cs);
+		if (linkComputeProgram(program, p, *cs)) relinkGuard.commit();
 		return;
 	}
-	if (!vs || !fs) {
-		p.info_log = "a program needs one vertex and one fragment shader attached\n";
-		return;
-	}
-	if (!vs->compiled || !fs->compiled) {
-		p.info_log = "an attached shader is not compiled\n";
+	if (vertexShaderCount != 1 || fragmentShaderCount != 1 || !vs || !fs) {
+		p.info_log = "a graphics program must contain exactly one vertex shader and one fragment shader\n";
 		return;
 	}
 
 	// GLSL -> SPIR-V -> MSL for both stages at once (see shadertranslator.cpp).
 	TranslatedProgram tp;
-	if (!translateProgram(vs->source, fs->source, tp, p.frag_data_bindings)) {
-		p.info_log = tp.log;
-		GL4METAL_LOG("glLinkProgram(%u): translation failed:\n%s", program, tp.log.c_str());
+	try {
+		if (!translateProgram(vs->compiled_stage, fs->compiled_stage, tp, p.frag_data_bindings)) {
+			p.info_log = tp.log;
+			GL4METAL_LOG("glLinkProgram(%u): translation failed:\n%s", program, tp.log.c_str());
+			return;
+		}
+	} catch (const std::exception &exception) {
+		p.info_log = std::string("shader translation raised an exception: ") + exception.what() + "\n";
+		GL4METAL_LOG("glLinkProgram(%u): %s", program, p.info_log.c_str());
+		return;
+	} catch (...) {
+		p.info_log = "shader translation raised an unknown exception\n";
 		return;
 	}
 	if (dumpEnabled()) {
@@ -1282,35 +1504,56 @@ void glLinkProgram(GLuint program) {
 	for (int stage = 0; stage < 3; ++stage)
 		p.needs_buffer_size_buffer[stage] = tp.needs_buffer_size_buffer[stage];
 
-	// Vertex attributes: honour glBindAttribLocation first, then give the rest the lowest free index.
+	// GLSL layout(location=...) has priority over glBindAttribLocation. The latter
+	// only supplies a GL VAO index for attributes without an explicit source location.
+	// Reserve every explicit location and API binding before assigning automatic slots,
+	// otherwise an unbound attribute can accidentally alias a shader-declared location.
 	bool used[16] = {};
-	for (const TranslatedAttrib &a : tp.attribs) {
-		auto bound = p.attrib_bindings.find(a.name);
-		if (bound != p.attrib_bindings.end() && bound->second < 16) {
+	std::vector<bool> hasExplicitLocation;
+	collectCompiledStageExplicitVertexAttributeLocations(vs->compiled_stage, tp.attribs, hasExplicitLocation);
+	for (size_t attribIndex = 0; attribIndex < tp.attribs.size(); ++attribIndex) {
+		const TranslatedAttrib &attribute = tp.attribs[attribIndex];
+		if (hasExplicitLocation[attribIndex]) {
+			if (attribute.location >= 16) {
+				p.info_log = "explicit vertex attribute location exceeds GL_MAX_VERTEX_ATTRIBS for '" + attribute.name + "'\n";
+				return;
+			}
+			used[attribute.location] = true;
+			continue;
+		}
+		auto bound = p.attrib_bindings.find(attribute.name);
+		if (bound != p.attrib_bindings.end()) {
+			if (bound->second >= 16) {
+				p.info_log = "glBindAttribLocation index exceeds GL_MAX_VERTEX_ATTRIBS for '" + attribute.name + "'\n";
+				return;
+			}
 			used[bound->second] = true;
 		}
 	}
-	for (const TranslatedAttrib &a : tp.attribs) {
+	for (size_t attribIndex = 0; attribIndex < tp.attribs.size(); ++attribIndex) {
+		const TranslatedAttrib &attribute = tp.attribs[attribIndex];
 		ProgramAttrib pa;
-		pa.name = a.name;
-		pa.msl_location = a.location;
-		pa.vecsize = a.vecsize;
-		pa.is_integer = a.is_integer;
-		pa.is_unsigned = a.is_unsigned;
-		auto bound = p.attrib_bindings.find(a.name);
-		if (bound != p.attrib_bindings.end() && bound->second < 16) {
-			pa.gl_index = (GLint)bound->second;
+		pa.name = attribute.name;
+		pa.msl_location = attribute.location;
+		pa.vecsize = attribute.vecsize;
+		pa.is_integer = attribute.is_integer;
+		pa.is_unsigned = attribute.is_unsigned;
+		if (hasExplicitLocation[attribIndex]) {
+			pa.gl_index = (GLint)attribute.location;
 		} else {
-			int slot = 0;
-			while (slot < 16 && used[slot]) {
-				slot++;
+			auto bound = p.attrib_bindings.find(attribute.name);
+			if (bound != p.attrib_bindings.end()) {
+				pa.gl_index = (GLint)bound->second;
+			} else {
+				int slot = 0;
+				while (slot < 16 && used[slot]) ++slot;
+				if (slot == 16) {
+					p.info_log = "too many active vertex attributes\n";
+					return;
+				}
+				used[slot] = true;
+				pa.gl_index = slot;
 			}
-			if (slot == 16) {
-				p.info_log = "too many active vertex attributes\n";
-				return;
-			}
-			used[slot] = true;
-			pa.gl_index = slot;
 		}
 		p.attribs.push_back(pa);
 	}
@@ -1326,7 +1569,12 @@ void glLinkProgram(GLuint program) {
 			p.locations.emplace_back((GLint)p.uniforms.size(), element);
 		}
 		nextLocation += u.array_size;
+		const uint32_t uniformIndex = (uint32_t)p.uniforms.size();
 		p.uniforms.push_back(pu);
+		if (u.kind == TranslatedUniform::Sampler &&
+			(u.stage[0].present || u.stage[1].present)) {
+			p.sampler_uniform_indices.push_back(uniformIndex);
+		}
 	}
 	p.uniform_data[0].assign(tp.block_size[0], 0); // GL uniforms start at 0
 	p.uniform_data[1].assign(tp.block_size[1], 0);
@@ -1380,7 +1628,9 @@ void glLinkProgram(GLuint program) {
 	p.vertex_stage_cache_id = vertexEntry.cacheId;
 	p.fragment_stage_cache_id = fragmentEntry.cacheId;
 	p.uses_gl_frag_coord = tp.uses_gl_frag_coord;
+	p.has_executable = true;
 	p.linked = GL_TRUE;
+	relinkGuard.commit();
 
 	if (dumpEnabled()) {
 		for (const ProgramAttrib &a : p.attribs) {
@@ -1409,15 +1659,19 @@ void glUseProgram(GLuint program) {
 		ProgramObject *old = findProgram(previous);
 		if (old && old->deleted) {
 			destroyProgram(previous); // glDeleteProgram was waiting for it to stop being current
+		} else if (old && !old->linked && old->has_executable) {
+			clearProgramExecutable(*old);
 		}
 	}
 }
 
 void glValidateProgram(GLuint program) {
 	ProgramObject *p = findProgram(program);
-	if (p) {
-		p->validated = p->linked;
+	if (!p) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
 	}
+	p->validated = p->linked;
 }
 
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
@@ -1490,6 +1744,15 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 			*params = (GLint)longest;
 			break;
 		}
+		case GL_TRANSFORM_FEEDBACK_VARYINGS:
+			*params = 0; // capture layout is rejected until vertex-output instrumentation exists
+			break;
+		case GL_TRANSFORM_FEEDBACK_BUFFER_MODE:
+			*params = GL_INTERLEAVED_ATTRIBS;
+			break;
+		case GL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH:
+			*params = 0;
+			break;
 		default:
 			gl4metalSetError(GL_INVALID_ENUM);
 			GL4METAL_LOG("glGetProgramiv: unhandled pname 0x%X", pname);
@@ -1499,17 +1762,31 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint *params) {
 }
 
 void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
+	if (bufSize < 0 || (bufSize > 0 && !infoLog)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	ProgramObject *p = findProgram(program);
-	copyGLString(p ? p->info_log : std::string(), bufSize, length, infoLog);
+	if (!p) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
+		return;
+	}
+	copyGLString(p->info_log, bufSize, length, infoLog);
 }
 
 // MARK: - Vertex attribute locations
 
 void glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) {
 	ProgramObject *p = findProgram(program);
-	if (!p || index >= 16 || !name || strncmp(name, "gl_", 3) == 0) {
+	if (!p || index >= 16 || !name) {
 		gl4metalSetError(GL_INVALID_VALUE);
-		GL4METAL_LOG("glBindAttribLocation: invalid program %u, index %u or name", program, index);
+		GL4METAL_LOG("glBindAttribLocation: invalid program %u, index %u or null name", program, index);
+		return;
+	}
+	if (strncmp(name, "gl_", 3) == 0) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBindAttribLocation: attribute name '%s' uses the reserved gl_ prefix", name);
 		return;
 	}
 	p->attrib_bindings[name] = index; // takes effect at the next glLinkProgram
@@ -1529,6 +1806,10 @@ GLint glGetAttribLocation(GLuint program, const GLchar *name) {
 }
 
 void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+	if (bufSize < 0 || (bufSize > 0 && !name)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || index >= it->second.attribs.size()) {
 		gl4metalSetError(GL_INVALID_VALUE);

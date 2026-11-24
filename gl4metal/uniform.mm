@@ -298,6 +298,7 @@ GLint glGetUniformLocation(GLuint program, const GLchar *name) {
 }
 
 void glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	double values[16] = { 0 };
 	int n = componentsAt(program, location);
 	readUniform(program, location, n, values);
@@ -307,6 +308,7 @@ void glGetUniformfv(GLuint program, GLint location, GLfloat *params) {
 }
 
 void glGetUniformiv(GLuint program, GLint location, GLint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	double values[16] = { 0 };
 	int n = componentsAt(program, location);
 	readUniform(program, location, n, values);
@@ -316,6 +318,7 @@ void glGetUniformiv(GLuint program, GLint location, GLint *params) {
 }
 
 void glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	double values[16] = { 0 };
 	int n = componentsAt(program, location);
 	readUniform(program, location, n, values);
@@ -325,6 +328,10 @@ void glGetUniformuiv(GLuint program, GLint location, GLuint *params) {
 }
 
 void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
+	if (bufSize < 0 || (bufSize > 0 && !name)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || index >= it->second.active_uniforms.size()) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -405,8 +412,13 @@ void glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, const GLuint *u
 }
 
 void glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformName) {
+	if (bufSize < 0 || (bufSize > 0 && !uniformName)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || uniformIndex >= it->second.active_uniforms.size()) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		if (length) *length = 0;
 		return;
 	}
@@ -458,11 +470,14 @@ void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum 
 }
 
 void glGetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformBlockName) {
+	if (bufSize < 0 || (bufSize > 0 && !uniformBlockName)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.program_objects.find(program);
 	if (it == ctx.program_objects.end() || uniformBlockIndex >= it->second.blocks.size()) {
-		if (length) {
-			*length = 0;
-		}
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
 		return;
 	}
 	copyGLString(it->second.blocks[uniformBlockIndex].info.name, bufSize, length, uniformBlockName);

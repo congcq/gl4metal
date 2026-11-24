@@ -60,7 +60,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl4metal/uniform.mm
     gl4metal/vertexarray.mm
 
-    gl4metal/shadertranslator.cpp
+    gl4metal/shadertranslator.mm
 
     gl4metal/extensions/ARB/GL_ARB_clear_texture.mm
     gl4metal/extensions/ARB/GL_ARB_compute_shader.mm
@@ -82,5 +82,4 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
     "-framework CoreFoundation"
     "-framework Metal"
     "-framework QuartzCore"
-    "-framework UIKit"
 )

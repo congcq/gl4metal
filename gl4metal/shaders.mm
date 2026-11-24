@@ -1,5 +1,10 @@
 #import "shaders.h"
 #include <GL/glcorearb.h>
+#include <algorithm>
+#include <cstring>
+#include <cstdlib>
+#include <new>
+#include <stdexcept>
 
 GLuint glCreateShader(GLenum type) {
 	if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER && type != GL_COMPUTE_SHADER) {
@@ -46,74 +51,108 @@ GLboolean glIsShader(GLuint shader) {
 void glShaderSource(GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length) {
 	auto it = ctx.shader_objects.find(shader);
 	if (it == ctx.shader_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glShaderSource: invalid shader %u", shader);
 		return;
 	}
-	std::string source;
-	for (GLsizei i = 0; i < count; i++) {
-		if (!string[i]) {
-			continue;
-		}
-		if (length && length[i] >= 0) {
-			source.append(string[i], (size_t)length[i]);
-		} else {
-			source.append(string[i]);
-		}
+	if (count < 0 || (count > 0 && !string)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
 	}
-	it->second.source = source;
+	std::string source;
+	try {
+		for (GLsizei stringIndex = 0; stringIndex < count; ++stringIndex) {
+			if (!string[stringIndex]) {
+				gl4metalSetError(GL_INVALID_VALUE);
+				return;
+			}
+			if (length && length[stringIndex] >= 0) {
+				source.append(string[stringIndex], (size_t)length[stringIndex]);
+			} else {
+				source.append(string[stringIndex]);
+			}
+		}
+	} catch (const std::bad_alloc &) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return;
+	} catch (const std::length_error &) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		return;
+	}
+	ShaderObject &shaderObject = it->second;
+	shaderObject.source.swap(source);
+	// Replacing source invalidates only the shader object's compile result. A
+	// previously linked program executable remains valid until it is relinked.
+	shaderObject.compiled = GL_FALSE;
+	shaderObject.compiled_stage.reset();
+	shaderObject.info_log.clear();
 }
 
 void glCompileShader(GLuint shader) {
 	auto it = ctx.shader_objects.find(shader);
 	if (it == ctx.shader_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
 		GL4METAL_LOG("glCompileShader: invalid shader %u", shader);
 		return;
 	}
-	ShaderObject &s = it->second;
-	s.info_log.clear();
-	if (s.source.empty()) {
-		s.compiled = GL_FALSE;
-		s.info_log = "shader source is empty\n";
+	ShaderObject &shaderObject = it->second;
+	shaderObject.compiled = GL_FALSE;
+	shaderObject.compiled_stage.reset();
+	shaderObject.info_log.clear();
+	if (shaderObject.source.empty()) {
+		shaderObject.info_log = "shader source is empty\n";
 		return;
 	}
 
-	// GLSL is only stored here. The GLSL -> MSL translation needs both stages and their interface,
-	// so it belongs to glLinkProgram.
-	s.compiled = GL_TRUE;
+	// glCompileShader performs the real GLSL stage parse and validation. The
+	// parsed glslang intermediate is retained for the first program link, where
+	// cross-stage validation, SPIR-V generation and MSL translation take place.
+	shaderObject.compiled_stage = compileShaderStage((uint32_t)shaderObject.type,
+		shaderObject.source, shaderObject.info_log);
+	shaderObject.compiled = shaderObject.compiled_stage ? GL_TRUE : GL_FALSE;
+	if (!shaderObject.compiled) {
+		GL4METAL_LOG("glCompileShader(%u) failed:\n%s", shader, shaderObject.info_log.c_str());
+		return;
+	}
 
 	const char *dump = getenv("GL4METAL_DUMP_SHADERS");
 	if (dump && dump[0] == '1') {
 		GL4METAL_LOG("---- %s shader %u ----\n%s\n---- end shader %u ----",
-			s.type == GL_VERTEX_SHADER ? "vertex" : (s.type == GL_FRAGMENT_SHADER ? "fragment" : "compute"), shader, s.source.c_str(), shader);
+			shaderObject.type == GL_VERTEX_SHADER ? "vertex" : (shaderObject.type == GL_FRAGMENT_SHADER ? "fragment" : "compute"),
+			shader, shaderObject.source.c_str(), shader);
 	}
 }
 
 void glGetShaderiv(GLuint shader, GLenum pname, GLint *params) {
+	if (!params) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.shader_objects.find(shader);
 	if (it == ctx.shader_objects.end()) {
-		GL4METAL_LOG("glGetShaderiv: invalid shader %u", shader);
+		gl4metalSetError(GL_INVALID_VALUE);
 		*params = 0;
 		return;
 	}
-	const ShaderObject &s = it->second;
+	const ShaderObject &shaderObject = it->second;
 	switch (pname) {
 		case GL_SHADER_TYPE:
-			*params = (GLint)s.type;
+			*params = (GLint)shaderObject.type;
 			break;
 		case GL_DELETE_STATUS:
-			*params = s.deleted;
+			*params = shaderObject.deleted;
 			break;
 		case GL_COMPILE_STATUS:
-			*params = s.compiled;
+			*params = shaderObject.compiled;
 			break;
 		case GL_INFO_LOG_LENGTH:
-			*params = s.info_log.empty() ? 0 : (GLint)s.info_log.size() + 1; // includes the NUL terminator
+			*params = shaderObject.info_log.empty() ? 0 : (GLint)shaderObject.info_log.size() + 1;
 			break;
 		case GL_SHADER_SOURCE_LENGTH:
-			*params = s.source.empty() ? 0 : (GLint)s.source.size() + 1;
+			*params = shaderObject.source.empty() ? 0 : (GLint)shaderObject.source.size() + 1;
 			break;
 		default:
-			GL4METAL_LOG("glGetShaderiv: unhandled pname 0x%X", pname);
+			gl4metalSetError(GL_INVALID_ENUM);
 			*params = 0;
 			break;
 	}
@@ -132,11 +171,29 @@ void copyGLString(const std::string &src, GLsizei bufSize, GLsizei *length, GLch
 }
 
 void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog) {
+	if (bufSize < 0 || (bufSize > 0 && !infoLog)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.shader_objects.find(shader);
-	copyGLString(it == ctx.shader_objects.end() ? std::string() : it->second.info_log, bufSize, length, infoLog);
+	if (it == ctx.shader_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
+		return;
+	}
+	copyGLString(it->second.info_log, bufSize, length, infoLog);
 }
 
 void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *source) {
+	if (bufSize < 0 || (bufSize > 0 && !source)) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		return;
+	}
 	auto it = ctx.shader_objects.find(shader);
-	copyGLString(it == ctx.shader_objects.end() ? std::string() : it->second.source, bufSize, length, source);
+	if (it == ctx.shader_objects.end()) {
+		gl4metalSetError(GL_INVALID_VALUE);
+		if (length) *length = 0;
+		return;
+	}
+	copyGLString(it->second.source, bufSize, length, source);
 }

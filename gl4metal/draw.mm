@@ -435,8 +435,9 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 static MTLSamplerAddressMode addressMode(GLenum wrap) {
 	switch (wrap) {
 		case GL_CLAMP_TO_EDGE:
-		case GL_CLAMP_TO_BORDER: // clamp-to-border colours are not available on every iOS GPU, edge clamp is the closest
 			return MTLSamplerAddressModeClampToEdge;
+		case GL_CLAMP_TO_BORDER:
+			return MTLSamplerAddressModeClampToBorderColor;
 		case GL_MIRRORED_REPEAT:
 			return MTLSamplerAddressModeMirrorRepeat;
 		default:
@@ -524,7 +525,7 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 	static thread_local std::vector<FeedbackSnapshotRequest> requests;
 	static thread_local std::unordered_set<GLuint> seenTextures;
 	// Requests contain strong Metal texture references. Clear them on every exit,
-	// including the default-framebuffer and no-sampler fast paths, while retaining
+	// including default-framebuffer and sampler-free fast paths, while retaining
 	// vector/hash-table capacity for subsequent feedback checks.
 	requests.clear();
 	seenTextures.clear();
@@ -533,17 +534,16 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 		std::unordered_set<GLuint> &seenTextures;
 		~ScratchReset() { requests.clear(); seenTextures.clear(); }
 	} scratchReset{requests, seenTextures};
-	if (ctx.draw_fbo == 0) return true; // the drawable is never a GL texture attachment
-	bool hasSampler = false;
-	for (const ProgramUniform &uniform : program.uniforms) {
-		if (uniform.info.kind == TranslatedUniform::Sampler &&
-			(uniform.info.stage[0].present || uniform.info.stage[1].present)) { hasSampler = true; break; }
+	if (ctx.draw_fbo == 0 || program.sampler_uniform_indices.empty()) {
+		return true; // drawable or sampler-free programs cannot form feedback loops
 	}
-	if (!hasSampler) return true;
-
-	for (const ProgramUniform &uniform : program.uniforms) {
-		if (uniform.info.kind != TranslatedUniform::Sampler ||
-			(!uniform.info.stage[0].present && !uniform.info.stage[1].present)) continue;
+	for (uint32_t uniformIndex : program.sampler_uniform_indices) {
+		if (uniformIndex >= program.uniforms.size()) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: linked sampler-uniform index is out of range; draw skipped", caller);
+			return false;
+		}
+		const ProgramUniform &uniform = program.uniforms[uniformIndex];
 		if (uniform.info.array_size <= 0 || (size_t)uniform.info.array_size > uniform.units.size()) {
 			gl4metalSetError(GL_INVALID_OPERATION);
 			GL4METAL_LOG("%s: sampler '%s' has an invalid unit array; draw skipped", caller, uniform.info.name.c_str());
@@ -605,6 +605,8 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 				descriptor.mipmapLevelCount = source.mipmapLevelCount;
 				descriptor.storageMode = MTLStorageModePrivate;
 				descriptor.usage = MTLTextureUsageShaderRead;
+				object.feedback_sampled_view = nil;
+				object.feedback_sampled_view_source_identity = nullptr;
 				snapshot = [ctx.device newTextureWithDescriptor:descriptor];
 				if (!snapshot) {
 					gl4metalSetError(GL_OUT_OF_MEMORY);
@@ -641,27 +643,54 @@ static bool prepareFeedbackSnapshots(const ProgramObject &program, const char *c
 
 	// Finish earlier writes to the active render targets before reading them in a blit.
 	endRenderEncoder();
-	id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
-	if (!blit) {
-		gl4metalSetError(GL_OUT_OF_MEMORY);
-		GL4METAL_LOG("%s: failed to create Metal blit encoder for %zu feedback snapshot(s)", caller, requests.size());
-		encoder = beginRenderPass(0, true); // restore the same logical pass for subsequent GL commands
-		return false;
-	}
-	for (const FeedbackSnapshotRequest &request : requests) {
-		// Copy every mip level, not just the attached level: the shader may issue
-		// explicit-LOD samples from other levels of the same GL texture object.
-		for (NSUInteger level = 0; level < request.source.mipmapLevelCount; ++level) {
-			const NSUInteger width = std::max<NSUInteger>(1, request.source.width >> level);
-			const NSUInteger height = std::max<NSUInteger>(1, request.source.height >> level);
-			const MTLSize size = MTLSizeMake(width, height, 1);
-			[blit copyFromTexture:request.source sourceSlice:0 sourceLevel:level
-				sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
-				toTexture:request.snapshot destinationSlice:0 destinationLevel:level
-				destinationOrigin:MTLOriginMake(0, 0, 0)];
+	bool snapshotsCopiedByMetal4 = false;
+
+	if (ctx.metal4Enabled) {
+		snapshotsCopiedByMetal4 = true;
+		for (const FeedbackSnapshotRequest &request : requests) {
+			// Copy every mip level, not just the attached level: a shader may issue
+			// explicit-LOD samples from other levels of the same GL texture object.
+			for (NSUInteger level = 0; level < request.source.mipmapLevelCount; ++level) {
+				const NSUInteger width = std::max<NSUInteger>(1, request.source.width >> level);
+				const NSUInteger height = std::max<NSUInteger>(1, request.source.height >> level);
+				if (!gl4metalMetal4CopyTextureRegion(request.source, 0, level,
+					MTLOriginMake(0, 0, 0), MTLSizeMake(width, height, 1),
+					request.snapshot, 0, level, MTLOriginMake(0, 0, 0))) {
+					snapshotsCopiedByMetal4 = false;
+					break;
+				}
+			}
+			if (!snapshotsCopiedByMetal4) break;
 		}
 	}
-	[blit endEncoding];
+
+	if (!snapshotsCopiedByMetal4) {
+		if (!gl4metalEnsureClassicCommandBuffer()) {
+			gl4metalSetError(GL_OUT_OF_MEMORY);
+			GL4METAL_LOG("%s: failed to create ordered command buffer for %zu feedback snapshot(s)", caller, requests.size());
+			encoder = beginRenderPass(0, true);
+			return false;
+		}
+		id<MTLBlitCommandEncoder> blit = [ctx.currentCommandBuffer blitCommandEncoder];
+		if (!blit) {
+			gl4metalSetError(GL_OUT_OF_MEMORY);
+			GL4METAL_LOG("%s: failed to create Metal blit encoder for %zu feedback snapshot(s)", caller, requests.size());
+			encoder = beginRenderPass(0, true); // restore the same logical pass for subsequent GL commands
+			return false;
+		}
+		for (const FeedbackSnapshotRequest &request : requests) {
+			for (NSUInteger level = 0; level < request.source.mipmapLevelCount; ++level) {
+				const NSUInteger width = std::max<NSUInteger>(1, request.source.width >> level);
+				const NSUInteger height = std::max<NSUInteger>(1, request.source.height >> level);
+				const MTLSize size = MTLSizeMake(width, height, 1);
+				[blit copyFromTexture:request.source sourceSlice:0 sourceLevel:level
+					sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:size
+					toTexture:request.snapshot destinationSlice:0 destinationLevel:level
+					destinationOrigin:MTLOriginMake(0, 0, 0)];
+			}
+		}
+		[blit endEncoding];
+	}
 	for (const FeedbackSnapshotRequest &request : requests) {
 		auto textureObject = ctx.texture_objects.find(request.textureName);
 		if (textureObject != ctx.texture_objects.end()) {
@@ -722,8 +751,9 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	// Snapshot sampler-object state on the owning GL thread; this context is thread-local.
 	GLenum minFilter = t.min_filter, magFilter = t.mag_filter;
 	GLenum wrapS = t.wrap_s, wrapT = t.wrap_t, wrapR = t.wrap_r;
-	GLfloat minLod = t.min_lod, maxLod = t.max_lod, anisotropy = t.max_anisotropy;
+	GLfloat minLod = t.min_lod, maxLod = t.max_lod, lodBias = t.lod_bias, anisotropy = t.max_anisotropy;
 	GLenum compareMode = t.compare_mode, compareFunc = t.compare_func;
+	GLfloat borderColor[4] = { t.border_color[0], t.border_color[1], t.border_color[2], t.border_color[3] };
 	const GLuint samplerName = ctx.bound_samplers[textureUnit];
 	if (samplerName != 0) {
 		auto found = ctx.sampler_objects.find(samplerName);
@@ -731,8 +761,9 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 			const SamplerObject &so = found->second;
 			minFilter = so.min_filter; magFilter = so.mag_filter;
 			wrapS = so.wrap_s; wrapT = so.wrap_t; wrapR = so.wrap_r;
-			minLod = so.min_lod; maxLod = so.max_lod; anisotropy = so.max_anisotropy;
+			minLod = so.min_lod; maxLod = so.max_lod; lodBias = so.lod_bias; anisotropy = so.max_anisotropy;
 			compareMode = so.compare_mode; compareFunc = so.compare_func;
+			for (int component = 0; component < 4; ++component) borderColor[component] = so.border_color[component];
 		}
 	}
 	// Reuse thread-local key storage; samplerFor is called for every active sampler on every draw.
@@ -740,6 +771,10 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	std::string &key = samplerKeyScratch;
 	key.clear();
 	if (key.capacity() < 128) key.reserve(128);
+	// Cache keys are device-scoped: a context may be reinitialized on a different
+	// device, and an MTL sampler state cannot be reused across devices.
+	const uintptr_t deviceIdentity = (uintptr_t)(__bridge void *)ctx.device;
+	putBytes(key, &deviceIdentity, sizeof(deviceIdentity));
 	// Parameters of the texture, overridden by the sampler object bound to the unit (glBindSampler) when there is one.
 	putBytes(key, &minFilter, sizeof(minFilter));
 	putBytes(key, &magFilter, sizeof(magFilter));
@@ -748,22 +783,27 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	putBytes(key, &wrapR, sizeof(wrapR));
 	putBytes(key, &minLod, sizeof(minLod));
 	putBytes(key, &maxLod, sizeof(maxLod));
+	putBytes(key, &lodBias, sizeof(lodBias));
 	putBytes(key, &t.base_level, sizeof(t.base_level));
 	putBytes(key, &t.max_level, sizeof(t.max_level));
 	putBytes(key, &anisotropy, sizeof(anisotropy));
 	putBytes(key, &compareMode, sizeof(compareMode));
 	putBytes(key, &compareFunc, sizeof(compareFunc));
+	putBytes(key, borderColor, sizeof(borderColor));
 
 	struct LastSamplerCache {
 		std::string key;
+		uintptr_t device_identity = 0;
 		__strong id<MTLSamplerState> sampler = nil;
 		bool valid = false;
 	};
 	static thread_local LastSamplerCache lastSamplerCache;
-	if (lastSamplerCache.valid && key == lastSamplerCache.key) return lastSamplerCache.sampler;
+	if (lastSamplerCache.valid && lastSamplerCache.device_identity == deviceIdentity && key == lastSamplerCache.key)
+		return lastSamplerCache.sampler;
 	auto cachedSampler = ctx.sampler_cache.find(key);
 	if (cachedSampler != ctx.sampler_cache.end()) {
 		lastSamplerCache.key = key;
+		lastSamplerCache.device_identity = deviceIdentity;
 		lastSamplerCache.sampler = cachedSampler->second;
 		lastSamplerCache.valid = true;
 		return cachedSampler->second;
@@ -781,10 +821,23 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	d.sAddressMode = addressMode(wrapS);
 	d.tAddressMode = addressMode(wrapT);
 	d.rAddressMode = addressMode(wrapR);
+	if (borderColor[0] == 0.0f && borderColor[1] == 0.0f && borderColor[2] == 0.0f && borderColor[3] == 0.0f) {
+		d.borderColor = MTLSamplerBorderColorTransparentBlack;
+	} else if (borderColor[0] == 0.0f && borderColor[1] == 0.0f && borderColor[2] == 0.0f && borderColor[3] == 1.0f) {
+		d.borderColor = MTLSamplerBorderColorOpaqueBlack;
+	} else {
+		d.borderColor = MTLSamplerBorderColorOpaqueWhite;
+	} // setters restrict stored colors to Metal's three supported border values
 	float lodMin = std::max(std::max(minLod, (float)t.base_level), 0.0f);
 	float lodMax = std::max(std::min(maxLod, (float)t.max_level), lodMin);
 	d.lodMinClamp = lodMin;
 	d.lodMaxClamp = lodMax;
+	// MTLSamplerDescriptor.lodBias is available on iOS/iPadOS 26 and later;
+	// older deployment targets must not message a selector that their OS lacks.
+	if (@available(iOS 26.0, *)) {
+		// Metal stores LOD bias in S4.6 fixed-point.
+		d.lodBias = std::min(std::max(lodBias, -16.0f), 15.999f);
+	}
 	d.maxAnisotropy = (NSUInteger)std::min(std::max(anisotropy, 1.0f), 16.0f);
 	if (compareMode == GL_COMPARE_REF_TO_TEXTURE) {
 		d.compareFunction = getMetalCompareFunc(compareFunc);
@@ -798,6 +851,7 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 	}
 	auto inserted = ctx.sampler_cache.emplace(key, sampler);
 	lastSamplerCache.key = key;
+	lastSamplerCache.device_identity = deviceIdentity;
 	lastSamplerCache.sampler = inserted.first->second;
 	lastSamplerCache.valid = true;
 	return inserted.first->second;
@@ -806,6 +860,7 @@ static id<MTLSamplerState> samplerFor(const TextureObject &t, GLuint textureUnit
 // What GL samples from a texture unit with nothing (usable) bound: (0, 0, 0, 1).
 static GLenum targetForDim(TranslatedUniform::Dim dim) {
 	switch (dim) {
+		case TranslatedUniform::Dim1D:      return GL_TEXTURE_1D;
 		case TranslatedUniform::DimCube:    return GL_TEXTURE_CUBE_MAP;
 		case TranslatedUniform::Dim3D:      return GL_TEXTURE_3D;
 		case TranslatedUniform::Dim2DArray: return GL_TEXTURE_2D_ARRAY;
@@ -816,6 +871,7 @@ static GLenum targetForDim(TranslatedUniform::Dim dim) {
 
 static MTLTextureType typeForDim(TranslatedUniform::Dim dim) {
 	switch (dim) {
+		case TranslatedUniform::Dim1D:      return MTLTextureType1D;
 		case TranslatedUniform::DimCube:    return MTLTextureTypeCube;
 		case TranslatedUniform::Dim3D:      return MTLTextureType3D;
 		case TranslatedUniform::Dim2DArray: return MTLTextureType2DArray;
@@ -854,14 +910,15 @@ static id<MTLTexture> fallbackTexture(const TranslatedUniform &uniform) {
 		return slot;
 	}
 	const int dimensionIndex = (int)dim;
-	if (dimensionIndex < 0 || dimensionIndex >= 4) return nil;
-	static id<MTLTexture> textures[4] = { nil, nil, nil, nil };
+	if (dimensionIndex < 0 || dimensionIndex >= 5) return nil;
+	static id<MTLTexture> textures[5] = { nil, nil, nil, nil, nil };
 	__strong id<MTLTexture> &slot = textures[dimensionIndex];
 	if (!slot) {
 		MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
 		d.textureType = typeForDim(dim);
 		d.pixelFormat = MTLPixelFormatRGBA8Unorm;
-		d.width = d.height = 1;
+		d.width = 1;
+		d.height = 1;
 		d.depth = 1;
 		d.arrayLength = 1;
 		d.usage = MTLTextureUsageShaderRead;
@@ -869,9 +926,13 @@ static id<MTLTexture> fallbackTexture(const TranslatedUniform &uniform) {
 		slot = [ctx.device newTextureWithDescriptor:d];
 		if (!slot) return nil;
 		const uint8_t black[4] = { 0, 0, 0, 255 };
-		NSUInteger slices = dim == TranslatedUniform::DimCube ? 6 : 1;
-		for (NSUInteger slice = 0; slice < slices; slice++) {
-			[slot replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:slice withBytes:black bytesPerRow:4 bytesPerImage:4];
+		if (dim == TranslatedUniform::Dim1D) {
+			[slot replaceRegion:MTLRegionMake1D(0, 1) mipmapLevel:0 withBytes:black bytesPerRow:0];
+		} else {
+			NSUInteger slices = dim == TranslatedUniform::DimCube ? 6 : 1;
+			for (NSUInteger slice = 0; slice < slices; slice++) {
+				[slot replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:slice withBytes:black bytesPerRow:4 bytesPerImage:4];
+			}
 		}
 	}
 	return slot;
@@ -1517,6 +1578,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 	if (dc.count == 0 || dc.instances == 0) return;
+	if (ctx.conditional_render_active && !ctx.conditional_render_should_draw) return;
 	if (capOn(GL_RASTERIZER_DISCARD)) return;
 	if (!dc.indexed && dc.first < 0) {
 		gl4metalSetError(GL_INVALID_VALUE);
@@ -1525,11 +1587,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	}
 
 	auto pit = ctx.program_objects.find(ctx.current_program);
-	if (ctx.current_program == 0 || pit == ctx.program_objects.end() || !pit->second.linked) {
+	if (ctx.current_program == 0 || pit == ctx.program_objects.end() || !pit->second.has_executable) {
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
-			GL4METAL_LOG("%s: no linked program in use, draw skipped (reported once)", caller);
+			GL4METAL_LOG("%s: no executable program in use, draw skipped (reported once)", caller);
 		}
 		return;
 	}
@@ -2006,9 +2068,17 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 	// Textures: direct Metal bindings are the fastest compatible path here. The
 	// GL combined unit index selects the source texture; the MSL slot stays dense
 	// and stage-local (0...15), independent of the GL unit number.
-	for (const ProgramUniform &u : p.uniforms) {
+	for (uint32_t samplerUniformIndex : p.sampler_uniform_indices) {
+		if (samplerUniformIndex >= p.uniforms.size()) {
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: linked sampler-uniform index is out of range; draw skipped", caller);
+			return;
+		}
+		const ProgramUniform &u = p.uniforms[samplerUniformIndex];
 		if (u.info.kind != TranslatedUniform::Sampler) {
-			continue;
+			gl4metalSetError(GL_INVALID_OPERATION);
+			GL4METAL_LOG("%s: linked sampler-uniform index references a non-sampler; draw skipped", caller);
+			return;
 		}
 		if (u.info.array_size <= 0 || (size_t)u.info.array_size > u.units.size() ||
 			(u.info.stage[0].present && (u.info.stage[0].slot >= GL4METAL_MAX_VERTEX_TEXTURE_UNITS ||
@@ -2044,7 +2114,14 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					auto feedbackSnapshot = feedbackSnapshots.find(textureName);
 					auto to = ctx.texture_objects.find(textureName);
 					if (feedbackSnapshot != feedbackSnapshots.end()) {
-						texture = feedbackSnapshot->second;
+						if (to != ctx.texture_objects.end()) {
+							texture = gl4metalTextureForSampling(to->second, feedbackSnapshot->second);
+							if (!texture) return;
+						} else {
+							gl4metalSetError(GL_INVALID_OPERATION);
+							GL4METAL_LOG("%s: feedback snapshot %u has no live GL texture object", caller, textureName);
+							return;
+						}
 						if (to != ctx.texture_objects.end() && !isBufferSampler) {
 							sampler = samplerFor(to->second, (GLuint)unit);
 						}
@@ -2060,7 +2137,8 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 						if (to != ctx.texture_objects.end() && to->second.texture &&
 							to->second.texture.textureType == typeForDim(u.info.dim) &&
 							(to->second.texture.usage & MTLTextureUsageShaderRead) != 0) {
-							texture = to->second.texture;
+							texture = gl4metalTextureForSampling(to->second, to->second.texture);
+							if (!texture) return;
 							if (isBufferSampler) {
 								markBufferUsed(to->second.buffer_object);
 							} else {

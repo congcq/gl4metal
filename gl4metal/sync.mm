@@ -7,19 +7,21 @@ extern void invalidateComputeEncoderStateCache(void);
 
 // A fence completes when the command buffer that holds the commands recorded before it has completed.
 struct SyncObject {
-	id<MTLCommandBuffer> buffer = nil; // nil: nothing was pending, already signaled
+	id<MTLCommandBuffer> buffer = nil;	// Classic queue fence target.
+	__strong id<MTLSharedEvent> event = nil;
+	uint64_t event_value = 0;
 };
 
-static bool isSignaled(const SyncObject *s) {
-	if (!s->buffer) {
-		return true;
+static bool isSignaled(const SyncObject *syncObject) {
+	if (syncObject->event && syncObject->event_value != 0) {
+		return syncObject->event.signaledValue >= syncObject->event_value;
 	}
-	MTLCommandBufferStatus status = s->buffer.status;
-	if (status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError) {
-		return true;
-	}
-	// A buffer that was dropped without being committed (app in the background) can never complete.
-	return status < MTLCommandBufferStatusCommitted && s->buffer != ctx.currentCommandBuffer;
+
+	if (!syncObject->buffer) return true;
+	MTLCommandBufferStatus status = syncObject->buffer.status;
+	if (status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError) return true;
+	// An uncommitted command buffer is pending only while it is still the active GL buffer.
+	return status < MTLCommandBufferStatusCommitted && syncObject->buffer != ctx.currentCommandBuffer;
 }
 
 // Metal completion handlers can run on arbitrary driver queues, including while the
@@ -52,16 +54,19 @@ void flushCommandBuffer(bool waitUntilCompleted) {
 		ctx.currentComputeEncoder = nil;
 		invalidateComputeEncoderStateCache();
 	}
-	if (ctx.currentCommandBuffer) {
-		[ctx.currentCommandBuffer commit];
-		resetDrawTransientUploadArena(ctx.currentCommandBuffer);
-		resetTextureUploadArena(ctx.currentCommandBuffer);
-		ctx.last_committed_buffer = ctx.currentCommandBuffer;
-		ctx.currentCommandBuffer = nil;
-	}
-	if (waitUntilCompleted && ctx.last_committed_buffer) {
-		[ctx.last_committed_buffer waitUntilCompleted];
-		reportCommandBufferErrorIfNeeded(ctx.last_committed_buffer);
+	gl4metalCommitMetal4Compute();
+	gl4metalCommitClassicCommandBuffer();
+	if (waitUntilCompleted) {
+		if (ctx.last_committed_buffer) {
+			[ctx.last_committed_buffer waitUntilCompleted];
+			reportCommandBufferErrorIfNeeded(ctx.last_committed_buffer);
+		}
+
+		if (ctx.metal4Enabled && ctx.metal4NextEventValue != 0 &&
+			!gl4metalWaitForMetal4Event(ctx.metal4NextEventValue, UINT64_MAX)) {
+			GL4METAL_LOG("glFinish: timed out waiting for Metal 4 queue completion");
+		}
+		gl4metalReapMetal4Submissions();
 	}
 }
 
@@ -75,7 +80,21 @@ GLsync glFenceSync(GLenum condition, GLbitfield flags) {
 		return NULL;
 	}
 	SyncObject *s = new SyncObject();
-	s->buffer = ctx.currentCommandBuffer ? ctx.currentCommandBuffer : ctx.last_committed_buffer;
+
+	if (ctx.metal4Enabled && ctx.currentMetal4CommandBuffer) {
+		s->event = ctx.metal4InteropEvent;
+		s->event_value = ctx.metal4CurrentEventValue;
+	} else if (ctx.currentCommandBuffer) {
+		s->buffer = ctx.currentCommandBuffer;
+	} else if (ctx.metal4Enabled && ctx.metal4LastComputeEventValue > ctx.metal4LastClassicEventValue) {
+		s->event = ctx.metal4InteropEvent;
+		s->event_value = ctx.metal4LastComputeEventValue;
+	} else {
+		s->buffer = ctx.last_committed_buffer;
+	}
+
+	// s->buffer = ctx.currentCommandBuffer ? ctx.currentCommandBuffer : ctx.last_committed_buffer;
+
 	ctx.sync_objects.insert(s);
 	return (GLsync)s;
 }
@@ -110,15 +129,20 @@ GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
 	}
 	flushCommandBuffer(false);
 	if (timeout == GL_TIMEOUT_IGNORED) {
-		[s->buffer waitUntilCompleted];
-		return GL_CONDITION_SATISFIED;
+		if (s->event && s->event_value != 0) {
+			gl4metalWaitForMetal4Event(s->event_value, UINT64_MAX);
+			return isSignaled(s) ? GL_CONDITION_SATISFIED : GL_WAIT_FAILED;
+		}
+
+		if (s->buffer) [s->buffer waitUntilCompleted];
+		return isSignaled(s) ? GL_CONDITION_SATISFIED : GL_WAIT_FAILED;
 	}
 	const uint64_t pollNs = 200000; // 0.2 ms
 	for (uint64_t waited = 0; waited < timeout; waited += pollNs) {
-		if (isSignaled(s)) {
-			return GL_CONDITION_SATISFIED;
-		}
-		usleep((useconds_t)(pollNs / 1000));
+		if (isSignaled(s)) return GL_CONDITION_SATISFIED;
+		const uint64_t remainingNs = timeout - waited;
+		const useconds_t sleepUs = (useconds_t)std::max<uint64_t>(1, std::min<uint64_t>(pollNs, remainingNs) / 1000);
+		usleep(sleepUs);
 	}
 	return isSignaled(s) ? GL_CONDITION_SATISFIED : GL_TIMEOUT_EXPIRED;
 }

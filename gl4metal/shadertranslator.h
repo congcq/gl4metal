@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <memory>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -32,7 +33,7 @@
 
 struct TranslatedUniform {
 	enum Kind { Float, Int, UInt, Bool, Sampler };
-	enum Dim { Dim2D, DimCube, Dim3D, Dim2DArray, DimBuffer }; // samplers: what the shader samples
+	enum Dim { Dim1D, Dim2D, DimCube, Dim3D, Dim2DArray, DimBuffer }; // samplers: what the shader samples
 
 	std::string name;
 	Kind kind = Float;
@@ -92,6 +93,7 @@ struct TranslatedImage {
 	uint32_t slot = 0;    // first MSL [[texture(slot)]]
 	uint32_t format = 0;  // GL sized image format, 0 when the GLSL format is unqualified
 	bool is_3d = false;   // image3D uses a layered GL_TEXTURE_3D / MTLTextureType3D binding
+	bool is_array = false; // image2DArray uses a layered GL_TEXTURE_2D_ARRAY binding
 	bool read_only = false;
 	bool write_only = false;
 };
@@ -111,9 +113,23 @@ struct TranslatedProgram {
 	std::string log;
 };
 
-bool translateProgram(const std::string &vertexGLSL, const std::string &fragmentGLSL, TranslatedProgram &out,
+// Opaque parsed GLSL stage. The object owns its source storage and glslang intermediate.
+// glCompileShader creates this object; program linking consumes it once and reparses
+// only when the same GL shader object is linked into another program.
+struct CompiledShaderStage;
+
+std::shared_ptr<CompiledShaderStage> compileShaderStage(uint32_t shaderType,
+	const std::string &source, std::string &infoLog);
+// Collect explicit layout(location=...) declarations for the reflected active vertex inputs.
+// This distinguishes source locations from glslang's automatic mapping.
+void collectCompiledStageExplicitVertexAttributeLocations(
+	const std::shared_ptr<CompiledShaderStage> &stage,
+	const std::vector<TranslatedAttrib> &attributes, std::vector<bool> &explicitLocations);
+
+bool translateProgram(const std::shared_ptr<CompiledShaderStage> &vertexStage,
+	const std::shared_ptr<CompiledShaderStage> &fragmentStage, TranslatedProgram &out,
 	const std::unordered_map<std::string, uint32_t> &fragDataBindings);
-bool translateComputeProgram(const std::string &computeGLSL, TranslatedProgram &out);
+bool translateComputeProgram(const std::shared_ptr<CompiledShaderStage> &computeStage, TranslatedProgram &out);
 
 // Compact nested threadgroup float3 arrays to packed_float3 where the MSL
 // array is used as private workgroup storage. This preserves float precision

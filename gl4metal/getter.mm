@@ -1,5 +1,5 @@
 #import "gl4metal.h"
-#import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
 
 #include <sys/utsname.h>
 #include <limits>
@@ -62,6 +62,7 @@ GLenum glGetError(void) {
 }
 
 void glGetBooleanv(GLenum pname, GLboolean *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	switch (pname) {
 		case GL_BLEND:
 		case GL_CULL_FACE:
@@ -90,6 +91,7 @@ void glGetBooleanv(GLenum pname, GLboolean *data) {
 }
 
 void glGetDoublev(GLenum pname, GLdouble *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	GLfloat values[4] = { 0, 0, 0, 0 };
 	glGetFloatv(pname, values);
 	int count = (pname == GL_COLOR_CLEAR_VALUE || pname == GL_BLEND_COLOR || pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) ? 4 :
@@ -100,6 +102,7 @@ void glGetDoublev(GLenum pname, GLdouble *data) {
 }
 
 void glGetFloatv(GLenum pname, GLfloat *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	switch (pname) {
 		case GL_COLOR_CLEAR_VALUE:
 			data[0] = (GLfloat)ctx.clear_color.red; data[1] = (GLfloat)ctx.clear_color.green;
@@ -129,6 +132,9 @@ void glGetFloatv(GLenum pname, GLfloat *data) {
 		case GL_SMOOTH_LINE_WIDTH_RANGE:
 			data[0] = 1.0f; data[1] = 1.0f;
 			break;
+		case GL_POINT_SIZE:
+			*data = 1.0f; // fixed-size Metal point primitive
+			break;
 		case GL_POINT_SIZE_RANGE:
 			data[0] = 1.0f; data[1] = 1.0f;
 			break;
@@ -151,6 +157,7 @@ void glGetFloatv(GLenum pname, GLfloat *data) {
 }
 
 void glGetIntegerv(GLenum pname, GLint *data) {
+	if (!data) { gl4metalSetError(GL_INVALID_VALUE); return; }
 	switch(pname) {
 		case GL_MAJOR_VERSION:
 			*data = 3;
@@ -195,7 +202,7 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 			*data = GL4METAL_MAX_3D_TEXTURE_SIZE; // Metal feature tables specify 2048 for 3D textures.
 			break;
 		case GL_MAX_ARRAY_TEXTURE_LAYERS:
-			*data = 0; // GL_TEXTURE_2D_ARRAY storage/upload is not implemented yet.
+			*data = ctx.device ? GL4METAL_MAX_ARRAY_TEXTURE_LAYERS : 0;
 			break;
 		case GL_MAX_TEXTURE_BUFFER_SIZE:
 			*data = maxTextureBufferTexels();
@@ -405,6 +412,11 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		case GL_ACTIVE_TEXTURE:
 			*data = (GLint)(GL_TEXTURE0 + ctx.active_texture_unit);
 			break;
+		case GL_TEXTURE_BINDING_1D: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_1D);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
 		case GL_TEXTURE_BINDING_2D: {
 			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_2D);
 			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
@@ -412,6 +424,21 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 		}
 		case GL_TEXTURE_BINDING_3D: {
 			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_3D);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
+		case GL_TEXTURE_BINDING_2D_ARRAY: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_2D_ARRAY);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
+		case GL_TEXTURE_BINDING_2D_MULTISAMPLE: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_2D_MULTISAMPLE);
+			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
+			break;
+		}
+		case GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY: {
+			auto bound = ctx.bound_textures[ctx.active_texture_unit].find(GL_TEXTURE_2D_MULTISAMPLE_ARRAY);
 			*data = bound == ctx.bound_textures[ctx.active_texture_unit].end() ? 0 : (GLint)bound->second;
 			break;
 		}
@@ -644,7 +671,17 @@ void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
 }
 
 void glGetPointerv(GLenum pname, void **params) {
-	*params = NULL; // no debug callback, no client-side arrays
+	if (!params) { gl4metalSetError(GL_INVALID_VALUE); return; }
+	switch (pname) {
+		case GL_DEBUG_CALLBACK_FUNCTION:
+		case GL_DEBUG_CALLBACK_USER_PARAM:
+			*params = nullptr; // debug callbacks are not exposed
+			return;
+		default:
+			gl4metalSetError(GL_INVALID_ENUM);
+			*params = nullptr;
+			return;
+	}
 }
 
 NSString *detectDeviceName(utsname si) {
@@ -794,8 +831,13 @@ const GLubyte *glGetString(GLenum name) {
 			return (const GLubyte *)"congcq";
 		case GL_RENDERER: {
 			struct utsname si; uname(&si);
-			UIDevice *d = UIDevice.currentDevice;
-			NSString *s = [NSString stringWithFormat:@"GL4Metal beta (%@ | %@ | iOS %@)", detectDeviceName(si), ctx.device.name, d.systemVersion];
+			const NSOperatingSystemVersion osVersion = NSProcessInfo.processInfo.operatingSystemVersion;
+			NSString *systemVersion = osVersion.patchVersion > 0
+				? [NSString stringWithFormat:@"%ld.%ld.%ld", (long)osVersion.majorVersion,
+					(long)osVersion.minorVersion, (long)osVersion.patchVersion]
+				: [NSString stringWithFormat:@"%ld.%ld", (long)osVersion.majorVersion,
+					(long)osVersion.minorVersion];
+			NSString *s = [NSString stringWithFormat:@"GL4Metal beta (%@ | %@ | iOS %@)", detectDeviceName(si), ctx.device.name, systemVersion];
 			return (const GLubyte *)s.UTF8String;
 		}
 		case GL_VERSION:
