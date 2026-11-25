@@ -2337,9 +2337,9 @@ static bool compileComputeStage(std::vector<unsigned int> spirv, TranslatedProgr
 
 		for (const spirv_cross::Resource &resource : resources.storage_images) {
 			const spirv_cross::SPIRType &imageType = msl.get_type(resource.type_id);
-			// Metal texture2d_array supports read/write storage access. The matching
-			// GL_TEXTURE_2D_ARRAY allocation path requests ShaderRead + ShaderWrite,
-			// and glBindImageTexture enforces layered binding for image2DArray.
+			// Metal texture2d_array supports read/write storage access. GL storage
+			// starts with ShaderRead; glBindImageTexture promotes the backing texture
+			// to ShaderWrite only when the bound image access can modify its contents.
 			const bool is2D = imageType.image.dim == spv::Dim2D && !imageType.image.arrayed;
 			const bool isArray = imageType.image.dim == spv::Dim2D && imageType.image.arrayed;
 			const bool is3D = imageType.image.dim == spv::Dim3D && !imageType.image.arrayed;

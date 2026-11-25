@@ -27,6 +27,10 @@ static bool isBufferTarget(GLenum target) {
 // mutex from the per-draw hot path.
 static uint32_t bufferUsePruneCounter = 0;
 
+void markBufferMayBeGPUWritten(GLuint buf_id) {
+	if (buf_id != 0) ctx.buffer_may_be_gpu_written.insert(buf_id);
+}
+
 static bool commandBufferPending(id<MTLCommandBuffer> commandBuffer) {
 	if (!commandBuffer) return false;
 	const MTLCommandBufferStatus status = commandBuffer.status;
@@ -104,12 +108,22 @@ static void waitForBufferGPUUse(GLuint buf_id);
 
 static bool makeBufferWritableWithoutStall(GLuint buf_id, __strong id<MTLBuffer> &buffer, bool preserveContents = true) {
 	if (!bufferHasPendingGPUUse(buf_id)) return true;
-	// A CPU-side clone of shared storage is not a safe substitute for waiting when
-	// the GPU may have written the buffer. Preserve-content updates must observe all
-	// prior GL commands; only whole-store/invalidate renames may skip the wait.
-	if (preserveContents) {
+	// On Apple GPUs the CPU and GPU share this MTLBuffer's system-memory allocation.
+	// If the in-flight workload only reads it (vertex/index/UBO input), clone the
+	// current CPU-visible bytes into a new shared allocation and redirect future GL
+	// commands to that allocation. Earlier command buffers keep the old MTLBuffer, so
+	// the CPU can update the new store without waiting for those GPU reads to finish.
+	// Shader-storage buffers and GPU blit destinations are conservatively classified
+	// as potentially GPU-written and still take the synchronization path.
+	const bool mayBeGPUWritten = ctx.buffer_may_be_gpu_written.find(buf_id) !=
+		ctx.buffer_may_be_gpu_written.end();
+	if (preserveContents && mayBeGPUWritten) {
 		waitForBufferGPUUse(buf_id);
 		if (!bufferHasPendingGPUUse(buf_id)) return true;
+		// Never clone a store while an untracked GPU write could still be in flight.
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("buffer update: refusing to rename potentially GPU-written buffer %u while its last use is pending", buf_id);
+		return false;
 	}
 	if (!ctx.device || !buffer || buffer.length > ctx.device.maxBufferLength) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
@@ -278,6 +292,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *buffers) {
 		invalidateConvertedVertexBuffers(buf_id);
 		ctx.buffer_last_use.erase(buf_id);
 		ctx.buffer_last_use_event_value.erase(buf_id);
+		ctx.buffer_may_be_gpu_written.erase(buf_id);
 		ctx.buffer_objects.erase(buf_id);
 		gl4metalEraseBufferLogicalSize(buf_id);
 
@@ -454,6 +469,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 		invalidateConvertedVertexBuffers(buf_id);
 		ctx.buffer_last_use.erase(buf_id);
 		ctx.buffer_last_use_event_value.erase(buf_id);
+		ctx.buffer_may_be_gpu_written.erase(buf_id);
 		gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
 		refreshTextureBufferViews(buf_id);
 		return;
@@ -476,6 +492,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 	invalidateConvertedVertexBuffers(buf_id);
 	ctx.buffer_last_use.erase(buf_id);
 	ctx.buffer_last_use_event_value.erase(buf_id);
+	ctx.buffer_may_be_gpu_written.erase(buf_id);
 	ctx.buffer_objects[buf_id] = buffer;
 	gl4metalSetBufferLogicalSize(buf_id, (NSUInteger)size);
 	refreshTextureBufferViews(buf_id);
@@ -582,6 +599,7 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 		const GLuint destinationName = boundBuffer(writeTarget);
 		if (ctx.metal4Enabled && gl4metalMetal4CopyBuffer(from, (NSUInteger)readOffset,
 			to, (NSUInteger)writeOffset, (NSUInteger)size)) {
+			markBufferMayBeGPUWritten(destinationName);
 			invalidateConvertedVertexBuffers(destinationName);
 			gl4metalMarkMetal4BufferUsed(sourceName);
 			gl4metalMarkMetal4BufferUsed(destinationName);

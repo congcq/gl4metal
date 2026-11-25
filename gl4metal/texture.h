@@ -16,7 +16,10 @@ void refreshTextureBufferViews(GLuint bufferObject);
 GLint maxTextureBufferTexels(void);
 void gl4metalInvalidateTextureSamplingViews(TextureObject &textureObject);
 void gl4metalSetTextureStorage(TextureObject &textureObject, id<MTLTexture> texture);
-id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, id<MTLTexture> sourceTexture);
+// Lazily promotes image textures to ShaderWrite only when GL binds them writable.
+bool gl4metalEnsureTextureUsage(TextureObject &textureObject, MTLTextureUsage requiredUsage, const char *caller);
+// sourceTexture is borrowed from TextureObject storage or the active feedback-snapshot map.
+id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, __unsafe_unretained id<MTLTexture> sourceTexture);
 
 // Internal implementation hooks used by GL_ARB_clear_texture entry points.
 void gl4metalClearTexImageImpl(GLuint texture, GLint level, GLenum format, GLenum type, const void *data);

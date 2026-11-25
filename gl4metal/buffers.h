@@ -11,5 +11,6 @@
 #import "gl4metal.h"
 
 void pruneCompletedBufferUses(void);
+void markBufferMayBeGPUWritten(GLuint buf_id);
 
 #endif /* BUFFERS_H */

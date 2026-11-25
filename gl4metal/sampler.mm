@@ -139,10 +139,18 @@ static bool samplerParameterfUnlocked(GLuint samplerName, GLenum pname, GLfloat 
 		return false;
 	}
 	switch (pname) {
-		case GL_TEXTURE_MIN_LOD:  sampler->min_lod = param; return true;
-		case GL_TEXTURE_MAX_LOD:  sampler->max_lod = param; return true;
-		case GL_TEXTURE_LOD_BIAS: sampler->lod_bias = param; return true;
-		case 0x84FE:              sampler->max_anisotropy = std::min(std::max(param, 1.0f), 16.0f); return true;
+		case GL_TEXTURE_MIN_LOD:
+			sampler->min_lod = param;
+			return true;
+		case GL_TEXTURE_MAX_LOD:
+			sampler->max_lod = param;
+			return true;
+		case GL_TEXTURE_LOD_BIAS:
+			sampler->lod_bias = param;
+			return true;
+		case GL_TEXTURE_MAX_ANISOTROPY_EXT:
+			sampler->max_anisotropy = std::min(std::max(param, 1.0f), 16.0f);
+			return true;
 		default:
 			if (param > (GLfloat)std::numeric_limits<GLint>::max() || param < (GLfloat)std::numeric_limits<GLint>::min()) {
 				gl4metalSetError(GL_INVALID_VALUE);

@@ -5,6 +5,10 @@
 #include <chrono>
 #include <limits>
 
+// CPU-write/GPU-read staging allocations are never read back by the CPU.
+static constexpr MTLResourceOptions kMetal4TransientUploadOptions =
+	(MTLResourceOptions)(MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined);
+
 thread_local MTLContext ctx; // independent GL/Metal state for the calling thread
 
 static std::mutex *gl4metalInitMutex = new std::mutex();
@@ -203,6 +207,8 @@ bool gl4metalBeginMetal4Compute(void) {
 	ctx.metal4CurrentSamplers.clear();
 	ctx.metal4CurrentComputePipelines.clear();
 	ctx.metal4CurrentResourceKeys.clear();
+	ctx.metal4BlitReadResourceKeys.clear();
+	ctx.metal4BlitWriteResourceKeys.clear();
 	ctx.metal4CurrentEventValue = ++ctx.metal4NextEventValue;
 	ctx.metal4LastWorkStage = 0;
 	ctx.metal4CurrentEncoderStages = 0;
@@ -214,24 +220,70 @@ bool gl4metalMetal4PrepareDispatch(void) {
 	if (ctx.metal4LastWorkStage == 2) {
 		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
 			beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+		// The stage barrier makes all earlier blit writes visible to dispatch.
+		ctx.metal4BlitReadResourceKeys.clear();
+		ctx.metal4BlitWriteResourceKeys.clear();
 	}
 	ctx.metal4LastWorkStage = 1;
 	ctx.metal4CurrentEncoderStages |= (uint32_t)MTLStageDispatch;
 	return true;
 }
 
-static bool prepareMetal4BlitStage(void) {
+static const void *metal4BlitResourceKey(id<MTLResource> resource) {
+	if (!resource) return nullptr;
+
+	// Texture views alias their parent allocation, and buffer-backed textures alias
+	// the source MTLBuffer. Key the owning allocation rather than the view object so
+	// a copy through one view cannot miss a dependency recorded through another.
+	if ([resource conformsToProtocol:@protocol(MTLTexture)]) {
+		id<MTLTexture> texture = (id<MTLTexture>)resource;
+		id<MTLTexture> parentTexture = texture.parentTexture;
+		while (parentTexture) {
+			texture = parentTexture;
+			parentTexture = texture.parentTexture;
+		}
+		if (texture.buffer) return (__bridge const void *)texture.buffer;
+		return (__bridge const void *)texture;
+	}
+	return (__bridge const void *)resource;
+}
+
+static bool metal4BlitContainsResourceKey(const std::vector<const void *> &keys, const void *key) {
+	return key && std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+static void metal4BlitRememberResourceKey(std::vector<const void *> &keys, const void *key) {
+	if (key && !metal4BlitContainsResourceKey(keys, key)) keys.push_back(key);
+}
+
+static bool prepareMetal4BlitStage(id<MTLResource> readResource, id<MTLResource> writeResource) {
 	if (!gl4metalBeginMetal4Compute() || !ctx.currentMetal4ComputeEncoder) return false;
+
+	const void *readKey = metal4BlitResourceKey(readResource);
+	const void *writeKey = metal4BlitResourceKey(writeResource);
 	if (ctx.metal4LastWorkStage == 1) {
 		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageDispatch
 			beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+		// Dispatch->blit orders all shader writes. Blit hazard tracking starts fresh.
+		ctx.metal4BlitReadResourceKeys.clear();
+		ctx.metal4BlitWriteResourceKeys.clear();
 	} else if (ctx.metal4LastWorkStage == 2) {
-		// A compute encoder can issue multiple blits in one pass. Metal 4 treats
-		// resources as untracked, so sequential GL copies that may read a previous
-		// copy's destination need an explicit blit->blit visibility boundary too.
-		[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
-			beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+		// Do not serialize unrelated texture uploads/copies. A blit->blit barrier is
+		// needed only for RAW, WAR, or WAW access to the same Metal resource.
+		const bool readAfterWrite = metal4BlitContainsResourceKey(ctx.metal4BlitWriteResourceKeys, readKey);
+		const bool writeAfterRead = metal4BlitContainsResourceKey(ctx.metal4BlitReadResourceKeys, writeKey);
+		const bool writeAfterWrite = metal4BlitContainsResourceKey(ctx.metal4BlitWriteResourceKeys, writeKey);
+		if (readAfterWrite || writeAfterRead || writeAfterWrite) {
+			[ctx.currentMetal4ComputeEncoder barrierAfterEncoderStages:MTLStageBlit
+				beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+			// This barrier publishes every prior blit write, not just one resource.
+			ctx.metal4BlitReadResourceKeys.clear();
+			ctx.metal4BlitWriteResourceKeys.clear();
+		}
 	}
+
+	metal4BlitRememberResourceKey(ctx.metal4BlitReadResourceKeys, readKey);
+	metal4BlitRememberResourceKey(ctx.metal4BlitWriteResourceKeys, writeKey);
 	ctx.metal4LastWorkStage = 2;
 	ctx.metal4CurrentEncoderStages |= (uint32_t)MTLStageBlit;
 	return true;
@@ -258,7 +310,7 @@ bool gl4metalMetal4StageBytes(const void *bytes, NSUInteger length, id<MTLBuffer
 			capacity *= 2u;
 		}
 		if (capacity < requiredEnd || capacity > ctx.device.maxBufferLength) return false;
-		id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+		id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:kMetal4TransientUploadOptions];
 		if (!replacement) return false;
 		ctx.metal4TransientBuffers[allocatorIndex] = replacement;
 		transientBuffer = replacement;
@@ -281,7 +333,7 @@ bool gl4metalMetal4CopyBuffer(id<MTLBuffer> source_buffer, NSUInteger source_off
 		const NSUInteger destination_end = destination_offset + size;
 		if (source_offset < destination_end && destination_offset < source_end) return false;
 	}
-	if (!prepareMetal4BlitStage()) return false;
+	if (!prepareMetal4BlitStage(source_buffer, destination_buffer)) return false;
 	registerMetal4Resource(source_buffer);
 	registerMetal4Resource(destination_buffer);
 	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
@@ -293,7 +345,7 @@ bool gl4metalMetal4CopyBufferToTexture(id<MTLBuffer> source_buffer, NSUInteger s
 	NSUInteger source_bytes_per_row, NSUInteger source_bytes_per_image, MTLSize source_size,
 	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin) {
 	if (!source_buffer || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
-		source_offset > source_buffer.length || !prepareMetal4BlitStage()) return false;
+		source_offset > source_buffer.length || !prepareMetal4BlitStage(source_buffer, destination_texture)) return false;
 	registerMetal4Resource(source_buffer);
 	registerMetal4Resource(destination_texture);
 	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
@@ -308,7 +360,7 @@ bool gl4metalMetal4CopyBufferToTextureOptions(id<MTLBuffer> source_buffer, NSUIn
 	id<MTLTexture> destination_texture, NSUInteger destination_slice, NSUInteger destination_level,
 	MTLOrigin destination_origin, MTLBlitOption options) {
 	if (!source_buffer || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
-		source_offset > source_buffer.length || !prepareMetal4BlitStage()) return false;
+		source_offset > source_buffer.length || !prepareMetal4BlitStage(source_buffer, destination_texture)) return false;
 	registerMetal4Resource(source_buffer);
 	registerMetal4Resource(destination_texture);
 	[ctx.currentMetal4ComputeEncoder copyFromBuffer:source_buffer sourceOffset:source_offset
@@ -323,7 +375,8 @@ bool gl4metalMetal4CopyTextureRegion(id<MTLTexture> source_texture, NSUInteger s
 	NSUInteger destination_slice, NSUInteger destination_level, MTLOrigin destination_origin) {
 	if (!source_texture || !destination_texture || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
 		source_texture == destination_texture || source_texture.pixelFormat != destination_texture.pixelFormat ||
-		source_texture.sampleCount != destination_texture.sampleCount || !prepareMetal4BlitStage()) return false;
+		source_texture.sampleCount != destination_texture.sampleCount ||
+		!prepareMetal4BlitStage(source_texture, destination_texture)) return false;
 	registerMetal4Resource(source_texture);
 	registerMetal4Resource(destination_texture);
 	[ctx.currentMetal4ComputeEncoder copyFromTexture:source_texture sourceSlice:source_slice sourceLevel:source_level
@@ -333,7 +386,7 @@ bool gl4metalMetal4CopyTextureRegion(id<MTLTexture> source_texture, NSUInteger s
 }
 
 bool gl4metalMetal4GenerateMipmaps(id<MTLTexture> texture) {
-	if (!texture || texture.mipmapLevelCount < 2 || !prepareMetal4BlitStage()) return false;
+	if (!texture || texture.mipmapLevelCount < 2 || !prepareMetal4BlitStage(texture, texture)) return false;
 	registerMetal4Resource(texture);
 	[ctx.currentMetal4ComputeEncoder generateMipmapsForTexture:texture];
 	return true;
@@ -343,7 +396,8 @@ bool gl4metalMetal4CopyTextureToBuffer(id<MTLTexture> source_texture, NSUInteger
 	MTLOrigin source_origin, MTLSize source_size, id<MTLBuffer> destination_buffer,
 	NSUInteger destination_offset, NSUInteger destination_bytes_per_row, NSUInteger destination_bytes_per_image, MTLBlitOption options) {
 	if (!source_texture || !destination_buffer || source_size.width == 0 || source_size.height == 0 || source_size.depth == 0 ||
-		destination_offset > destination_buffer.length || !prepareMetal4BlitStage()) return false;
+		destination_offset > destination_buffer.length ||
+		!prepareMetal4BlitStage(source_texture, destination_buffer)) return false;
 	registerMetal4Resource(source_texture);
 	registerMetal4Resource(destination_buffer);
 	[ctx.currentMetal4ComputeEncoder copyFromTexture:source_texture sourceSlice:source_slice sourceLevel:source_level

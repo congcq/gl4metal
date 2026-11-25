@@ -49,6 +49,12 @@ void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean laye
 			format, texture, textureFound->second.internalformat);
 		return;
 	}
+	if (access != GL_READ_ONLY &&
+		!gl4metalEnsureTextureUsage(textureFound->second, MTLTextureUsageShaderWrite, "glBindImageTexture")) {
+		gl4metalSetError(GL_INVALID_OPERATION);
+		GL4METAL_LOG("glBindImageTexture: texture %u cannot be promoted to ShaderWrite usage", texture);
+		return;
+	}
 	ImageUnitBinding binding;
 	binding.texture = texture;
 	binding.level = level;
@@ -88,7 +94,10 @@ void glMemoryBarrier(GLbitfield barriers) {
 				beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
 		}
 		// The barrier prepares the next GL compute access to resources written by
-		// either a prior dispatch or a prior MTL4 blit command.
+		// either a prior dispatch or a prior MTL4 blit command. The stage barrier
+		// publishes every earlier blit write, so its per-resource hazard set resets.
+		ctx.metal4BlitReadResourceKeys.clear();
+		ctx.metal4BlitWriteResourceKeys.clear();
 		ctx.metal4LastWorkStage = 1;
 		return;
 	}

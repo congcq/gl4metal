@@ -6,10 +6,18 @@
 
 
 // MARK: - Helpers
-// iOS notes: CPU-visible textures use MTLStorageModeShared (Managed does not exist on iOS), depth/stencil textures are
-// Private, and there are no 24-bit depth formats nor 24-bit RGB formats, so GL_DEPTH24_* maps to Depth32Float* and
-// GL_RGB8 to RGBA8. RGB5_A1 uses the native packed 16-bit format whenever the device accepts it as a sampled
-// render target; simulator/unsupported configurations fall back to RGBA8.
+
+// CPU writes these staging allocations sequentially and never reads them back.
+// WriteCombined can reduce CPU cache pollution for this write-only upload path.
+static constexpr MTLResourceOptions kTextureUploadBufferOptions =
+	(MTLResourceOptions)(MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined);
+
+// iOS notes: long-lived GPU-facing textures default to MTLStorageModePrivate.
+// Textures that GL may attach to an FBO retain RenderTarget usage from allocation;
+// ShaderWrite is added only when GL binds an image for writing. CPU uploads use a
+// shared, write-combined staging arena and blit into Private textures. MTLStorageModeManaged
+// does not exist on iOS. There are no 24-bit depth or RGB formats, so GL_DEPTH24_* maps
+// to Depth32Float* and GL_RGB8 to RGBA8. RGB5_A1 uses the native packed format when supported.
 static MTLPixelFormat rgb5A1MetalPixelFormat(void) {
 	if (!ctx.device) return MTLPixelFormatRGBA8Unorm;
 	static const void *cachedDeviceKey = nullptr;
@@ -216,6 +224,85 @@ void gl4metalSetTextureStorage(TextureObject &textureObject, id<MTLTexture> text
 	textureObject.texture = texture;
 }
 
+// Promote a GPU texture to an additional Metal usage only when GL actually needs it.
+// FBO-capable textures keep RenderTarget from allocation (GL may attach them later);
+// omitting blanket ShaderWrite is the important part for Apple GPU lossless compression.
+bool gl4metalEnsureTextureUsage(TextureObject &textureObject, MTLTextureUsage requiredUsage, const char *caller) {
+	id<MTLTexture> sourceTexture = textureObject.texture;
+	if (!sourceTexture) return false;
+	if ((sourceTexture.usage & requiredUsage) == requiredUsage) return true;
+	if (textureObject.buffer_object != 0) return false;
+
+	const MTLTextureUsage allowedPromotionBits = MTLTextureUsageShaderWrite;
+	if (requiredUsage == 0 || (requiredUsage & ~allowedPromotionBits) != 0) return false;
+
+	const MTLTextureType textureType = sourceTexture.textureType;
+	if (textureType != MTLTextureType2D && textureType != MTLTextureType2DArray &&
+		textureType != MTLTextureType3D && textureType != MTLTextureTypeCube) {
+		GL4METAL_LOG("%s: cannot promote unsupported texture type %lu to usage 0x%X",
+			caller ? caller : "texture usage promotion", (unsigned long)textureType, (unsigned)requiredUsage);
+		return false;
+	}
+
+	MTLTextureDescriptor *descriptor = [[MTLTextureDescriptor alloc] init];
+	descriptor.textureType = textureType;
+	descriptor.pixelFormat = sourceTexture.pixelFormat;
+	descriptor.width = sourceTexture.width;
+	descriptor.height = sourceTexture.height;
+	descriptor.depth = sourceTexture.depth;
+	descriptor.mipmapLevelCount = sourceTexture.mipmapLevelCount;
+	descriptor.sampleCount = sourceTexture.sampleCount;
+	descriptor.arrayLength = sourceTexture.arrayLength;
+	descriptor.storageMode = sourceTexture.storageMode;
+	descriptor.cpuCacheMode = sourceTexture.cpuCacheMode;
+	descriptor.usage = (MTLTextureUsage)(sourceTexture.usage | requiredUsage);
+
+	id<MTLTexture> replacementTexture = [ctx.device newTextureWithDescriptor:descriptor];
+	if (!replacementTexture) {
+		GL4METAL_LOG("%s: Metal could not promote texture format=%d type=%lu storage=%lu usage=0x%X",
+			caller ? caller : "texture usage promotion", (int)sourceTexture.pixelFormat,
+			(unsigned long)textureType, (unsigned long)sourceTexture.storageMode,
+			(unsigned)descriptor.usage);
+		return false;
+	}
+
+	// A usage change requires a new MTLTexture allocation. Drain both backends once
+	// at promotion time, then copy every mip/slice before publishing the replacement.
+	// This is intentionally a cold path; normal sampling and draw submission never wait here.
+	endRenderEncoder();
+	flushCommandBuffer(true);
+	if (!gl4metalEnsureClassicCommandBuffer()) return false;
+	id<MTLBlitCommandEncoder> copyEncoder = [ctx.currentCommandBuffer blitCommandEncoder];
+	if (!copyEncoder) return false;
+
+	const NSUInteger sliceCount = textureType == MTLTextureType2DArray ? sourceTexture.arrayLength :
+		(textureType == MTLTextureTypeCube ? 6u : 1u);
+	for (NSUInteger mipLevel = 0; mipLevel < sourceTexture.mipmapLevelCount; ++mipLevel) {
+		const NSUInteger levelWidth = std::max<NSUInteger>(1, sourceTexture.width >> mipLevel);
+		const NSUInteger levelHeight = std::max<NSUInteger>(1, sourceTexture.height >> mipLevel);
+		const NSUInteger levelDepth = textureType == MTLTextureType3D
+			? std::max<NSUInteger>(1, sourceTexture.depth >> mipLevel) : 1u;
+		const MTLSize copySize = MTLSizeMake(levelWidth, levelHeight, levelDepth);
+		if (textureType == MTLTextureType3D) {
+			[copyEncoder copyFromTexture:sourceTexture sourceSlice:0 sourceLevel:mipLevel
+				sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:copySize
+				toTexture:replacementTexture destinationSlice:0 destinationLevel:mipLevel
+				destinationOrigin:MTLOriginMake(0, 0, 0)];
+		} else {
+			for (NSUInteger slice = 0; slice < sliceCount; ++slice) {
+				[copyEncoder copyFromTexture:sourceTexture sourceSlice:slice sourceLevel:mipLevel
+					sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:copySize
+					toTexture:replacementTexture destinationSlice:slice destinationLevel:mipLevel
+					destinationOrigin:MTLOriginMake(0, 0, 0)];
+			}
+		}
+	}
+	[copyEncoder endEncoding];
+	if (sourceTexture.label.length > 0) replacementTexture.label = sourceTexture.label;
+	gl4metalSetTextureStorage(textureObject, replacementTexture);
+	return true;
+}
+
 static bool textureSwizzleTraceEnabled() {
 	static const bool enabled = [] {
 		const char *value = std::getenv("GL4METAL_TRACE_TEXTURE_SWIZZLE");
@@ -261,7 +348,7 @@ static bool textureViewSliceRange(id<MTLTexture> sourceTexture, NSUInteger &slic
 	}
 }
 
-id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, id<MTLTexture> sourceTexture) {
+id<MTLTexture> gl4metalTextureForSampling(const TextureObject &textureObject, __unsafe_unretained id<MTLTexture> sourceTexture) {
 	if (!sourceTexture) return nil;
 	MTLTextureSwizzle mapped[4];
 	bool identitySwizzle = true;
@@ -463,7 +550,7 @@ static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger
 					capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
 				capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
 				if (capacity >= requiredEnd) {
-					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:kTextureUploadBufferOptions];
 					if (replacement) {
 						textureUploadArena.buffer = replacement;
 						textureUploadArena.used = 0;
@@ -512,7 +599,7 @@ static bool enqueueTextureUpload(id<MTLTexture> texture, GLint level, NSUInteger
 				capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
 			}
 			capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
-			id<MTLBuffer> newArena = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+			id<MTLBuffer> newArena = [ctx.device newBufferWithLength:capacity options:kTextureUploadBufferOptions];
 			if (!newArena) return false;
 			// Previous arena allocations remain valid: the command buffer retains the old
 			// MTLBuffer even after this context points at the larger replacement.
@@ -575,7 +662,7 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 					capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
 				capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
 				if (capacity >= requiredEnd) {
-					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+					id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:kTextureUploadBufferOptions];
 					if (replacement) {
 						textureUploadArena.buffer = replacement;
 						textureUploadArena.used = 0;
@@ -635,7 +722,7 @@ static bool enqueueTextureUpload3D(id<MTLTexture> texture, GLint level,
 			if (textureUploadArena.buffer && textureUploadArena.buffer.length <= ctx.device.maxBufferLength / 2)
 				capacity = std::max(capacity, textureUploadArena.buffer.length * 2);
 			capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
-			id<MTLBuffer> newArena = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+			id<MTLBuffer> newArena = [ctx.device newBufferWithLength:capacity options:kTextureUploadBufferOptions];
 			if (!newArena) return false;
 			textureUploadArena.buffer = newArena;
 			textureUploadArena.used = 0;
@@ -909,11 +996,6 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		return;
 	}
 	if (w == 0 || h == 0) return;
-	if (t.texture.storageMode == MTLStorageModePrivate) {
-		gl4metalSetError(GL_INVALID_OPERATION);
-		GL4METAL_LOG("%s: CPU pixel upload to a private texture is unsupported; use a staging/blit path", caller);
-		return;
-	}
 
 	int srcComps = 0, idx[4];
 	int dstComps = 0, dstCompSize = 0;
@@ -1007,22 +1089,23 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 		return;
 	}
 	if ((identical || directNativeA1BGR5) && srcRowBytes % dstBpp == 0 && (!ctx.unpack_swap_bytes || srcCompSize == 1)) {
-		if (is1D) {
-			if (!freshTextureStorage && !enqueueTextureUpload(t.texture, level, 0, x, 0, w, 1,
-					src, srcRowBytes, copyRowBytes)) {
-				flushCommandBuffer(true);
+		const bool canReplaceDirectly = freshTextureStorage && t.texture.storageMode == MTLStorageModeShared;
+		if (canReplaceDirectly) {
+			if (is1D) {
 				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:0];
-			} else if (freshTextureStorage) {
-				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:0];
+			} else {
+				[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
 			}
-		} else if (freshTextureStorage) {
-			// A just-allocated texture has no earlier GPU readers, so avoid a staging blit
-			// for the common initial texture upload.
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
 		} else if (!enqueueTextureUpload(t.texture, level, slice, x, y, w, h, src, srcRowBytes, copyRowBytes)) {
-			// Oversized staging uploads or encoder allocation failure use the conservative path.
-			flushCommandBuffer(true);
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
+			if (t.texture.storageMode == MTLStorageModeShared) {
+				// A bounded synchronous fallback is valid only for CPU-visible Shared textures.
+				flushCommandBuffer(true);
+				if (is1D) [t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:src bytesPerRow:0];
+				else [t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:src bytesPerRow:srcRowBytes bytesPerImage:0];
+			} else {
+				gl4metalSetError(GL_OUT_OF_MEMORY);
+				GL4METAL_LOG("%s: could not allocate staging for private texture upload (%dx%d)", caller, w, h);
+			}
 		}
 		return;
 	}
@@ -1093,19 +1176,21 @@ static void uploadPixels(TextureObject &t, GLint level, GLint x, GLint y, GLsize
 			}
 		}
 	}
-	if (freshTextureStorage) {
+	const bool canReplaceConvertedDirectly = freshTextureStorage && t.texture.storageMode == MTLStorageModeShared;
+	if (canReplaceConvertedDirectly) {
 		if (is1D) {
 			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:0];
 		} else {
 			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
 		}
 	} else if (!enqueueTextureUpload(t.texture, level, slice, x, y, w, h, tmp.data(), tmpRowBytes, tmpRowBytes)) {
-		// Keep a correct synchronous fallback when the staging blit cannot be allocated.
-		flushCommandBuffer(true);
-		if (is1D) {
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:0];
+		if (t.texture.storageMode == MTLStorageModeShared) {
+			flushCommandBuffer(true);
+			if (is1D) [t.texture replaceRegion:region mipmapLevel:(NSUInteger)level withBytes:tmp.data() bytesPerRow:0];
+			else [t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
 		} else {
-			[t.texture replaceRegion:region mipmapLevel:(NSUInteger)level slice:slice withBytes:tmp.data() bytesPerRow:tmpRowBytes bytesPerImage:0];
+			gl4metalSetError(GL_OUT_OF_MEMORY);
+			GL4METAL_LOG("%s: could not allocate staging for converted private texture upload (%dx%d)", caller, w, h);
 		}
 	}
 }
@@ -2027,21 +2112,14 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 																	 height:(NSUInteger)height
 																  mipmapped:levels > 1];
 			d.mipmapLevelCount = levels;
+			// GL textures can be attached to an FBO after allocation, so retain the
+			// RenderTarget capability, but do not blanket-enable ShaderWrite: that flag
+			// can disable lossless texture compression on Apple GPUs.
 			d.usage = MTLTextureUsageShaderRead;
-			if (mtlFormat != MTLPixelFormatRGB9E5Float) {
-				d.usage = d.usage | MTLTextureUsageRenderTarget; // RGB9E5 is not renderable
-			}
-			// Compute imageStore needs ShaderWrite. Keep depth and RGB9E5 textures
-			// out of this path; on older iOS GPU families retry without ShaderWrite
-			// so an image-write-capable descriptor never breaks ordinary sampling.
-			const bool canShaderWrite = !isDepthStencilFormat(mtlFormat) && mtlFormat != MTLPixelFormatRGB9E5Float;
-			if (canShaderWrite) d.usage = d.usage | MTLTextureUsageShaderWrite;
-			d.storageMode = isDepthStencilFormat(mtlFormat) ? MTLStorageModePrivate : MTLStorageModeShared;
+			if (mtlFormat != MTLPixelFormatRGB9E5Float)
+				d.usage = d.usage | MTLTextureUsageRenderTarget;
+			d.storageMode = MTLStorageModePrivate;
 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:d];
-			if (!newTexture && canShaderWrite) {
-				d.usage = (MTLTextureUsage)(d.usage & ~MTLTextureUsageShaderWrite);
-				newTexture = [ctx.device newTextureWithDescriptor:d];
-			}
 			if (!newTexture) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("glTexImage2D: failed to allocate a %dx%d MTLPixelFormat %d texture; previous storage preserved", width, height, (int)mtlFormat);
@@ -2154,20 +2232,13 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 			descriptor.arrayLength = isArray ? (NSUInteger)depth : 1;
 			descriptor.mipmapLevelCount = levels;
 			descriptor.sampleCount = 1;
+			// 2D-array layers may be FBO attachments; 3D volumes are sampling/image
+			// resources only. Neither receives ShaderWrite unless GL binds it writable.
 			descriptor.usage = MTLTextureUsageShaderRead;
 			if (isArray && mtlFormat != MTLPixelFormatRGB9E5Float)
 				descriptor.usage = descriptor.usage | MTLTextureUsageRenderTarget;
-			const bool canShaderWrite = !depthStencilFormat && mtlFormat != MTLPixelFormatRGB9E5Float;
-			if (canShaderWrite) descriptor.usage = descriptor.usage | MTLTextureUsageShaderWrite;
-			// Volume textures remain private and are uploaded through a staging blit.
-			// Array textures use shared storage: it supports fast initial slice upload
-			// and is also the conservative fallback if staging allocation is exhausted.
-			descriptor.storageMode = (isArray && !depthStencilFormat) ? MTLStorageModeShared : MTLStorageModePrivate;
+			descriptor.storageMode = MTLStorageModePrivate;
 			id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
-			if (!newTexture && canShaderWrite) {
-				descriptor.usage = (MTLTextureUsage)(descriptor.usage & ~MTLTextureUsageShaderWrite);
-				newTexture = [ctx.device newTextureWithDescriptor:descriptor];
-			}
 			if (!newTexture) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("glTexImage3D: failed to allocate %dx%dx%d texture type=%lu format=%d; previous storage preserved",
@@ -2235,7 +2306,6 @@ static bool allocateImmutableTexture(TextureObject &textureObject, MTLTextureTyp
 		GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth,
 		GLsizei levels, bool cube, bool arrayTexture) {
 	const MTLPixelFormat pixelFormat = metalPixelFormat(internalformat);
-	const bool depthStencil = isDepthStencilFormat(pixelFormat);
 	MTLTextureDescriptor *descriptor = nil;
 	if (cube) {
 		descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat
@@ -2251,22 +2321,15 @@ static bool allocateImmutableTexture(TextureObject &textureObject, MTLTextureTyp
 	descriptor.arrayLength = arrayTexture ? (NSUInteger)depth : 1;
 	descriptor.mipmapLevelCount = (NSUInteger)levels;
 	descriptor.sampleCount = 1;
+	// GL 2D/cube/array textures may later become framebuffer attachments. Keep
+	// RenderTarget capability but omit ShaderWrite unless GL explicitly binds it writable.
 	descriptor.usage = MTLTextureUsageShaderRead;
 	if ((textureType == MTLTextureType2D || textureType == MTLTextureTypeCube || arrayTexture) &&
-		pixelFormat != MTLPixelFormatRGB9E5Float) {
+		pixelFormat != MTLPixelFormatRGB9E5Float)
 		descriptor.usage = descriptor.usage | MTLTextureUsageRenderTarget;
-	}
-	const bool canShaderWrite = !depthStencil && pixelFormat != MTLPixelFormatRGB9E5Float &&
-		textureType != MTLTextureTypeCube;
-	if (canShaderWrite) descriptor.usage = descriptor.usage | MTLTextureUsageShaderWrite;
-	descriptor.storageMode = (depthStencil || textureType == MTLTextureType3D)
-		? MTLStorageModePrivate : MTLStorageModeShared;
+	descriptor.storageMode = textureType == MTLTextureType1D ? MTLStorageModeShared : MTLStorageModePrivate;
 
 	id<MTLTexture> newTexture = [ctx.device newTextureWithDescriptor:descriptor];
-	if (!newTexture && canShaderWrite) {
-		descriptor.usage = (MTLTextureUsage)(descriptor.usage & ~MTLTextureUsageShaderWrite);
-		newTexture = [ctx.device newTextureWithDescriptor:descriptor];
-	}
 	if (!newTexture) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("glTexStorage: Metal allocation failed type=%lu size=%dx%dx%d levels=%d format=0x%X",
@@ -2885,7 +2948,7 @@ static bool uploadCompressedSlices(TextureObject &textureObject, GLint level, NS
 			}
 			capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
 			if (capacity < requiredEnd) return false;
-			id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+			id<MTLBuffer> replacement = [ctx.device newBufferWithLength:capacity options:kTextureUploadBufferOptions];
 			if (!replacement) return false;
 			// The command buffer retains previously encoded staging buffers. Reset the
 			// offset only when switching to a newly allocated arena buffer.

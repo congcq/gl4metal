@@ -1,4 +1,5 @@
 #import "draw.h"
+#import "buffers.h"
 
 #include <mutex>
 #include <atomic>
@@ -15,6 +16,11 @@ static std::mutex *fallbackSamplerMutex = new std::mutex();
 // Converted index lists use one transient upload arena per in-flight command buffer.
 // Large default-uniform blocks use command-buffer arena slices while changing, then
 // immutable per-program snapshots when stable across command buffers.
+// Draw transient upload memory is CPU-write/GPU-read only. Keep ordinary GL
+// buffer objects on the default cache mode because they can be CPU-mapped/read.
+static constexpr MTLResourceOptions kDrawTransientUploadBufferOptions =
+	(MTLResourceOptions)(MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined);
+
 struct DrawTransientUploadArena {
 	id<MTLCommandBuffer> commandBuffer = nil;
 	id<MTLBuffer> buffer = nil;
@@ -83,7 +89,7 @@ static bool allocateDrawTransientBuffer(NSUInteger length, NSUInteger alignment,
 		}
 		capacity = std::min<NSUInteger>(capacity, ctx.device.maxBufferLength);
 		if (capacity < length) return false;
-		id<MTLBuffer> expanded = [ctx.device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+		id<MTLBuffer> expanded = [ctx.device newBufferWithLength:capacity options:kDrawTransientUploadBufferOptions];
 		if (!expanded) return false;
 		// Earlier encoders retain the previous allocation until this command buffer
 		// completes. The replacement is used only by subsequent draw commands.
@@ -378,7 +384,7 @@ void invalidateConvertedVertexBuffers(GLuint buffer) {
 	convertedVertexBufferCache.erase(buffer);
 }
 
-static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAttrib &va, id<MTLBuffer> source, NSUInteger &convertedStride, __strong id<MTLBuffer> &converted) {
+static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAttrib &va, __unsafe_unretained id<MTLBuffer> source, NSUInteger &convertedStride, __unsafe_unretained id<MTLBuffer> &converted) {
 	if (!source || !source.contents || va.size < 1 || va.size > 4) return false;
 	const NSUInteger sourceLength = source.length;
 	bool sourceUnsigned = false;
@@ -402,7 +408,7 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 	auto &perBuffer = convertedVertexBufferCache[bufferId];
 	auto cached = perBuffer.find(cacheKey);
 	if (cached != perBuffer.end() && cached->second) {
-		converted = cached->second;
+		converted = cached->second; // borrowed from convertedVertexBufferCache
 		return true;
 	}
 	const NSUInteger records = (source.length - sourceOffset - sourceElementSize) / sourceStride + 1;
@@ -427,8 +433,16 @@ static bool makeSignednessConvertedVertexBuffer(GLuint bufferId, const VertexAtt
 			memcpy(dstRecord + component * sizeof(value), &value, sizeof(value));
 		}
 	}
-	converted = [ctx.device newBufferWithBytes:bytes.data() length:convertedSize options:MTLResourceStorageModeShared];
-	if (converted) perBuffer[cacheKey] = converted;
+	__strong id<MTLBuffer> createdBuffer = [ctx.device newBufferWithBytes:bytes.data() length:convertedSize options:MTLResourceStorageModeShared];
+	if (!createdBuffer) return false;
+	try {
+		auto inserted = perBuffer.emplace(cacheKey, createdBuffer);
+		converted = inserted.first->second; // the cache owns this buffer after publication
+	} catch (const std::bad_alloc &) {
+		gl4metalSetError(GL_OUT_OF_MEMORY);
+		GL4METAL_LOG("vertex conversion: cache allocation failed (%llu bytes)", (unsigned long long)convertedSize);
+		return false;
+	}
 	return converted != nil;
 }
 
@@ -971,7 +985,10 @@ struct ActiveAttrib {
 	const ProgramAttrib *pa = nullptr;
 	bool constant = true;  // no usable array: GL's default (0, 0, 0, 1)
 	MTLVertexFormat format = MTLVertexFormatInvalid;
-	id<MTLBuffer> buffer = nil;
+	// Borrowed for this draw only. The live GL buffer map, VAO's deleted-buffer
+	// retention, or convertedVertexBufferCache owns the backing resource. Metal's
+	// encoder takes its own reference when the buffer is bound.
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	NSUInteger offset = 0;
 	NSUInteger stride = 0;
 	NSUInteger elementBytes = 0; // bytes consumed by one vertex/instance attribute element
@@ -981,10 +998,18 @@ struct ActiveAttrib {
 	NSUInteger slot = 0;
 };
 
-static id<MTLBuffer> metalBufferForVertexAttrib(const VertexAttrib &attrib) {
-	if (attrib.retains_deleted_buffer) return attrib.retained_deleted_buffer;
+// Return borrowed pointers through out-parameters: the VAO or context buffer map is
+// the strong owner, and the render-thread GL call cannot mutate it before binding.
+static bool metalBufferForVertexAttrib(const VertexAttrib &attrib, __unsafe_unretained id<MTLBuffer> &bufferRef) {
+	bufferRef = nil;
+	if (attrib.retains_deleted_buffer) {
+		bufferRef = attrib.retained_deleted_buffer;
+		return bufferRef != nil;
+	}
 	auto storage = ctx.buffer_objects.find(attrib.bound_vbo);
-	return storage != ctx.buffer_objects.end() ? storage->second : nil;
+	if (storage == ctx.buffer_objects.end() || !storage->second) return false;
+	bufferRef = storage->second; // borrowed from ctx.buffer_objects
+	return true;
 }
 
 static NSUInteger logicalLengthForVertexAttrib(const VertexAttrib &attrib) {
@@ -993,10 +1018,16 @@ static NSUInteger logicalLengthForVertexAttrib(const VertexAttrib &attrib) {
 		: glBufferLogicalSize(attrib.bound_vbo);
 }
 
-static id<MTLBuffer> metalBufferForElementArray(const VertexArray &vao) {
-	if (vao.retains_deleted_element_buffer) return vao.retained_deleted_element_buffer;
+static bool metalBufferForElementArray(const VertexArray &vao, __unsafe_unretained id<MTLBuffer> &bufferRef) {
+	bufferRef = nil;
+	if (vao.retains_deleted_element_buffer) {
+		bufferRef = vao.retained_deleted_element_buffer;
+		return bufferRef != nil;
+	}
 	auto storage = ctx.buffer_objects.find(vao.element_array_buffer_id);
-	return storage != ctx.buffer_objects.end() ? storage->second : nil;
+	if (storage == ctx.buffer_objects.end() || !storage->second) return false;
+	bufferRef = storage->second; // borrowed from ctx.buffer_objects
+	return true;
 }
 
 static NSUInteger logicalLengthForElementArray(const VertexArray &vao) {
@@ -1006,6 +1037,9 @@ static NSUInteger logicalLengthForElementArray(const VertexArray &vao) {
 }
 
 
+// Object parameters on the setter helpers below are borrowed: executeDraw/MTLContext or the
+// per-encoder cache keeps each resource alive. Cache slots take strong references only
+// when an effective binding changes.
 // Metal command encoders retain their last bindings. GL4Metal previously resent
 // practically every state item on every draw, even when a shader pack rendered
 // thousands of objects with identical state. Keep a per-thread shadow of the active
@@ -1078,7 +1112,7 @@ struct DrawEncoderStateCache {
 	DrawEncoderBytesSlot vertexBufferSizeBytes;
 	DrawEncoderBytesSlot fragmentBufferSizeBytes;
 
-	void resetForEncoder(id<MTLRenderCommandEncoder> newEncoder) {
+	void resetForEncoder(__unsafe_unretained id<MTLRenderCommandEncoder> newEncoder) {
 		pipelineValid = depthStateValid = stencilReferenceValid = false;
 		vertexDefaultBytes.valid = fragmentDefaultBytes.valid = false;
 		vertexBufferSizeBytes.valid = fragmentBufferSizeBytes.valid = false;
@@ -1107,7 +1141,7 @@ static DrawEncoderStateCache &threadDrawEncoderStateCache(void) {
 	return cache;
 }
 
-static DrawEncoderStateCache &drawEncoderStateFor(id<MTLRenderCommandEncoder> encoder) {
+static DrawEncoderStateCache &drawEncoderStateFor(__unsafe_unretained id<MTLRenderCommandEncoder> encoder) {
 	DrawEncoderStateCache &cache = threadDrawEncoderStateCache();
 	if (cache.encoder != encoder) cache.resetForEncoder(encoder);
 	return cache;
@@ -1121,7 +1155,7 @@ void invalidateDrawEncoderStateCache(void) {
 }
 
 static inline void bindVertexBufferCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
 	if (slot >= kDrawVertexBufferSlots) {
 		[encoder setVertexBuffer:buffer offset:offset atIndex:slot];
 		return;
@@ -1136,7 +1170,7 @@ static inline void bindVertexBufferCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentBufferCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger slot) {
 	if (slot >= kDrawVertexBufferSlots) {
 		[encoder setFragmentBuffer:buffer offset:offset atIndex:slot];
 		return;
@@ -1151,7 +1185,7 @@ static inline void bindFragmentBufferCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexDefaultBytesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
 	const uint8_t *bytes, NSUInteger length) {
 	DrawEncoderRevisionSlot &binding = cache.vertexDefaultBytes;
 	if (binding.valid && binding.length == length && binding.source_program == programId &&
@@ -1167,7 +1201,7 @@ static inline void bindVertexDefaultBytesCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentDefaultBytesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, GLuint programId, uint64_t revision,
 	const uint8_t *bytes, NSUInteger length) {
 	DrawEncoderRevisionSlot &binding = cache.fragmentDefaultBytes;
 	if (binding.valid && binding.length == length && binding.source_program == programId &&
@@ -1183,7 +1217,7 @@ static inline void bindFragmentDefaultBytesCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexBufferSizesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
 	DrawEncoderBytesSlot &binding = cache.vertexBufferSizeBytes;
 	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
 	[encoder setVertexBytes:bytes length:length atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
@@ -1193,7 +1227,7 @@ static inline void bindVertexBufferSizesCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentBufferSizesCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger length) {
 	DrawEncoderBytesSlot &binding = cache.fragmentBufferSizeBytes;
 	if (binding.valid && binding.length == length && memcmp(binding.bytes, bytes, length) == 0) return;
 	[encoder setFragmentBytes:bytes length:length atIndex:GL4METAL_BUFFER_SIZE_BUFFER_INDEX];
@@ -1203,7 +1237,7 @@ static inline void bindFragmentBufferSizesCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexConstantCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, const uint8_t *bytes, NSUInteger slot) {
 	if (slot >= 16) {
 		[encoder setVertexBytes:bytes length:16 atIndex:slot];
 		return;
@@ -1217,7 +1251,7 @@ static inline void bindVertexConstantCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexTextureCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLTexture> texture, NSUInteger slot) {
 	if (slot >= kDrawTextureSlots) { [encoder setVertexTexture:texture atIndex:slot]; return; }
 	DrawEncoderTextureSlot &binding = cache.vertexTextures[slot];
 	if (binding.valid && binding.texture == texture) return;
@@ -1227,7 +1261,7 @@ static inline void bindVertexTextureCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentTextureCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLTexture> texture, NSUInteger slot) {
 	if (slot >= kDrawTextureSlots) { [encoder setFragmentTexture:texture atIndex:slot]; return; }
 	DrawEncoderTextureSlot &binding = cache.fragmentTextures[slot];
 	if (binding.valid && binding.texture == texture) return;
@@ -1237,7 +1271,7 @@ static inline void bindFragmentTextureCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindVertexSamplerCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLSamplerState> sampler, NSUInteger slot) {
 	if (slot >= kDrawTextureSlots) { [encoder setVertexSamplerState:sampler atIndex:slot]; return; }
 	DrawEncoderSamplerSlot &binding = cache.vertexSamplers[slot];
 	if (binding.valid && binding.sampler == sampler) return;
@@ -1247,7 +1281,7 @@ static inline void bindVertexSamplerCached(DrawEncoderStateCache &cache,
 }
 
 static inline void bindFragmentSamplerCached(DrawEncoderStateCache &cache,
-	id<MTLRenderCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger slot) {
+	__unsafe_unretained id<MTLRenderCommandEncoder> encoder, __unsafe_unretained id<MTLSamplerState> sampler, NSUInteger slot) {
 	if (slot >= kDrawTextureSlots) { [encoder setFragmentSamplerState:sampler atIndex:slot]; return; }
 	DrawEncoderSamplerSlot &binding = cache.fragmentSamplers[slot];
 	if (binding.valid && binding.sampler == sampler) return;
@@ -1649,8 +1683,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					caller, pa.name.c_str(), ctx.current_vao);
 				return;
 			}
-			id<MTLBuffer> attributeBuffer = metalBufferForVertexAttrib(va);
-			if (!attributeBuffer) {
+			// Borrow from the GL buffer map/VAO. No GL object mutation can interleave
+			// on this context's render thread before setVertexBuffer: records the draw.
+			__unsafe_unretained id<MTLBuffer> attributeBufferRef = nil;
+			if (!metalBufferForVertexAttrib(va, attributeBufferRef)) {
 				gl4metalSetError(GL_INVALID_OPERATION);
 				GL4METAL_LOG("%s: enabled attribute '%s' references VBO %u without retained Metal storage; draw skipped",
 					caller, pa.name.c_str(), va.bound_vbo);
@@ -1664,7 +1700,7 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 			}
 			aa.constant = false;
 			aa.format = format;
-			aa.buffer = attributeBuffer;
+			aa.buffer = attributeBufferRef;
 			aa.source_buffer = va.retains_deleted_buffer ? 0 : va.bound_vbo;
 			// The byte-length lookup is only needed by the opt-in full vertex-fetch
 			// validator. Avoid one hash-map lookup per active attribute in release draws.
@@ -1682,8 +1718,8 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 				(void)sourceComponentSize;
 				if (hasIntegerStorageType && sourceUnsigned != pa.is_unsigned) {
 					NSUInteger convertedStride = 0;
-					id<MTLBuffer> converted = nil;
-					if (!makeSignednessConvertedVertexBuffer(va.bound_vbo, va, attributeBuffer, convertedStride, converted)) {
+					__unsafe_unretained id<MTLBuffer> converted = nil;
+					if (!makeSignednessConvertedVertexBuffer(va.bound_vbo, va, attributeBufferRef, convertedStride, converted)) {
 						GL4METAL_LOG("%s: cannot convert integer vertex attribute '%s' from GL type 0x%X for the shader's %s input", caller, pa.name.c_str(), va.type, pa.is_unsigned ? "unsigned" : "signed");
 						return;
 					}
@@ -1705,8 +1741,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		attribs.push_back(aa);
 	}
 
-	id<MTLRenderPipelineState> pipeline = pipelineFor(ctx.current_program, p, attribs, caller);
-	if (!pipeline) {
+	// pipelineFor pins successful PSOs in the context cache and its per-thread
+	// last-entry cache. This draw only borrows the cached object.
+	__unsafe_unretained id<MTLRenderPipelineState> pipelineRef = pipelineFor(ctx.current_program, p, attribs, caller);
+	if (!pipelineRef) {
 		return;
 	}
 
@@ -1747,17 +1785,18 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		if (ctx.currentCommandBuffer) ctx.currentCommandBuffer.label = drawLabel;
 		enc.label = drawLabel;
 	}
-	id<MTLDepthStencilState> activeDepthState =
+	// Both choices are owned by MTLContext for the whole GL call.
+	__unsafe_unretained id<MTLDepthStencilState> activeDepthStateRef =
 		((ctx.pass_depth_format != MTLPixelFormatInvalid || ctx.pass_stencil_format != MTLPixelFormatInvalid)
 			? ctx.depthStencilState : ctx.no_depth_state);
-	if (!activeDepthState) {
+	if (!activeDepthStateRef) {
 		gl4metalSetError(GL_OUT_OF_MEMORY);
 		GL4METAL_LOG("%s: no valid Metal depth-stencil state; draw skipped", caller);
 		return;
 	}
-	if (!encoderCache.pipelineValid || encoderCache.pipeline != pipeline) {
-		[enc setRenderPipelineState:pipeline];
-		encoderCache.pipeline = pipeline;
+	if (!encoderCache.pipelineValid || encoderCache.pipeline != pipelineRef) {
+		[enc setRenderPipelineState:pipelineRef];
+		encoderCache.pipeline = pipelineRef;
 		encoderCache.pipelineValid = true;
 	}
 	if (p.uses_gl_frag_coord && !ctx.fragcoord_params_bound) {
@@ -1779,9 +1818,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		[enc setFragmentBytes:&fragCoordParams length:sizeof(fragCoordParams) atIndex:GL4METAL_FRAGCOORD_BUFFER_INDEX];
 		ctx.fragcoord_params_bound = true;
 	}
-	if (!encoderCache.depthStateValid || encoderCache.depthState != activeDepthState) {
-		[enc setDepthStencilState:activeDepthState];
-		encoderCache.depthState = activeDepthState;
+	if (!encoderCache.depthStateValid || encoderCache.depthState != activeDepthStateRef) {
+		[enc setDepthStencilState:activeDepthStateRef];
+		encoderCache.depthState = activeDepthStateRef;
 		encoderCache.depthStateValid = true;
 	}
 	const uint32_t stencilFrontReference = (uint32_t)ctx.stencil_front.ref;
@@ -1861,7 +1900,9 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		}
 		for (const TranslatedStorageBuffer &storageInfo : p.storage_buffers) {
 			if (storageInfo.stage[0].present || storageInfo.stage[1].present) {
-				appendUnique(ctx.shader_storage_buffer_bindings[storageInfo.binding].buffer);
+				const GLuint storage_buf_id = ctx.shader_storage_buffer_bindings[storageInfo.binding].buffer;
+				appendUnique(storage_buf_id);
+				markBufferMayBeGPUWritten(storage_buf_id);
 			}
 		}
 		appendUnique(elementBuffer);
@@ -2101,8 +2142,11 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					caller, u.info.name.c_str(), unit, GL4METAL_MAX_TEXTURE_UNITS - 1);
 				return;
 			}
-			id<MTLTexture> texture = nil;
-			id<MTLSamplerState> sampler = nil;
+			// Borrow from TextureObject/feedbackSnapshots/static fallbacks and the
+			// context sampler cache. Those owners outlive this binding loop; the
+			// encoder/cache retain resources needed by the encoded draw.
+			__unsafe_unretained id<MTLTexture> textureRef = nil;
+			__unsafe_unretained id<MTLSamplerState> samplerRef = nil;
 			const bool isBufferSampler = u.info.dim == TranslatedUniform::DimBuffer;
 			GLuint textureNameForTrace = 0;
 			bool usedFallbackTexture = false;
@@ -2115,15 +2159,15 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 					auto to = ctx.texture_objects.find(textureName);
 					if (feedbackSnapshot != feedbackSnapshots.end()) {
 						if (to != ctx.texture_objects.end()) {
-							texture = gl4metalTextureForSampling(to->second, feedbackSnapshot->second);
-							if (!texture) return;
+							textureRef = gl4metalTextureForSampling(to->second, feedbackSnapshot->second);
+							if (!textureRef) return;
 						} else {
 							gl4metalSetError(GL_INVALID_OPERATION);
 							GL4METAL_LOG("%s: feedback snapshot %u has no live GL texture object", caller, textureName);
 							return;
 						}
 						if (to != ctx.texture_objects.end() && !isBufferSampler) {
-							sampler = samplerFor(to->second, (GLuint)unit);
+							samplerRef = samplerFor(to->second, (GLuint)unit);
 						}
 					} else {
 						if (to != ctx.texture_objects.end() && isBufferSampler &&
@@ -2137,73 +2181,73 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 						if (to != ctx.texture_objects.end() && to->second.texture &&
 							to->second.texture.textureType == typeForDim(u.info.dim) &&
 							(to->second.texture.usage & MTLTextureUsageShaderRead) != 0) {
-							texture = gl4metalTextureForSampling(to->second, to->second.texture);
-							if (!texture) return;
+							textureRef = gl4metalTextureForSampling(to->second, to->second.texture);
+							if (!textureRef) return;
 							if (isBufferSampler) {
 								markBufferUsed(to->second.buffer_object);
 							} else {
-								sampler = samplerFor(to->second, (GLuint)unit);
+								samplerRef = samplerFor(to->second, (GLuint)unit);
 							}
 						}
 					}
 				}
 			}
-			if (!texture) {
+			if (!textureRef) {
 				usedFallbackTexture = true;
-				texture = fallbackTexture(u.info);
-				if (!isBufferSampler) sampler = fallbackSampler();
+				textureRef = fallbackTexture(u.info);
+				if (!isBufferSampler) samplerRef = fallbackSampler();
 			}
-			// Never encode a shader read against a nil or non-readable Metal resource. A nil
-			// texture can surface later as an asynchronous GPU page fault at address zero.
-			if (!texture || (texture.usage & MTLTextureUsageShaderRead) == 0) {
+			// Never encode a shader read against a nil or non-readable Metal resource.
+			// A nil texture can surface later as an asynchronous GPU page fault at address zero.
+			if (!textureRef || (textureRef.usage & MTLTextureUsageShaderRead) == 0) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("%s: sampler '%s' (unit=%d, program=%u) has no valid ShaderRead texture; fallback allocation failed; draw skipped",
 					caller, u.info.name.c_str(), unit, ctx.current_program);
 				return;
 			}
-			if (!isBufferSampler && !sampler) {
+			if (!isBufferSampler && !samplerRef) {
 				gl4metalSetError(GL_OUT_OF_MEMORY);
 				GL4METAL_LOG("%s: sampler state creation failed for '%s' (unit=%d, program=%u); draw skipped",
 					caller, u.info.name.c_str(), unit, ctx.current_program);
 				return;
 			}
-			if (vertexSamplerTraceEnabled() && u.info.stage[0].present && texture) {
+			if (vertexSamplerTraceEnabled() && u.info.stage[0].present && textureRef) {
 				std::string traceKey = std::to_string(ctx.current_program) + ":" + u.info.name + ":" +
 					std::to_string(unit) + ":" + std::to_string(textureNameForTrace) + ":" +
-					std::to_string((uintptr_t)(__bridge void *)texture);
+					std::to_string((uintptr_t)(__bridge void *)textureRef);
 				if (firstVertexSamplerTrace(traceKey)) {
 					GL4METAL_LOG("VS sampler binding: program=%u uniform='%s' unit=%d GLtexture=%u fallback=%d MetalTexture=%p type=%lu size=%lux%lux%lu mips=%lu format=%lu usage=0x%lx storage=%lu slot=%lu",
 						ctx.current_program, u.info.name.c_str(), unit, textureNameForTrace, usedFallbackTexture ? 1 : 0,
-						(__bridge void *)texture, (unsigned long)texture.textureType,
-						(unsigned long)texture.width, (unsigned long)texture.height, (unsigned long)texture.depth,
-						(unsigned long)texture.mipmapLevelCount, (unsigned long)texture.pixelFormat,
-						(unsigned long)texture.usage, (unsigned long)texture.storageMode,
+						(__bridge void *)textureRef, (unsigned long)textureRef.textureType,
+						(unsigned long)textureRef.width, (unsigned long)textureRef.height, (unsigned long)textureRef.depth,
+						(unsigned long)textureRef.mipmapLevelCount, (unsigned long)textureRef.pixelFormat,
+						(unsigned long)textureRef.usage, (unsigned long)textureRef.storageMode,
 						(unsigned long)u.info.stage[0].slot);
 				}
 			}
-			if (fragmentSamplerTraceEnabled() && u.info.stage[1].present && texture) {
+			if (fragmentSamplerTraceEnabled() && u.info.stage[1].present && textureRef) {
 				std::string traceKey = std::to_string(ctx.current_program) + ":" + u.info.name + ":" +
 					std::to_string(unit) + ":" + std::to_string(textureNameForTrace) + ":" +
-					std::to_string((uintptr_t)(__bridge void *)texture);
+					std::to_string((uintptr_t)(__bridge void *)textureRef);
 				if (firstFragmentSamplerTrace(traceKey)) {
 					GL4METAL_LOG("FS sampler binding: program=%u uniform='%s' unit=%d GLtexture=%u fallback=%d MetalTexture=%p type=%lu size=%lux%lux%lu mips=%lu format=%lu usage=0x%lx storage=%lu slot=%lu",
 						ctx.current_program, u.info.name.c_str(), unit, textureNameForTrace, usedFallbackTexture ? 1 : 0,
-						(__bridge void *)texture, (unsigned long)texture.textureType,
-						(unsigned long)texture.width, (unsigned long)texture.height, (unsigned long)texture.depth,
-						(unsigned long)texture.mipmapLevelCount, (unsigned long)texture.pixelFormat,
-						(unsigned long)texture.usage, (unsigned long)texture.storageMode,
+						(__bridge void *)textureRef, (unsigned long)textureRef.textureType,
+						(unsigned long)textureRef.width, (unsigned long)textureRef.height, (unsigned long)textureRef.depth,
+						(unsigned long)textureRef.mipmapLevelCount, (unsigned long)textureRef.pixelFormat,
+						(unsigned long)textureRef.usage, (unsigned long)textureRef.storageMode,
 						(unsigned long)u.info.stage[1].slot);
 				}
 			}
 			if (u.info.stage[0].present) {
 				NSUInteger index = u.info.stage[0].slot + (NSUInteger)e;
-				bindVertexTextureCached(encoderCache, enc, texture, index);
-				if (!isBufferSampler) bindVertexSamplerCached(encoderCache, enc, sampler, index);
+				bindVertexTextureCached(encoderCache, enc, textureRef, index);
+				if (!isBufferSampler) bindVertexSamplerCached(encoderCache, enc, samplerRef, index);
 			}
 			if (u.info.stage[1].present) {
 				NSUInteger index = u.info.stage[1].slot + (NSUInteger)e;
-				bindFragmentTextureCached(encoderCache, enc, texture, index);
-				if (!isBufferSampler) bindFragmentSamplerCached(encoderCache, enc, sampler, index);
+				bindFragmentTextureCached(encoderCache, enc, textureRef, index);
+				if (!isBufferSampler) bindFragmentSamplerCached(encoderCache, enc, samplerRef, index);
 			}
 		}
 	}
@@ -2260,8 +2304,10 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		return;
 	}
 
-	id<MTLBuffer> ebo = metalBufferForElementArray(vao);
-	if (vao.element_array_buffer_id == 0 || !ebo) {
+	// The VAO or ctx.buffer_objects owns this element buffer until the GL draw
+	// finishes encoding; avoid a per-draw strong retain/release pair.
+	__unsafe_unretained id<MTLBuffer> elementBufferRef = nil;
+	if (vao.element_array_buffer_id == 0 || !metalBufferForElementArray(vao, elementBufferRef)) {
 		gl4metalSetError(GL_INVALID_OPERATION);
 		GL4METAL_LOG("%s: no element array buffer with storage is attached to the current VAO", caller);
 		return;
@@ -2284,21 +2330,21 @@ static void executeDraw(const DrawCall &dc, const char *caller) {
 		GL4METAL_LOG("%s: index offset %ld is not aligned to %lu bytes; draw skipped", caller, (long)dc.indexOffset, (unsigned long)indexSize);
 		return;
 	}
-	if (!validateVertexFetchRanges(dc, caller, attribs, ebo, indexSize)) return;
+	if (!validateVertexFetchRanges(dc, caller, attribs, elementBufferRef, indexSize)) return;
 
 	const bool primitiveRestart = capOn(GL_PRIMITIVE_RESTART);
 	if (dc.indexType != GL_UNSIGNED_BYTE && !fan && !primitiveRestart) {
 		markActiveDrawBuffers(vao.retains_deleted_element_buffer ? 0 : vao.element_array_buffer_id);
 		[enc drawIndexedPrimitives:prim indexCount:(NSUInteger)dc.count
 						 indexType:(dc.indexType == GL_UNSIGNED_INT ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16)
-					   indexBuffer:ebo indexBufferOffset:(NSUInteger)dc.indexOffset
+					   indexBuffer:elementBufferRef indexBufferOffset:(NSUInteger)dc.indexOffset
 					 instanceCount:(NSUInteger)dc.instances baseVertex:dc.baseVertex baseInstance:0];
 		markDefaultFramebufferAttachmentsWritten();
 		return;
 	}
 
 	// 8-bit indices (Metal has none) and triangle fans: rebuild as a 32-bit index list.
-	const uint8_t *raw = (const uint8_t *)ebo.contents + dc.indexOffset;
+	const uint8_t *raw = (const uint8_t *)elementBufferRef.contents + dc.indexOffset;
 	auto indexAt = [&](GLsizei i) -> uint32_t {
 		switch (dc.indexType) {
 			case GL_UNSIGNED_INT:   return ((const uint32_t *)raw)[i];

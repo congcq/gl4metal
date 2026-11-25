@@ -1,6 +1,7 @@
 #import "program.h"
 #import "shaders.h"
 #import "draw.h"
+#import "buffers.h"
 #import "sync.h"
 
 #include <mutex>
@@ -984,6 +985,7 @@ void dispatchComputeInternal(GLuint num_groups_x, GLuint num_groups_y, GLuint nu
 			computeBufferSizes[storageInfo.slot] = (uint32_t)resolved.size;
 		}
 		storageBufferBindings.push_back(resolved);
+		markBufferMayBeGPUWritten(binding.buffer);
 		addUniqueBufferName(usedBufferNames, binding.buffer);
 	}
 

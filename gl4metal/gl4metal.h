@@ -525,6 +525,10 @@ struct MTLContext {
 	// MTL4ComputeCommandEncoder also records blit operations. Track the last stage
 	// so dispatch<->blit hazards get an explicit intra-encoder visibility barrier.
 	uint8_t metal4LastWorkStage = 0; // 0=none, 1=dispatch, 2=blit
+	// Blit resources are untracked on Metal 4. Track resource-level reads/writes so
+	// independent copies can remain unordered while dependent copies get a barrier.
+	std::vector<const void *> metal4BlitReadResourceKeys;
+	std::vector<const void *> metal4BlitWriteResourceKeys;
 	std::vector<id<MTLResource>> metal4CurrentResources;
 	std::vector<id<MTLSamplerState>> metal4CurrentSamplers;
 	std::vector<id<MTLComputePipelineState>> metal4CurrentComputePipelines;
@@ -536,6 +540,10 @@ struct MTLContext {
 	// appended to preserve the established MTLContext member layout.
 	uint32_t metal4CurrentEncoderStages = 0;
 	uint32_t metal4PendingQueueBarrierStages = 0;
+	// Buffers that have been exposed to shader-storage writes or GPU blit destinations.
+	// A pending read-only buffer may be copy-on-write renamed in shared memory; a buffer
+	// that a GPU stage may write must be synchronized before preserving its contents.
+	std::unordered_set<GLuint> buffer_may_be_gpu_written;
 };
 
 extern thread_local MTLContext ctx;
