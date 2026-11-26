@@ -743,6 +743,9 @@ NSString *detectDeviceName(utsname si) {
 			@"iPhone19,3" : @"iPhone 18 Pro Max",
 			@"iPhone19,7" : @"iPhone 18 Pro Max",
 
+			// iPhone Duo
+			@"iPhone19,4": @"iPhone Duo",
+
             // iPad
             @"iPad6,11"  : @"iPad 5th gen",
             @"iPad6,12"  : @"iPad 5th gen",
@@ -837,11 +840,11 @@ const GLubyte *glGetString(GLenum name) {
 					(long)osVersion.minorVersion, (long)osVersion.patchVersion]
 				: [NSString stringWithFormat:@"%ld.%ld", (long)osVersion.majorVersion,
 					(long)osVersion.minorVersion];
-			NSString *s = [NSString stringWithFormat:@"GL4Metal beta (%@ | %@ | iOS %@)", detectDeviceName(si), ctx.device.name, systemVersion];
+			NSString *s = [NSString stringWithFormat:@"gl4metal v%s (%@ | %@ | iOS %@)", GL4METAL_VERSION, detectDeviceName(si), ctx.device.name, systemVersion];
 			return (const GLubyte *)s.UTF8String;
 		}
 		case GL_VERSION:
-			return (const GLubyte *)"3.3 MetalGL";
+			return (const GLubyte *)"3.3 Core Profile MetalGL";
 		case GL_SHADING_LANGUAGE_VERSION:
 			return (const GLubyte *)"3.3.0";
 		case GL_EXTENSIONS:
