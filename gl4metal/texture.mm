@@ -1,4 +1,5 @@
 #import "texture.h"
+#import "gl4metal.h"
 
 #include <cmath>
 #include <limits>

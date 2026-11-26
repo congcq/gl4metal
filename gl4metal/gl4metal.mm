@@ -45,13 +45,11 @@ static bool initializeMetal4Backend(void) {
 		const bool apple7 = [ctx.device supportsFamily:MTLGPUFamilyApple7];
 		const bool metal4 = [ctx.device supportsFamily:MTLGPUFamilyMetal4];
 		if (!apple7 || !metal4) {
-			const bool apple6 = [ctx.device supportsFamily:MTLGPUFamilyApple6];
-			if (apple6 && !apple7 && !metal4) {
-				GL4METAL_LOG("Metal 4 unavailable on Apple6 (A13); using complete classic Metal path");
-			} else {
-				GL4METAL_LOG("Metal 4 command path unavailable: Apple7=%d Metal4=%d; using classic Metal",
-					apple7 ? 1 : 0, metal4 ? 1 : 0);
+			if (!apple7 && !metal4) {
+				GL4METAL_LOG("Metal 4 unavailable on this device, using complete classic Metal path");
 			}
+			
+			GL4METAL_LOG("Metal 4 command path unavailable: Apple7=%d Metal4=%d, using classic Metal", apple7 ? 1 : 0, metal4 ? 1 : 0);
 			return false;
 		}
 

@@ -7,6 +7,7 @@
 
 
 #import "framebuffer.h"
+#import "gl4metal.h"
 
 extern void invalidateDrawEncoderStateCache(void);
 extern void invalidateComputeEncoderStateCache(void);

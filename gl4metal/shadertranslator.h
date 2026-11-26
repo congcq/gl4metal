@@ -9,27 +9,7 @@
 #include <vector>
 #include <unordered_map>
 
-// Metal buffer indices shared by GL buffers and SPIRV-Cross helper resources.
-// Vertex attributes occupy vertex slots 0...15; fragment slot 15 is gl_FragCoord.
-// Slot 29 carries OpArrayLength byte sizes and slot 30 carries GL loose uniforms.
-#define GL4METAL_BUFFER_SIZE_BUFFER_INDEX 29
-#define GL4METAL_UNIFORM_BUFFER_INDEX 30
-// Metal/iOS supports up to eight color attachments on the target devices.
-#define GL4METAL_MAX_FRAGMENT_OUTPUTS 8
-
-// Iris uses GL_MAX_TEXTURE_IMAGE_UNITS as a logical dynamic-sampler allocator
-// capacity. Those logical units are virtualized to dense MSL slots at draw time.
-// Keep 96 fragment-side logical units plus 16 vertex-side logical units in the
-// combined GL namespace; actual active MSL sampler slots remain 16 per stage.
-#define GL4METAL_MAX_TEXTURE_UNITS 112
-#define GL4METAL_MAX_FRAGMENT_TEXTURE_UNIT_BINDINGS 96
-#define GL4METAL_MAX_IMAGE_UNITS 32
-#define GL4METAL_MAX_COMPUTE_TEXTURE_UNITS 16
-#define GL4METAL_MAX_FRAGMENT_TEXTURE_UNITS 16
-#define GL4METAL_MAX_VERTEX_TEXTURE_UNITS 16
-#define GL4METAL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 16
-// Reserved fragment-stage buffer slot for the dynamic GL gl_FragCoord coordinate fixup.
-#define GL4METAL_FRAGCOORD_BUFFER_INDEX 15
+#include "config.h"
 
 struct TranslatedUniform {
 	enum Kind { Float, Int, UInt, Bool, Sampler };

@@ -27,15 +27,11 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
-// Some older platform GL headers expose the ARB-suffixed token only, even
-// though GL_TEXTURE_BUFFER_FORMAT is part of the OpenGL 3.1 texture-buffer API.
-// Keep the unsuffixed core spelling available to the backend on every build.
-
-#define GL_TEXTURE_BUFFER_FORMAT GL_TEXTURE_BUFFER_FORMAT_ARB
+#include "config.h"
 
 #include "shadertranslator.h"
 
-#define GL4METAL_DEBUG 0
+#define GL4METAL_DEBUG 1
 #define GL4METAL_VERSION "1.0"
 
 #if GL4METAL_DEBUG
@@ -43,85 +39,6 @@
 #else
 #define GL4METAL_LOG(...)
 #endif
-
-// iOS limits (Apple GPU family 3+ / A9 and newer)
-#define GL4METAL_MAX_TEXTURE_SIZE 16384
-#define GL4METAL_MAX_3D_TEXTURE_SIZE 2048
-#define GL4METAL_MAX_ARRAY_TEXTURE_LAYERS 2048
-#define GL4METAL_MAX_COLOR_ATTACHMENTS GL4METAL_MAX_FRAGMENT_OUTPUTS
-#define GL4METAL_MAX_UNIFORM_BUFFER_BINDINGS 36
-// Metal buffer slots: vertex attributes 0...15, fragment gl_FragCoord 15,
-// graphics/compute SSBO and UBO ranges 0...28, SPIRV-Cross OpArrayLength 29,
-// and GL loose-uniform blocks 30. Vertex SSBO/UBO slots are limited to 16...28.
-#define GL4METAL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 1024
-
-// MARK: - Textures
-
-struct TextureObject {
-	GLenum target = 0; // 0 until the name is bound for the first time
-	id<MTLTexture> texture = nil;
-	GLenum internalformat = 0; // 0 until level 0 or a buffer texture format is defined
-	GLsizei width = 0, height = 0, depth = 1; // level 0 size; depth > 1 for GL_TEXTURE_3D
-	GLuint buffer_object = 0; // GL_TEXTURE_BUFFER backing store name (0 for ordinary textures)
-	GLenum buffer_sampler_type = 0; // GL_SAMPLER_BUFFER / GL_INT_SAMPLER_BUFFER / GL_UNSIGNED_INT_SAMPLER_BUFFER
-	bool immutable_storage = false; // glTexStorage* / multisample texture storage cannot be redefined
-
-	// sampler parameters (consumed when the texture is bound to a shader)
-	GLenum min_filter = GL_NEAREST_MIPMAP_LINEAR;
-	GLenum mag_filter = GL_LINEAR;
-	GLenum wrap_s = GL_REPEAT, wrap_t = GL_REPEAT, wrap_r = GL_REPEAT;
-	GLfloat min_lod = -1000.0f, max_lod = 1000.0f, lod_bias = 0.0f;
-	GLint base_level = 0, max_level = 1000;
-	GLfloat max_anisotropy = 1.0f;
-	GLenum compare_mode = GL_NONE, compare_func = GL_LEQUAL;
-	GLfloat border_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	GLenum swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
-
-	// Sampling views share the original allocation. Keep separate entries for
-	// the regular texture and the feedback snapshot so swizzle never changes
-	// framebuffer attachment or image-load/store semantics.
-	mutable __strong id<MTLTexture> sampled_view = nil;
-	mutable void *sampled_view_source_identity = nullptr;
-	mutable __strong id<MTLTexture> feedback_sampled_view = nil;
-	mutable void *feedback_sampled_view_source_identity = nullptr;
-
-	// Lazily allocated read-only copy used when a shader samples this same image
-	// while it is selected as an active framebuffer attachment. Tied to the GL
-	// texture object's lifetime; recreated when the source dimensions/format change.
-	id<MTLTexture> feedback_snapshot = nil;
-	uint64_t feedback_snapshot_pass_serial = UINT64_MAX;
-};
-
-// MARK: - Framebuffers
-
-struct FBOAttachment {
-	GLuint texture = 0;       // GL_TEXTURE object, 0 when not a texture attachment
-	GLuint renderbuffer = 0;  // GL_RENDERBUFFER object, 0 when not a renderbuffer attachment
-	GLint level = 0;
-	GLint layer = -1;         // selected 2D-array slice; -1 for ordinary 2D attachments
-	mutable __strong id<MTLTexture> view = nil;        // cached single-slice 2D view
-	mutable __strong id<MTLTexture> view_source = nil; // storage identity used to build view
-};
-
-struct RenderbufferObject {
-	id<MTLTexture> texture = nil;
-	GLenum internalformat = 0;
-	GLsizei width = 0;
-	GLsizei height = 0;
-	GLsizei samples = 0;
-	bool initialized = false;
-};
-
-struct FBO {
-	FBOAttachment color[GL4METAL_MAX_COLOR_ATTACHMENTS];
-	FBOAttachment depth, stencil;
-	GLenum draw_buffers[GL4METAL_MAX_COLOR_ATTACHMENTS] = { GL_COLOR_ATTACHMENT0 };
-	GLenum read_buffer = GL_COLOR_ATTACHMENT0;
-	// Pending GL invalidation hints. They become MTLLoadActionDontCare at the next pass.
-	uint32_t invalidated_color_mask = 0;
-	bool invalidated_depth = false;
-	bool invalidated_stencil = false;
-};
 
 // MARK: - Vertex arrays
 
