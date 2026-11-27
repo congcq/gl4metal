@@ -548,15 +548,10 @@ bool gl4metalSupportsComputeShaders(void) {
 	cache.initialized = true;
 	NSUInteger sharedMemoryLimit = 0;
 	MTLSize threadgroupLimits = MTLSizeMake(0, 0, 0);
-	bool apple6 = false;
 	bool supported = false;
-	if (@available(iOS 14.0, *)) {
-		apple6 = [ctx.device supportsFamily:MTLGPUFamilyApple6];
-		sharedMemoryLimit = ctx.device.maxThreadgroupMemoryLength;
-		threadgroupLimits = ctx.device.maxThreadsPerThreadgroup;
-		supported = apple6 && sharedMemoryLimit >= 32768 &&
-			threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 && threadgroupLimits.depth >= 64;
-	}
+	sharedMemoryLimit = ctx.device.maxThreadgroupMemoryLength;
+	threadgroupLimits = ctx.device.maxThreadsPerThreadgroup;
+	supported = sharedMemoryLimit >= 32768 && threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 && threadgroupLimits.depth >= 64;
 	cache.supported = supported;
 	GL4METAL_LOG("Compute capability: Apple6=%d, threads/group=%lu x %lu x %lu, threadgroup memory=%lu, enabled=%d",
 		apple6 ? 1 : 0, (unsigned long)threadgroupLimits.width,
