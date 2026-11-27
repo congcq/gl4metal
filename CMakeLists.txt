@@ -33,8 +33,8 @@ include_directories(
     "gl4metal/extensions"
 )
 
-add_compile_options(-flto=thin)
-add_link_options(-flto=thin)
+add_compile_options(-flto=full)
+add_link_options(-flto=full)
 
 add_compile_options(-O2)
 
