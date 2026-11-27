@@ -4,6 +4,15 @@
 #include <GL/glcorearb.h>
 #include <GL/glext.h>
 
+#define GL4METAL_DEBUG 1
+#define GL4METAL_VERSION "1.0"
+
+#if GL4METAL_DEBUG
+#define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
+#else
+#define GL4METAL_LOG(...)
+#endif
+
 #define GL_TEXTURE_BUFFER_FORMAT GL_TEXTURE_BUFFER_FORMAT_ARB
 
 // iOS limits (Apple GPU family 3+ / A9 and newer)

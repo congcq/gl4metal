@@ -45,11 +45,11 @@ static bool initializeMetal4Backend(void) {
 		const bool apple7 = [ctx.device supportsFamily:MTLGPUFamilyApple7];
 		const bool metal4 = [ctx.device supportsFamily:MTLGPUFamilyMetal4];
 		if (!apple7 || !metal4) {
+			GL4METAL_LOG("Metal 4 command path unavailable: Apple7=%d Metal4=%d", apple7 ? 1 : 0, metal4 ? 1 : 0);
 			if (!apple7 && !metal4) {
 				GL4METAL_LOG("Metal 4 unavailable on this device, using complete classic Metal path");
 			}
 			
-			GL4METAL_LOG("Metal 4 command path unavailable: Apple7=%d Metal4=%d, using classic Metal", apple7 ? 1 : 0, metal4 ? 1 : 0);
 			return false;
 		}
 
@@ -553,8 +553,8 @@ bool gl4metalSupportsComputeShaders(void) {
 	threadgroupLimits = ctx.device.maxThreadsPerThreadgroup;
 	supported = sharedMemoryLimit >= 32768 && threadgroupLimits.width >= 1024 && threadgroupLimits.height >= 1024 && threadgroupLimits.depth >= 64;
 	cache.supported = supported;
-	GL4METAL_LOG("Compute capability: Apple6=%d, threads/group=%lu x %lu x %lu, threadgroup memory=%lu, enabled=%d",
-		apple6 ? 1 : 0, (unsigned long)threadgroupLimits.width,
+	GL4METAL_LOG("Compute capability: threadgroup=%lux%lux%lu, threadgroup memory=%lu, enabled=%d",
+		(unsigned long)threadgroupLimits.width,
 		(unsigned long)threadgroupLimits.height, (unsigned long)threadgroupLimits.depth,
 		(unsigned long)sharedMemoryLimit, supported ? 1 : 0);
 	return cache.supported;
@@ -586,10 +586,6 @@ GLboolean gl4metalInit() {
 	if (!ctx.device || !ctx.commandQueue) {
 		GL4METAL_LOG("gl4metalInit: Metal device or classic command queue creation failed");
 		return GL_FALSE;
-	}
-	const char *check = getenv("GL4METAL_CHECK_EXPORTS");
-	if (check && check[0] == '1') {
-		gl4metalCheckExports();
 	}
 
 	// Shader packs create many transient FBOs while building/reloading pipelines.
