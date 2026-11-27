@@ -31,15 +31,6 @@
 
 #include "shadertranslator.h"
 
-#define GL4METAL_DEBUG 1
-#define GL4METAL_VERSION "1.0"
-
-#if GL4METAL_DEBUG
-#define GL4METAL_LOG(format, ...) printf("[GL4Metal] " format "\n", ##__VA_ARGS__)
-#else
-#define GL4METAL_LOG(...)
-#endif
-
 // MARK: - Vertex arrays
 
 struct VertexAttrib {
